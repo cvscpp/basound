@@ -21,6 +21,7 @@
 #include <sys/bus.h>
 #include <sys/malloc.h>
 #include <sys/libkern.h>
+#include <sys/sysctl.h>
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdi_util.h>
@@ -37,6 +38,26 @@
 /* Line6 USB driver - bridges FreeBSD usb_device to ALSA Line6 driver */
 
 MALLOC_DECLARE(M_ALSA);
+
+/*
+ * Test tone sysctl: set to non-zero to inject a 1kHz square wave into USB
+ * output, bypassing the DMA/feeder path.  Useful for verifying the hardware
+ * output path works independently of the FreeBSD PCM stack.
+ *
+ *   sysctl hw.basound.line6.test_tone=1   # enable
+ *   sysctl hw.basound.line6.test_tone=0   # disable (normal playback)
+ */
+static int line6_test_tone = 0;
+static uint32_t line6_test_tone_phase = 0; /* sample counter for test tone */
+
+SYSCTL_DECL(_hw);
+SYSCTL_NODE(_hw, OID_AUTO, basound, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "basound USB audio driver");
+SYSCTL_NODE(_hw_basound, OID_AUTO, line6, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "Line6 USB audio");
+SYSCTL_INT(_hw_basound_line6, OID_AUTO, test_tone, CTLFLAG_RW,
+    &line6_test_tone, 0,
+    "Inject 1kHz test tone into USB output (1=enable, 0=normal)");
 
 /*
  * USB isochronous transport parameters.
@@ -423,16 +444,39 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 		/* Copy from DMA ring buffer into USB isochronous packet */
 		offset = 0;
 		pc = usbd_xfer_get_frame(xfer, 0);
-		while (total > 0) {
-			n = (uint32_t)(st->end - st->cur);
-			if (n > total)
-				n = total;
-			usbd_copy_in(pc, offset, st->cur, n);
-			total -= n;
-			st->cur += n;
-			offset += n;
-			if (st->cur >= st->end)
-				st->cur = st->start;
+		if (line6_test_tone) {
+			/*
+			 * Test tone mode: fill USB frames with a 1kHz square
+			 * wave (S16_LE stereo, amplitude 16384) to verify that
+			 * the hardware output path works independently of the
+			 * PCM stack.  Toggle polarity every 22 samples ≈ 1kHz.
+			 */
+			uint32_t remaining = total;
+			uint8_t tbuf[4]; /* one stereo S16_LE sample */
+			while (remaining >= 4) {
+				int16_t v = (line6_test_tone_phase % 44 < 22) ?
+				    16384 : -16384;
+				tbuf[0] = (uint8_t)(v & 0xff);
+				tbuf[1] = (uint8_t)((v >> 8) & 0xff);
+				tbuf[2] = tbuf[0]; /* same for right channel */
+				tbuf[3] = tbuf[1];
+				usbd_copy_in(pc, offset, tbuf, 4);
+				offset += 4;
+				remaining -= 4;
+				line6_test_tone_phase++;
+			}
+		} else {
+			while (total > 0) {
+				n = (uint32_t)(st->end - st->cur);
+				if (n > total)
+					n = total;
+				usbd_copy_in(pc, offset, st->cur, n);
+				total -= n;
+				st->cur += n;
+				offset += n;
+				if (st->cur >= st->end)
+					st->cur = st->start;
+			}
 		}
 		usbd_transfer_submit(xfer);
 		break;
