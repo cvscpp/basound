@@ -372,23 +372,35 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 			if (dbg_cnt % 200 == 0) {
 				uint32_t ready_after = sndbuf_getready(st->pcm_ch->bufhard);
 				uint32_t fp_after = sndbuf_getfreeptr(st->pcm_ch->bufhard);
-				/* Sample the bytes about to be sent (at st->cur) */
-				const int16_t *s = (const int16_t *)st->cur;
-				int ns0 = (st->cur + 8 <= st->end) ? s[0] : 0;
-				int ns1 = (st->cur + 8 <= st->end) ? s[1] : 0;
-				int ns2 = (st->cur + 8 <= st->end) ? s[2] : 0;
-				int ns3 = (st->cur + 8 <= st->end) ? s[3] : 0;
+				uint32_t ring_size = (uint32_t)(st->end - st->start);
+
+				/* Bytes just written by feeder_mixer start at fp_before */
+				const int16_t *sf = (const int16_t *)(st->start +
+				    fp_before % ring_size);
+				int f0 = (fp_before + 8 <= ring_size) ? sf[0] : 0;
+				int f1 = (fp_before + 8 <= ring_size) ? sf[1] : 0;
+				int f2 = (fp_before + 8 <= ring_size) ? sf[2] : 0;
+				int f3 = (fp_before + 8 <= ring_size) ? sf[3] : 0;
+
+				/* Bytes about to be USB-sent start at st->cur */
+				const int16_t *su = (const int16_t *)st->cur;
+				int ns0 = (st->cur + 8 <= st->end) ? su[0] : 0;
+				int ns1 = (st->cur + 8 <= st->end) ? su[1] : 0;
+				int ns2 = (st->cur + 8 <= st->end) ? su[2] : 0;
+				int ns3 = (st->cur + 8 <= st->end) ? su[3] : 0;
+
 				printf("line6 play cb#%u state=%s"
 				    " cur=%p(+%u) ring=[%u..%u]"
 				    " ready=%u->%u fp=%u->%u"
-				    " next=[%d,%d,%d,%d]\n",
+				    " new=[%d,%d,%d,%d] usb=[%d,%d,%d,%d]\n",
 				    dbg_cnt,
 				    USB_GET_STATE(xfer) == USB_ST_SETUP ?
 				        "SETUP" : "XFRD",
 				    st->cur, (uint32_t)(st->cur - st->start),
-				    0, (uint32_t)(st->end - st->start),
+				    0, ring_size,
 				    ready_before, ready_after,
 				    fp_before, fp_after,
+				    f0, f1, f2, f3,
 				    ns0, ns1, ns2, ns3);
 			}
 		}
@@ -753,6 +765,20 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		st->pcm_ch = ch->channel;
 		st->running = 1;
 
+		{
+			const uint8_t *d = (const uint8_t *)runtime->dma_area;
+			uint32_t nz = 0;
+			for (uint32_t i = 0; i < 1024 && i < runtime->dma_bytes; i++)
+				if (d[i]) nz++;
+			printf("line6 pcm trigger START dir=%d speed=%u\n",
+			    substream->stream, ch->speed);
+			printf("line6 trigger: dma_area=%p dma_bytes=%zu"
+			    " nonzero_in_first_1024=%u bytes=[%02x %02x %02x %02x"
+			    " %02x %02x %02x %02x]\n",
+			    runtime->dma_area, runtime->dma_bytes, nz,
+			    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+		}
+
 		for (int i = 0; i < LINE6_NCHANBUFS; i++)
 			usbd_transfer_start(st->xfer[i]);
 		mtx_unlock(&sc->sc_lock);
@@ -767,6 +793,7 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		uint32_t stream_bit = (substream->stream ==
 		    SNDRV_PCM_STREAM_PLAYBACK) ? 1 : 2;
 
+		printf("line6 pcm trigger STOP dir=%d\n", substream->stream);
 		mtx_lock(&sc->sc_lock);
 		st->running = 0;
 		sc->audio_active &= ~stream_bit;
