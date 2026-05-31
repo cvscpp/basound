@@ -24,7 +24,7 @@ static constexpr int kSVuW    = 22;   /* VU meter width (left side of slot) */
 static constexpr int kSSlotH  = 100;  /* VU + fader slot height (same for both) */
 static constexpr int kSDbH    = 14;   /* dB readout height below slot */
 static constexpr int kSHdrH   = 22;   /* section header height */
-static constexpr int kSGapH   = 20;   /* vertical gap between sections */
+static constexpr int kSGapH   = 30;   /* vertical gap between sections */
 
 /* ------------------------------------------------------------------ */
 /* Construction                                                         */
@@ -263,6 +263,8 @@ void MixerWindow::build_ui() {
 
 	/* ----- Mixer tab -------------------------------------------------- */
 	clear_mix_strips();
+	mix_scroll_->scroll_to(0, 0);
+
 	int mx0 = mix_scroll_->x() + 4;
 	int y_cur = mix_scroll_->y() + 4;
 
@@ -278,6 +280,7 @@ void MixerWindow::build_ui() {
 	    mx0, section_w, y_cur, fl_rgb_color(80, 120, 200));
 
 	mix_scroll_->end();
+	mix_scroll_->init_sizes();
 	mix_scroll_->redraw();
 
 	/* ----- Meters tab ------------------------------------------------- */
@@ -313,6 +316,7 @@ void MixerWindow::build_ui() {
 	add_section("Hardware Outputs",   nch + 2, vu_out_, fl_rgb_color(80, 120, 200));
 
 	meter_scroll_->end();
+	meter_scroll_->init_sizes();
 	meter_scroll_->redraw();
 }
 
@@ -484,8 +488,9 @@ void MixerWindow::build_mix_section(
 	hdr->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 	y_cur += kSHdrH;
 
-	const int fader_w = kStripW - kSVuW - 6;  /* 60-22-6 = 32 */
+	const int fader_w = kStripW - kSVuW - 6;
 
+	/* Create strips side-by-side at the current y_cur */
 	for (int i = 0; i < count; ++i) {
 		int sx = x0 + i * kStripW;
 		int sy = y_cur;
@@ -496,7 +501,6 @@ void MixerWindow::build_mix_section(
 			addr = (int)HDSP_PLAYBACK_ADDR(i, i);
 		else if (addr_type == 1)
 			addr = (int)HDSP_CAPTURE_ADDR(i, i);
-		/* addr_type == 2: physical output — read-only, addr stays -1 */
 
 		MixerStrip *s = new MixerStrip{nullptr, nullptr, nullptr, addr, this};
 
@@ -515,12 +519,11 @@ void MixerWindow::build_mix_section(
 		int fx = sx + kSVuW + 4;
 		s->fader = new Fl_Slider(fx, sy, fader_w, kSSlotH);
 		s->fader->type(FL_VERT_NICE_SLIDER);
-		s->fader->bounds(1.0, 0.0);  /* top=1.0=unity, bottom=0.0=silence */
+		s->fader->bounds(1.0, 0.0);
 
 		if (addr >= 0) {
 			uint16_t gain = matrix_->get_gain((uint32_t)addr);
-			double init = (double)gain / HDSP_GAIN_UNITY;
-			s->fader->value(init);
+			s->fader->value((double)gain / HDSP_GAIN_UNITY);
 			s->fader->color(fl_rgb_color(60, 60, 60));
 			s->fader->selection_color(fl_rgb_color(80, 160, 80));
 			s->fader->callback(mix_fader_cb, s);
@@ -538,12 +541,8 @@ void MixerWindow::build_mix_section(
 		if (addr >= 0) {
 			uint16_t gain = matrix_->get_gain((uint32_t)addr);
 			char buf[16];
-			if (gain == 0)
-				snprintf(buf, sizeof(buf), "-inf");
-			else {
-				float db = 20.0f * log10f((float)gain / HDSP_GAIN_UNITY);
-				snprintf(buf, sizeof(buf), "%.0f", db);
-			}
+			if (gain == 0) snprintf(buf, sizeof(buf), "-inf");
+			else           snprintf(buf, sizeof(buf), "%.0f", 20.0f * log10f((float)gain / HDSP_GAIN_UNITY));
 			s->db_label->copy_label(buf);
 		} else {
 			s->db_label->copy_label("---");
@@ -553,6 +552,7 @@ void MixerWindow::build_mix_section(
 		vec.push_back(s);
 	}
 
+	/* Advance y_cur by the total height used by strips + gap */
 	y_cur += kSLabelH + kSSlotH + kSDbH + kSGapH;
 }
 
