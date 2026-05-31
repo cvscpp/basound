@@ -339,8 +339,10 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 	struct usb_page_cache *pc;
 	uint32_t total, n, offset, frame_len;
 	int actlen, sumlen;
+	static uint32_t dbg_cnt = 0;
 
 	usbd_xfer_status(xfer, &actlen, &sumlen, NULL, NULL);
+	dbg_cnt++;
 
 	switch (USB_GET_STATE(xfer)) {
 	case USB_ST_SETUP:
@@ -360,11 +362,35 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 		 * must not hold sc_lock when taking the channel lock.
 		 */
 		if (st->pcm_ch != NULL) {
+			uint32_t ready_before = sndbuf_getready(st->pcm_ch->bufhard);
+			uint32_t fp_before = sndbuf_getfreeptr(st->pcm_ch->bufhard);
 			mtx_unlock(&sc->sc_lock);
 			chn_intr(st->pcm_ch);
 			mtx_lock(&sc->sc_lock);
 			if (!st->running)
 				break;
+			if (dbg_cnt % 200 == 0) {
+				uint32_t ready_after = sndbuf_getready(st->pcm_ch->bufhard);
+				uint32_t fp_after = sndbuf_getfreeptr(st->pcm_ch->bufhard);
+				/* Sample the bytes about to be sent (at st->cur) */
+				const int16_t *s = (const int16_t *)st->cur;
+				int ns0 = (st->cur + 8 <= st->end) ? s[0] : 0;
+				int ns1 = (st->cur + 8 <= st->end) ? s[1] : 0;
+				int ns2 = (st->cur + 8 <= st->end) ? s[2] : 0;
+				int ns3 = (st->cur + 8 <= st->end) ? s[3] : 0;
+				printf("line6 play cb#%u state=%s"
+				    " cur=%p(+%u) ring=[%u..%u]"
+				    " ready=%u->%u fp=%u->%u"
+				    " next=[%d,%d,%d,%d]\n",
+				    dbg_cnt,
+				    USB_GET_STATE(xfer) == USB_ST_SETUP ?
+				        "SETUP" : "XFRD",
+				    st->cur, (uint32_t)(st->cur - st->start),
+				    0, (uint32_t)(st->end - st->start),
+				    ready_before, ready_after,
+				    fp_before, fp_after,
+				    ns0, ns1, ns2, ns3);
+			}
 		}
 
 		/* Compute per-frame lengths with rate jitter correction */
@@ -428,11 +454,13 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 	struct usb_page_cache *pc;
 	uint32_t offset, n, len;
 	int actlen, nframes, i;
+	static uint32_t dbg_cnt = 0;
 
 	usbd_xfer_status(xfer, &actlen, NULL, NULL, &nframes);
 
 	switch (USB_GET_STATE(xfer)) {
 	case USB_ST_TRANSFERRED: {
+		dbg_cnt++;
 		if (st->start == NULL || st->start == st->end)
 			goto tr_setup;
 
@@ -452,6 +480,10 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 					st->cur = st->start;
 			}
 		}
+
+		if (dbg_cnt % 200 == 0)
+			printf("line6 rec cb#%u cur+%u actlen=%d\n",
+			    dbg_cnt, (uint32_t)(st->cur - st->start), actlen);
 
 		if (st->pcm_ch != NULL) {
 			mtx_unlock(&sc->sc_lock);
