@@ -353,23 +353,16 @@ basound_chan_getptr(kobj_t obj, void *data)
 	struct basound_chan *ch = data;
 	struct snd_pcm_substream *substream = ch->substream;
 	const struct snd_pcm_ops *ops = substream->pstr->ops;
-	static uint32_t getptr_cnt = 0;
 	unsigned long frames;
 	uint32_t ptr;
 
 	if (ops && ops->pointer) {
 		frames = ops->pointer(substream);
-		/* ALSA driver returns frames, FreeBSD wants bytes.
-		 * Use the channel format (stored in basound_chan) to find frame size. */
 		uint32_t frame_bytes = AFMT_BPS(ch->format) * AFMT_CHANNEL(ch->format);
 		ptr = (uint32_t)(frames * frame_bytes);
-		
-		if (++getptr_cnt % 500 == 1)
-			printf("basound getptr #%u dir=%d frames=%lu ptr=%u\n",
-			    getptr_cnt, substream->stream, frames, ptr);
 		return ptr;
 	}
-	
+
 	return 0;
 }
 

@@ -346,65 +346,25 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 	case USB_ST_SETUP:
 		/* FALLTHROUGH */
 	case USB_ST_TRANSFERRED: {
-		static uint32_t dbg_cnt = 0;
-		dbg_cnt++;
-
 		if (!st->running || st->start == NULL || st->start == st->end)
 			break;
 
 		/*
-		 * After the previous transfer completed, notify the PCM layer
-		 * that the ring buffer was consumed.  Drop sc_lock first:
-		 * chn_intr acquires the PCM channel lock, and the channel lock
-		 * → sc_lock order (from trigger) means we must not hold sc_lock
-		 * when taking the channel lock.
+		 * Notify the PCM layer that the ring buffer was consumed and
+		 * allow the feeder to refill it.  Called for both SETUP and
+		 * TRANSFERRED so the feeder stays ahead of the USB pipeline
+		 * during the initial burst of SETUP submissions.
+		 *
+		 * Drop sc_lock first: chn_intr acquires the PCM channel lock,
+		 * and the channel lock → sc_lock order (from trigger) means we
+		 * must not hold sc_lock when taking the channel lock.
 		 */
-		if (USB_GET_STATE(xfer) == USB_ST_TRANSFERRED &&
-		    st->pcm_ch != NULL) {
-			uint32_t fp_before = 0, ready_before = 0;
-			if (st->pcm_ch->bufhard != NULL) {
-				fp_before = sndbuf_getfreeptr(st->pcm_ch->bufhard);
-				ready_before = sndbuf_getready(st->pcm_ch->bufhard);
-			}
+		if (st->pcm_ch != NULL) {
 			mtx_unlock(&sc->sc_lock);
 			chn_intr(st->pcm_ch);
 			mtx_lock(&sc->sc_lock);
 			if (!st->running)
 				break;
-
-			if (dbg_cnt % 200 == 0 && st->pcm_ch->bufhard != NULL) {
-				struct snd_dbuf *bh = st->pcm_ch->bufhard;
-				uint32_t fp_after = sndbuf_getfreeptr(bh);
-				uint32_t ready_after = sndbuf_getready(bh);
-				uint8_t *buf = sndbuf_getbuf(bh);
-				uint32_t bufsz = sndbuf_getsize(bh);
-				uint32_t nonzero = 0;
-				if (buf != NULL) {
-					for (uint32_t _i = 0; _i < bufsz; _i++)
-						if (buf[_i] != 0) nonzero++;
-				}
-				const int16_t *sc_s = (const int16_t *)st->cur;
-				printf("line6 play cb#%u cur=%p"
-				    " samples=[%d,%d,%d,%d]"
-				    " fp=%u->%u ready=%u->%u"
-				    " bufhard_nonzero=%u/%u buf=%p\n",
-				    dbg_cnt, st->cur,
-				    (st->cur + 8 <= st->end) ? sc_s[0] : 0,
-				    (st->cur + 8 <= st->end) ? sc_s[1] : 0,
-				    (st->cur + 8 <= st->end) ? sc_s[2] : 0,
-				    (st->cur + 8 <= st->end) ? sc_s[3] : 0,
-				    fp_before, fp_after, ready_before, ready_after,
-				    nonzero, bufsz, buf);
-			}
-		} else if (dbg_cnt % 200 == 0) {
-			/* SETUP path - no chn_intr yet */
-			const int16_t *sc_s = (const int16_t *)st->cur;
-			printf("line6 play cb#%u (SETUP) cur=%p samples=[%d,%d,%d,%d]\n",
-			    dbg_cnt, st->cur,
-			    (st->cur + 8 <= st->end) ? sc_s[0] : 0,
-			    (st->cur + 8 <= st->end) ? sc_s[1] : 0,
-			    (st->cur + 8 <= st->end) ? sc_s[2] : 0,
-			    (st->cur + 8 <= st->end) ? sc_s[3] : 0);
 		}
 
 		/* Compute per-frame lengths with rate jitter correction */
@@ -473,19 +433,8 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 
 	switch (USB_GET_STATE(xfer)) {
 	case USB_ST_TRANSFERRED: {
-		static uint32_t dbg_cnt = 0;
-		static uint32_t dbg_skip = 0;
-		dbg_cnt++;
-		if (st->start == NULL || st->start == st->end) {
-			dbg_skip++;
-			if (dbg_skip % 50 == 1)
-				printf("line6 rec cb#%u SKIP start=%p end=%p\n",
-				    dbg_cnt, st->start, st->end);
+		if (st->start == NULL || st->start == st->end)
 			goto tr_setup;
-		}
-		if (dbg_cnt % 200 == 0)
-			printf("line6 rec cb#%u start=%p cur=%p end=%p pcm_ch=%p running=%d\n",
-			    dbg_cnt, st->start, st->cur, st->end, st->pcm_ch, st->running);
 
 		pc = usbd_xfer_get_frame(xfer, 0);
 		offset = 0;
@@ -508,10 +457,6 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 			mtx_unlock(&sc->sc_lock);
 			chn_intr(st->pcm_ch);
 			mtx_lock(&sc->sc_lock);
-		} else {
-			static uint32_t null_ch_cnt = 0;
-			if (null_ch_cnt++ % 100 == 0)
-				printf("line6 rec cb#%u pcm_ch=NULL!\n", dbg_cnt);
 		}
 		/* FALLTHROUGH to re-arm */
 	}
@@ -700,9 +645,6 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		uint32_t channels, bps, sample_size;
 		uint32_t stream_bit;
 
-		printf("line6 pcm trigger START dir=%d speed=%u\n",
-		    substream->stream, ch->speed);
-
 		if (runtime->dma_area == NULL || runtime->dma_bytes == 0)
 			return -EINVAL;
 
@@ -779,19 +721,6 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		st->pcm_ch = ch->channel;
 		st->running = 1;
 
-		/* Diagnostic: check if PCM pre-filled the ring before USB starts */
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-			const uint8_t *d = st->start;
-			uint32_t nonzero = 0;
-			for (int i = 0; i < (int)runtime->dma_bytes && i < 1024; i++)
-				if (d[i]) nonzero++;
-			printf("line6 trigger: dma_area=%p dma_bytes=%u "
-			    "nonzero_in_first_1024=%u "
-			    "bytes=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
-			    runtime->dma_area, (unsigned)runtime->dma_bytes, nonzero,
-			    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-		}
-
 		for (int i = 0; i < LINE6_NCHANBUFS; i++)
 			usbd_transfer_start(st->xfer[i]);
 		mtx_unlock(&sc->sc_lock);
@@ -805,8 +734,6 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH: {
 		uint32_t stream_bit = (substream->stream ==
 		    SNDRV_PCM_STREAM_PLAYBACK) ? 1 : 2;
-
-		printf("line6 pcm trigger STOP dir=%d\n", substream->stream);
 
 		mtx_lock(&sc->sc_lock);
 		st->running = 0;
