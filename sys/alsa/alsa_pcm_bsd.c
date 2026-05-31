@@ -434,6 +434,22 @@ basound_pcm_attach(device_t dev)
 	if (pstr_c->substream_count > 0)
 		pcm_addchan(dev, PCMDIR_REC, &basound_chan_class, pcm);
 
+	/*
+	 * Pre-set vchan format/rate for non-bitperfect (e.g. Line6 USB)
+	 * devices.  Without this, pvchanformat=0 causes vchan_create() to
+	 * call chn_reset(parent, 0, 0), which skips feeder_chain().  The
+	 * parent channel then keeps feeder_root (installed during chn_init
+	 * before CHN_F_HAS_VCHAN was set), which reads from the empty parent
+	 * bufsoft instead of mixing vchan children → silence.  With non-zero
+	 * fmt+rate, feeder_chain() builds feeder_mixer on the parent, which
+	 * correctly reads from the active vchan children.
+	 */
+	if (pcm->private_data == NULL) {
+		struct snddev_info *d = device_get_softc(dev);
+		d->pvchanformat = SND_FORMAT(AFMT_S16_LE, 2, 0);
+		d->pvchanrate = 44100;
+	}
+
 	snprintf(status, sizeof(status), "at %s",
 	    device_get_nameunit(device_get_parent(dev)));
 
