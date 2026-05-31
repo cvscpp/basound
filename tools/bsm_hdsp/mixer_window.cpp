@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <list>
 
 /* Layout constants */
 static constexpr int kMenuH    = 25;
@@ -59,7 +60,7 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 		int tw = win_w, th = body_h - 25, ty = kMenuH + 25;
 
 		/* --- Mixer tab (main) --- */
-		tab_mixer_ = new Fl_Group(0, kMenuH, win_w, body_h, "  Mixer  ");
+		tab_mixer_ = new Fl_Group(0, ty, tw, th, "  Mixer  ");
 		tab_mixer_->color(fl_rgb_color(35, 35, 35));
 		tab_mixer_->labelcolor(FL_WHITE);
 		tab_mixer_->begin();
@@ -72,7 +73,7 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 		tab_mixer_->end();
 
 		/* --- Matrix tab --- */
-		tab_matrix_ = new Fl_Group(0, kMenuH, win_w, body_h, "  Matrix  ");
+		tab_matrix_ = new Fl_Group(0, ty, tw, th, "  Matrix  ");
 		tab_matrix_->color(fl_rgb_color(35, 35, 35));
 		tab_matrix_->labelcolor(FL_WHITE);
 		tab_matrix_->begin();
@@ -119,7 +120,7 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 		tab_matrix_->end();
 
 		/* --- Meters tab --- */
-		tab_meters_ = new Fl_Group(0, kMenuH, win_w, body_h, "  Meters  ");
+		tab_meters_ = new Fl_Group(0, ty, tw, th, "  Meters  ");
 		tab_meters_->color(fl_rgb_color(35, 35, 35));
 		tab_meters_->labelcolor(FL_WHITE);
 		tab_meters_->begin();
@@ -168,7 +169,7 @@ void MixerWindow::menu_cb(Fl_Widget *, void *data) {
 }
 
 /* MenuAction objects live for the program lifetime */
-static std::vector<MenuAction> g_menu_actions;
+static std::list<MenuAction> g_menu_actions;
 
 void MixerWindow::build_device_menu() {
 	g_menu_actions.clear();
@@ -305,7 +306,8 @@ void MixerWindow::build_ui() {
 			char lbl[8];
 			snprintf(lbl, sizeof(lbl), "%d", i + 1);
 			VuMeter *vm = new VuMeter(mx_x + i * kMeterW, my,
-			    kMeterW - 2, kMeterH, strdup(lbl));
+			    kMeterW - 2, kMeterH);
+			vm->copy_label(lbl);
 			vec.push_back(vm);
 		}
 		my += kMeterH + 10;
