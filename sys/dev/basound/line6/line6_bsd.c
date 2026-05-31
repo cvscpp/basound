@@ -348,16 +348,6 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 	case USB_ST_TRANSFERRED: {
 		static uint32_t dbg_cnt = 0;
 		dbg_cnt++;
-		if (dbg_cnt % 200 == 0) {
-			const int16_t *s = (const int16_t *)st->cur;
-			printf("line6 play cb#%u start=%p cur=%p end=%p pcm_ch=%p running=%d"
-			    " samples=[%d,%d,%d,%d]\n",
-			    dbg_cnt, st->start, st->cur, st->end, st->pcm_ch, st->running,
-			    (st->cur + 8 <= st->end) ? s[0] : 0,
-			    (st->cur + 8 <= st->end) ? s[1] : 0,
-			    (st->cur + 8 <= st->end) ? s[2] : 0,
-			    (st->cur + 8 <= st->end) ? s[3] : 0);
-		}
 
 		if (!st->running || st->start == NULL || st->start == st->end)
 			break;
@@ -371,11 +361,50 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 		 */
 		if (USB_GET_STATE(xfer) == USB_ST_TRANSFERRED &&
 		    st->pcm_ch != NULL) {
+			uint32_t fp_before = 0, ready_before = 0;
+			if (st->pcm_ch->bufhard != NULL) {
+				fp_before = sndbuf_getfreeptr(st->pcm_ch->bufhard);
+				ready_before = sndbuf_getready(st->pcm_ch->bufhard);
+			}
 			mtx_unlock(&sc->sc_lock);
 			chn_intr(st->pcm_ch);
 			mtx_lock(&sc->sc_lock);
 			if (!st->running)
 				break;
+
+			if (dbg_cnt % 200 == 0 && st->pcm_ch->bufhard != NULL) {
+				struct snd_dbuf *bh = st->pcm_ch->bufhard;
+				uint32_t fp_after = sndbuf_getfreeptr(bh);
+				uint32_t ready_after = sndbuf_getready(bh);
+				uint8_t *buf = sndbuf_getbuf(bh);
+				uint32_t bufsz = sndbuf_getsize(bh);
+				uint32_t nonzero = 0;
+				if (buf != NULL) {
+					for (uint32_t _i = 0; _i < bufsz; _i++)
+						if (buf[_i] != 0) nonzero++;
+				}
+				const int16_t *sc_s = (const int16_t *)st->cur;
+				printf("line6 play cb#%u cur=%p"
+				    " samples=[%d,%d,%d,%d]"
+				    " fp=%u->%u ready=%u->%u"
+				    " bufhard_nonzero=%u/%u buf=%p\n",
+				    dbg_cnt, st->cur,
+				    (st->cur + 8 <= st->end) ? sc_s[0] : 0,
+				    (st->cur + 8 <= st->end) ? sc_s[1] : 0,
+				    (st->cur + 8 <= st->end) ? sc_s[2] : 0,
+				    (st->cur + 8 <= st->end) ? sc_s[3] : 0,
+				    fp_before, fp_after, ready_before, ready_after,
+				    nonzero, bufsz, buf);
+			}
+		} else if (dbg_cnt % 200 == 0) {
+			/* SETUP path - no chn_intr yet */
+			const int16_t *sc_s = (const int16_t *)st->cur;
+			printf("line6 play cb#%u (SETUP) cur=%p samples=[%d,%d,%d,%d]\n",
+			    dbg_cnt, st->cur,
+			    (st->cur + 8 <= st->end) ? sc_s[0] : 0,
+			    (st->cur + 8 <= st->end) ? sc_s[1] : 0,
+			    (st->cur + 8 <= st->end) ? sc_s[2] : 0,
+			    (st->cur + 8 <= st->end) ? sc_s[3] : 0);
 		}
 
 		/* Compute per-frame lengths with rate jitter correction */
