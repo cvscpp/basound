@@ -1098,15 +1098,14 @@ line6_bsd_attach(device_t dev)
 	sc->audio_active = 0;
 
 	/*
-	 * Explicitly set alt=0 (zero-bandwidth) at attach time.  If a previous
-	 * module load crashed without resetting the interface, the device may
-	 * still be in alt=2 (audio streaming) which causes vendor control
-	 * requests (e.g. 0x0301) to fail with USB_ERR_IOERROR.  Setting alt=0
-	 * first brings the device back to a known state.  Ignore errors here
-	 * since the device may already be at alt=0.
+	 * Do NOT call usbd_set_alt_interface_index(alt=0) here.
+	 * The USB stack sends SET_CONFIGURATION during enumeration which
+	 * already resets all interfaces to alt=0.  An explicit SET_INTERFACE
+	 * (even to alt=0) can stall the device's control endpoint, making
+	 * subsequent vendor requests (0x80c2 firmware read, 0x0301 enable)
+	 * fail with USB_ERR_IOERROR.  The reset belongs in line6_bsd_detach()
+	 * so that a clean kldunload → kldload cycle never sees a stale alt.
 	 */
-	(void)usbd_set_alt_interface_index(sc->usbdev,
-	    sc->audio_iface_index, 0);
 
 	if (sc->capabilities & LINE6_CAP_INIT_TONEPORT) {
 		uint32_t ticks;
