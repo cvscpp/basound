@@ -776,20 +776,25 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 		/*
 		 * Switch interface 0 to the audio alt setting so the ISO
-		 * endpoints become visible.  FreeBSD's usbd_set_alt_interface_index
-		 * is idempotent if already at the requested alt index, so it is
-		 * safe to call for both play and rec.
+		 * endpoints become visible.  Safe to call for both play and rec
+		 * — each call is idempotent once the interface is already at the
+		 * requested alt setting.
+		 *
+		 * Some Line6 devices return USB_ERR_IOERROR from SET_INTERFACE
+		 * but still switch to the requested alt setting (error in the
+		 * USB status phase only).  Treat this as a non-fatal warning and
+		 * let usbd_transfer_setup below be the real gate — it will fail
+		 * with a clear error if the ISO endpoints are not actually present.
+		 *
 		 * Must NOT be called with sc_lock held (sleepable lock internally).
 		 */
 		uerr = usbd_set_alt_interface_index(sc->usbdev,
 		    sc->audio_iface_index, LINE6_ALT_AUDIO);
 		if (uerr != 0) {
 			device_printf(sc->dev,
-			    "set alt %u failed on iface %u: %s (is the device "
-			    "initialized correctly?)\n",
+			    "set alt %u warning on iface %u: %s — continuing\n",
 			    LINE6_ALT_AUDIO, sc->audio_iface_index,
 			    usbd_errstr(uerr));
-			return -EIO;
 		}
 
 		/*
@@ -890,8 +895,12 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 		uerr = usbd_set_alt_interface_index(sc->usbdev,
 		    sc->audio_iface_index, LINE6_ALT_AUDIO);
-		if (uerr != 0)
-			return -EIO;
+		if (uerr != 0) {
+			device_printf(sc->dev,
+			    "set alt %u warning on iface %u: %s — continuing\n",
+			    LINE6_ALT_AUDIO, sc->audio_iface_index,
+			    usbd_errstr(uerr));
+		}
 
 		struct usb_config cfg_copy[LINE6_NCHANBUFS];
 		memcpy(cfg_copy, cfg, sizeof(cfg_copy));
@@ -1088,6 +1097,17 @@ line6_bsd_attach(device_t dev)
 	sc->audio_iface_index = sc->ctrl_iface_index; /* always iface 0 */
 	sc->audio_active = 0;
 
+	/*
+	 * Explicitly set alt=0 (zero-bandwidth) at attach time.  If a previous
+	 * module load crashed without resetting the interface, the device may
+	 * still be in alt=2 (audio streaming) which causes vendor control
+	 * requests (e.g. 0x0301) to fail with USB_ERR_IOERROR.  Setting alt=0
+	 * first brings the device back to a known state.  Ignore errors here
+	 * since the device may already be at alt=0.
+	 */
+	(void)usbd_set_alt_interface_index(sc->usbdev,
+	    sc->audio_iface_index, 0);
+
 	if (sc->capabilities & LINE6_CAP_INIT_TONEPORT) {
 		uint32_t ticks;
 		struct timespec ts;
@@ -1216,6 +1236,15 @@ line6_bsd_detach(device_t dev)
 
 	usbd_transfer_unsetup(sc->play.xfer, LINE6_NCHANBUFS + 1);
 	usbd_transfer_unsetup(sc->rec.xfer, LINE6_NCHANBUFS + 1);
+
+	/*
+	 * Reset to zero-bandwidth alt setting so the device is in a clean
+	 * state after unload.  Without this the device stays in alt=2 (ISO
+	 * endpoints active) and the next kldload will see USB_ERR_IOERROR on
+	 * vendor control requests (firmware confusion without active ISO DMA).
+	 */
+	(void)usbd_set_alt_interface_index(sc->usbdev,
+	    sc->audio_iface_index, 0);
 
 	if (sc->alsa_line6 != NULL) {
 		card = (struct snd_card *)sc->alsa_line6;
