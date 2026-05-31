@@ -44,8 +44,17 @@ MALLOC_DECLARE(M_ALSA);
  * output, bypassing the DMA/feeder path.  Useful for verifying the hardware
  * output path works independently of the FreeBSD PCM stack.
  *
- *   sysctl hw.basound.line6.test_tone=1   # enable
- *   sysctl hw.basound.line6.test_tone=0   # disable (normal playback)
+ * Usage:
+ *   # Keep the device open with continuous writes:
+ *   dd if=/dev/zero of=/dev/dsp2 &
+ *   # Enable 1kHz test tone:
+ *   sysctl hw.basound.line6.test_tone=1
+ *   # Return to normal playback:
+ *   sysctl hw.basound.line6.test_tone=0
+ *
+ * If the tone is audible: USB output path works; silence is because the app
+ * writes zero samples.  Test with: cat /dev/urandom > /dev/dsp2
+ * If still silent: hardware routing or USB framing issue.
  */
 static int line6_test_tone = 0;
 static uint32_t line6_test_tone_phase = 0; /* sample counter for test tone */
@@ -450,6 +459,10 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 			 * wave (S16_LE stereo, amplitude 16384) to verify that
 			 * the hardware output path works independently of the
 			 * PCM stack.  Toggle polarity every 22 samples ≈ 1kHz.
+			 *
+			 * st->cur still advances so chn_intr sees correct
+			 * delta → feeder keeps draining the vchan bufsoft →
+			 * the app (e.g. dd if=/dev/zero) does not block.
 			 */
 			uint32_t remaining = total;
 			uint8_t tbuf[4]; /* one stereo S16_LE sample */
@@ -464,6 +477,16 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 				offset += 4;
 				remaining -= 4;
 				line6_test_tone_phase++;
+			}
+			/* Advance ring pointer to keep feeder draining */
+			n = total;
+			while (n > 0) {
+				uint32_t chunk = (uint32_t)(st->end - st->cur);
+				if (chunk > n) chunk = n;
+				st->cur += chunk;
+				n -= chunk;
+				if (st->cur >= st->end)
+					st->cur = st->start;
 			}
 		} else {
 			while (total > 0) {
