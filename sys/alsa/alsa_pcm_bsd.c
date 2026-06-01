@@ -32,6 +32,11 @@ static uint32_t basound_fmtlist[] = {
 	0
 };
 
+static uint32_t basound_line6_fmtlist[] = {
+	SND_FORMAT(AFMT_S16_LE, 2, 0),
+	0
+};
+
 /* FreeBSD Channel Methods */
 
 static void *
@@ -98,7 +103,10 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	ch->blocksize = 4096;
 
 	/* Initialize per-channel capabilities from ALSA constraints. */
-	ch->caps.fmtlist = basound_fmtlist;
+	if (pcm->private_data != NULL)
+		ch->caps.fmtlist = basound_fmtlist;
+	else
+		ch->caps.fmtlist = basound_line6_fmtlist;
 	ch->caps.caps = DSP_CAP_DUPLEX;
 	ch->caps.minspeed = 32000;
 	ch->caps.maxspeed = 192000;
@@ -135,6 +143,10 @@ basound_chan_setformat(kobj_t obj, void *data, uint32_t format)
 	struct snd_pcm_substream *substream = ch->substream;
 	const struct snd_pcm_ops *ops = substream->pstr->ops;
 
+	/* Line6 USB path is fixed to S16_LE stereo. */
+	if (substream->pcm->private_data == NULL)
+		format = SND_FORMAT(AFMT_S16_LE, 2, 0);
+
 	ch->format = format;
 	sndbuf_setfmt(ch->buffer, format);
 	if (substream->runtime != NULL) {
@@ -150,6 +162,10 @@ basound_chan_setspeed(kobj_t obj, void *data, uint32_t speed)
 	struct basound_chan *ch = data;
 	struct snd_pcm_substream *substream = ch->substream;
 	const struct snd_pcm_ops *ops = substream->pstr->ops;
+
+	/* Line6 USB path is fixed to 44.1kHz. */
+	if (substream->pcm->private_data == NULL)
+		speed = 44100;
 
 	ch->speed = speed;
 	if (substream->runtime != NULL) {
@@ -537,4 +553,3 @@ basound_pcm_register(struct snd_pcm *pcm)
 
 	return 0;
 }
-
