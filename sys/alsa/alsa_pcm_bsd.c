@@ -369,15 +369,9 @@ basound_chan_getptr(kobj_t obj, void *data)
 	struct basound_chan *ch = data;
 	struct snd_pcm_substream *substream = ch->substream;
 	const struct snd_pcm_ops *ops = substream->pstr->ops;
-	unsigned long frames;
-	uint32_t ptr;
 
-	if (ops && ops->pointer) {
-		frames = ops->pointer(substream);
-		uint32_t frame_bytes = AFMT_BPS(ch->format) * AFMT_CHANNEL(ch->format);
-		ptr = (uint32_t)(frames * frame_bytes);
-		return ptr;
-	}
+	if (ops && ops->pointer)
+		return (uint32_t)ops->pointer(substream);
 
 	return 0;
 }
@@ -452,18 +446,18 @@ basound_pcm_attach(device_t dev)
 
 	/*
 	 * Pre-set vchan format/rate for non-bitperfect (e.g. Line6 USB)
-	 * devices.  Without this, pvchanformat=0 causes vchan_create() to
+	 * devices.  Without this, {p,r}vchanformat=0 causes vchan_create() to
 	 * call chn_reset(parent, 0, 0), which skips feeder_chain().  The
 	 * parent channel then keeps feeder_root (installed during chn_init
-	 * before CHN_F_HAS_VCHAN was set), which reads from the empty parent
-	 * bufsoft instead of mixing vchan children → silence.  With non-zero
-	 * fmt+rate, feeder_chain() builds feeder_mixer on the parent, which
-	 * correctly reads from the active vchan children.
+	 * before CHN_F_HAS_VCHAN was set), so playback won't mix children and
+	 * capture won't distribute to children.
 	 */
 	if (pcm->private_data == NULL) {
 		struct snddev_info *d = device_get_softc(dev);
 		d->pvchanformat = SND_FORMAT(AFMT_S16_LE, 2, 0);
 		d->pvchanrate = 44100;
+		d->rvchanformat = SND_FORMAT(AFMT_S16_LE, 2, 0);
+		d->rvchanrate = 44100;
 	}
 
 	snprintf(status, sizeof(status), "at %s",

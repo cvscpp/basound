@@ -561,8 +561,11 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 		}
 
 		if (dbg_cnt % 200 == 0)
-			printf("line6 rec cb#%u cur+%u actlen=%d\n",
-			    dbg_cnt, (uint32_t)(st->cur - st->start), actlen);
+			printf("line6 rec cb#%u cur+%u actlen=%d pcm_ch=%p name=%s intr=%u\n",
+			    dbg_cnt, (uint32_t)(st->cur - st->start), actlen,
+			    st->pcm_ch,
+			    (st->pcm_ch != NULL) ? st->pcm_ch->name : "<null>",
+			    (st->pcm_ch != NULL) ? st->pcm_ch->interrupts : 0);
 
 		if (st->pcm_ch != NULL) {
 			mtx_unlock(&sc->sc_lock);
@@ -836,6 +839,10 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		st->cur   = (uint8_t *)runtime->dma_area;
 		st->pcm_ch = ch->channel;
 		st->running = 1;
+		printf("line6 trigger: dir=%d pcm_ch=%p name=%s format=0x%08x speed=%u\n",
+		    substream->stream, st->pcm_ch,
+		    (st->pcm_ch != NULL) ? st->pcm_ch->name : "<null>",
+		    (st->pcm_ch != NULL) ? st->pcm_ch->format : 0, ch->speed);
 
 		{
 			const uint8_t *d = (const uint8_t *)runtime->dma_area;
@@ -956,12 +963,7 @@ line6_pcm_pointer(struct snd_pcm_substream *substream)
 		return 0;
 
 	bytes = (unsigned long)(st->cur - st->start);
-
-	/* Convert bytes to frames for ALSA shim */
-	uint32_t frame_bytes = AFMT_BPS(st->pcm_ch->format) * AFMT_CHANNEL(st->pcm_ch->format);
-	if (frame_bytes == 0)
-		return 0;
-	return (unsigned long)(bytes / frame_bytes);
+	return bytes;
 }
 
 static const struct snd_pcm_ops line6_pcm_ops = {
