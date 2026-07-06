@@ -81,9 +81,9 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	/* Make the DMA address visible to the ALSA runtime and the
 	 * hardware trigger path (hdsp_main.c reads these via
 	 * hdsp->playback_substream->runtime->dma_addr). */
-	substream->runtime->dma_area  = sndbuf_getbuf(b);
-	substream->runtime->dma_addr  = sndbuf_getbufaddr(b);
-	substream->runtime->dma_bytes = sndbuf_getsize(b);
+	substream->runtime->dma_area  = b->buf;
+	substream->runtime->dma_addr  = b->buf_addr;
+	substream->runtime->dma_bytes = b->bufsize;
 
 	/* Initialize hardware format.  HDSP stores a struct hdsp * in
 	 * pcm->private_data with the exact channel count; other drivers
@@ -234,7 +234,7 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	 * the USB ring-buffer math (st->end = start + dma_bytes) agrees
 	 * with what the PCM layer thinks the buffer size is. */
 	if (ch->runtime != NULL)
-		ch->runtime->dma_bytes = sndbuf_getsize(ch->buffer);
+		ch->runtime->dma_bytes = ch->buffer->bufsize;
 
 	return blocksize;
 }

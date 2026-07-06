@@ -536,7 +536,7 @@ hdsp_deinterleave_to_planar(struct hdsp *hdsp, int period_idx)
 		return;
 
 	ch_buf_words = HDSP_CHANNEL_BUFFER_BYTES / 4;
-	src = (const uint32_t *)sndbuf_getbuf(ch->buffer);
+	src = (const uint32_t *)ch->buffer->buf;
 	dst = (uint32_t *)hdsp->playback_buffer;
 
 	src_off = period_idx * period_frames * nch;
@@ -582,7 +582,7 @@ hdsp_interleave_from_planar(struct hdsp *hdsp, int period_idx)
 
 	ch_buf_words = HDSP_CHANNEL_BUFFER_BYTES / 4;
 	src = (const uint32_t *)hdsp->capture_buffer;
-	dst = (uint32_t *)sndbuf_getbuf(ch->buffer);
+	dst = (uint32_t *)ch->buffer->buf;
 
 	src_off = period_idx * period_frames;
 	dst_off = period_idx * period_frames * nch;

@@ -249,7 +249,7 @@ User Applications (aplay, arecord, mixer, etc.)
 
 ### Prerequisites
 
-- FreeBSD kernel source (in `/usr/src`)
+- FreeBSD 15.1 or later with kernel source (in `/usr/src`)
 - C compiler (clang)
 - Make utility
 
@@ -506,7 +506,7 @@ The ALSA shim layer provides Linux kernel API compatibility to allow ALSA driver
 ### Prerequisites
 - Compatible DICE, HDSP, or Line6 device
 - FireWire cable (for DICE), PCI slot (for HDSP), or USB cable (for Line6)
-- FreeBSD system with kernel source
+- FreeBSD 15.1 or later with kernel source
 
 ### Steps
 
