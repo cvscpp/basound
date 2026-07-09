@@ -143,10 +143,6 @@ basound_chan_setformat(kobj_t obj, void *data, uint32_t format)
 	struct snd_pcm_substream *substream = ch->substream;
 	const struct snd_pcm_ops *ops = substream->pstr->ops;
 
-	/* Line6 USB path is fixed to S16_LE stereo. */
-	if (substream->pcm->private_data == NULL)
-		format = SND_FORMAT(AFMT_S16_LE, 2, 0);
-
 	ch->format = format;
 	sndbuf_setfmt(ch->buffer, format);
 	if (substream->runtime != NULL) {
@@ -162,17 +158,21 @@ basound_chan_setspeed(kobj_t obj, void *data, uint32_t speed)
 	struct basound_chan *ch = data;
 	struct snd_pcm_substream *substream = ch->substream;
 	const struct snd_pcm_ops *ops = substream->pstr->ops;
+	uint32_t actual;
 
-	/* Line6 USB path is fixed to 44.1kHz. */
-	if (substream->pcm->private_data == NULL)
-		speed = 44100;
+	/* Enforce hardware limits (Line6 is fixed at 44.1kHz). */
+	actual = speed;
+	if (ch->caps.minspeed != 0 && actual < ch->caps.minspeed)
+		actual = ch->caps.minspeed;
+	if (ch->caps.maxspeed != 0 && actual > ch->caps.maxspeed)
+		actual = ch->caps.maxspeed;
 
-	ch->speed = speed;
+	ch->speed = actual;
 	if (substream->runtime != NULL) {
 		if (ops && ops->prepare)
 			ops->prepare(substream);
 	}
-	return speed;
+	return actual;
 }
 static uint32_t
 basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
@@ -233,8 +233,16 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	/* Keep runtime in sync with the logical buffer size so that
 	 * the USB ring-buffer math (st->end = start + dma_bytes) agrees
 	 * with what the PCM layer thinks the buffer size is. */
-	if (ch->runtime != NULL)
+	if (ch->runtime != NULL) {
+		/*
+		 * sndbuf_resize() can remap/reallocate the backing buffer.
+		 * Refresh runtime DMA pointers so drivers (e.g. Line6) read
+		 * from the current hardware ring, not a stale old mapping.
+		 */
+		ch->runtime->dma_area = ch->buffer->buf;
+		ch->runtime->dma_addr = ch->buffer->buf_addr;
 		ch->runtime->dma_bytes = ch->buffer->bufsize;
+	}
 
 	return blocksize;
 }
@@ -415,6 +423,7 @@ basound_pcm_attach(device_t dev)
 	struct snd_pcm_str *pstr_p = &pcm->streams[SNDRV_PCM_STREAM_PLAYBACK];
 	struct snd_pcm_str *pstr_c = &pcm->streams[SNDRV_PCM_STREAM_CAPTURE];
 	char status[SND_STATUSLEN];
+	int is_line6 = (strcmp(card->driver, "line6_bsd") == 0);
 
 	/* Set description here because basound_pcm_probe is bypassed
 	 * (we use device_set_driver + device_attach directly). */
@@ -428,7 +437,7 @@ basound_pcm_attach(device_t dev)
 	 * with 18/26 channels).  For stereo USB devices like Line6, leave it
 	 * off so the PCM layer handles normal format negotiation.
 	 */
-	if (pcm->private_data != NULL) {
+	if (pcm->private_data != NULL || is_line6) {
 		pcm_setflags(dev, pcm_getflags(dev) | SD_F_BITPERFECT);
 	}
 
@@ -452,7 +461,7 @@ basound_pcm_attach(device_t dev)
 	 * before CHN_F_HAS_VCHAN was set), so playback won't mix children and
 	 * capture won't distribute to children.
 	 */
-	if (pcm->private_data == NULL) {
+	if (pcm->private_data == NULL && !is_line6) {
 		struct snddev_info *d = device_get_softc(dev);
 		d->pvchanformat = SND_FORMAT(AFMT_S16_LE, 2, 0);
 		d->pvchanrate = 44100;

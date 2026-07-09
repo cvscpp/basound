@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+# Usage:
+#   ./test.tone [dsp-device] [freq-hz] [length-ms]
+# Example:
+#   ./test.tone /dev/dsp3 440 2000
+
+DSP_DEV="${1:-/dev/dsp3}"
+FREQ_HZ="${2:-440}"
+LENGTH_MS="${3:-2000}"
+
+sysctl "hw.basound.debug.test_tone_freq_hz=${FREQ_HZ}"
+sysctl "hw.basound.debug.test_tone_length_ms=${LENGTH_MS}"
+
+# Re-arm one-shot tone even if already set.
+sysctl hw.basound.debug.test_tone=0 >/dev/null
+sysctl hw.basound.debug.test_tone=1
+
+# Keep playback stream active so USB callbacks run and inject the tone.
+dd if=/dev/zero of="${DSP_DEV}" bs=4096 2>/dev/null &
+DD_PID=$!
+
+cleanup() {
+	kill "${DD_PID}" 2>/dev/null || true
+	wait "${DD_PID}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+if [ "${LENGTH_MS}" -gt 0 ] 2>/dev/null; then
+	# Add 1 second guard so the one-shot has time to fully play.
+	SECS=$(( (LENGTH_MS + 999) / 1000 + 1 ))
+else
+	SECS=5
+fi
+
+sleep "${SECS}"

@@ -34,39 +34,15 @@
 #include <sound/pcm_params.h>
 #include <sound/rawmidi.h>
 #include <alsa_pcm_bsd.h>
+#include "basound_debug.h"
 
 /* Line6 USB driver - bridges FreeBSD usb_device to ALSA Line6 driver */
 
 MALLOC_DECLARE(M_ALSA);
 
-/*
- * Test tone sysctl: set to non-zero to inject a 1kHz square wave into USB
- * output, bypassing the DMA/feeder path.  Useful for verifying the hardware
- * output path works independently of the FreeBSD PCM stack.
- *
- * Usage:
- *   # Keep the device open with continuous writes:
- *   dd if=/dev/zero of=/dev/dsp2 &
- *   # Enable 1kHz test tone:
- *   sysctl hw.basound.line6.test_tone=1
- *   # Return to normal playback:
- *   sysctl hw.basound.line6.test_tone=0
- *
- * If the tone is audible: USB output path works; silence is because the app
- * writes zero samples.  Test with: cat /dev/urandom > /dev/dsp2
- * If still silent: hardware routing or USB framing issue.
- */
-static int line6_test_tone = 0;
-static uint32_t line6_test_tone_phase = 0; /* sample counter for test tone */
-
-SYSCTL_DECL(_hw);
-SYSCTL_NODE(_hw, OID_AUTO, basound, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
-    "basound USB audio driver");
+SYSCTL_DECL(_hw_basound);
 SYSCTL_NODE(_hw_basound, OID_AUTO, line6, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "Line6 USB audio");
-SYSCTL_INT(_hw_basound_line6, OID_AUTO, test_tone, CTLFLAG_RW,
-    &line6_test_tone, 0,
-    "Inject 1kHz test tone into USB output (1=enable, 0=normal)");
 
 /*
  * USB isochronous transport parameters.
@@ -81,6 +57,8 @@ SYSCTL_INT(_hw_basound_line6, OID_AUTO, test_tone, CTLFLAG_RW,
 #define LINE6_NFRAMES		8	/* ISO frames per USB transfer */
 #define LINE6_NCHANBUFS		4	/* double-buffered outstanding transfers */
 #define LINE6_ALT_AUDIO		2	/* bAlternateSetting index for ISO audio */
+#define LINE6_ALT_MIN		1
+#define LINE6_ALT_MAX		4
 
 /*
  * Per-direction audio stream state.  One instance lives in the softc for
@@ -92,6 +70,8 @@ struct line6_audio_stream {
 	uint8_t		*start;		/* DMA ring buffer start */
 	uint8_t		*end;		/* DMA ring buffer end */
 	uint8_t		*cur;		/* Current read/write position */
+	uint32_t	 hwptr_bytes;	/* hardware pointer offset in DMA ring */
+	uint32_t	 sample_size;	/* bytes per PCM frame (all channels) */
 	uint32_t	 bytes_per_frame[2]; /* [0]=base bytes, [1]=base+sample_sz */
 	uint32_t	 intr_frames;	/* USB frames per transfer */
 	uint32_t	 frames_per_second; /* 1000 for FS, 8000 for HS */
@@ -286,7 +266,9 @@ struct line6_bsd_softc {
 	struct line6_audio_stream rec;
 	uint8_t		 ctrl_iface_index; /* USB interface for AudioControl */
 	uint8_t		 audio_iface_index; /* USB interface hosting ISO endpoints */
+	uint8_t		 audio_altsetting; /* preferred audio streaming alt */
 	uint32_t	 audio_active;	/* bitmask: 1=play, 2=rec; 0=none active */
+	uint8_t		 toneport_enabled; /* 0x0301 accepted at least once */
 };
 
 MALLOC_DEFINE(M_LINE6_BSD, "line6_bsd", "Line6 BSD softc");
@@ -351,6 +333,37 @@ line6_has_iso_endpoints(struct usb_device *udev)
 }
 
 /*
+ * Select an audio alt setting robustly. Some devices/firmware return
+ * transient errors on one alt even though other valid audio alts work.
+ */
+static usb_error_t
+line6_set_audio_alt(struct line6_bsd_softc *sc)
+{
+	usb_error_t err;
+
+	err = usbd_set_alt_interface_index(sc->usbdev, sc->audio_iface_index,
+	    sc->audio_altsetting);
+	if (err == 0)
+		return 0;
+
+	for (uint8_t alt = LINE6_ALT_MIN; alt <= LINE6_ALT_MAX; alt++) {
+		if (alt == sc->audio_altsetting)
+			continue;
+		err = usbd_set_alt_interface_index(sc->usbdev,
+		    sc->audio_iface_index, alt);
+		if (err == 0) {
+			device_printf(sc->dev,
+			    "audio alt %u selected (fallback from %u)\n",
+			    alt, sc->audio_altsetting);
+			sc->audio_altsetting = alt;
+			return 0;
+		}
+	}
+
+	return err;
+}
+
+/*
  * USB isochronous playback callback.
  * Called with sc->sc_lock held (it is the USB transfer mutex).
  *
@@ -381,60 +394,6 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 		if (!st->running || st->start == NULL || st->start == st->end)
 			break;
 
-		/*
-		 * Notify the PCM layer that the ring buffer was consumed and
-		 * allow the feeder to refill it.  Called for both SETUP and
-		 * TRANSFERRED so the feeder stays ahead of the USB pipeline
-		 * during the initial burst of SETUP submissions.
-		 *
-		 * Drop sc_lock first: chn_intr acquires the PCM channel lock,
-		 * and the channel lock → sc_lock order (from trigger) means we
-		 * must not hold sc_lock when taking the channel lock.
-		 */
-		if (st->pcm_ch != NULL) {
-			uint32_t ready_before = sndbuf_getready(st->pcm_ch->bufhard);
-			uint32_t fp_before = sndbuf_getfreeptr(st->pcm_ch->bufhard);
-			mtx_unlock(&sc->sc_lock);
-			chn_intr(st->pcm_ch);
-			mtx_lock(&sc->sc_lock);
-			if (!st->running)
-				break;
-			if (dbg_cnt % 200 == 0) {
-				uint32_t ready_after = sndbuf_getready(st->pcm_ch->bufhard);
-				uint32_t fp_after = sndbuf_getfreeptr(st->pcm_ch->bufhard);
-				uint32_t ring_size = (uint32_t)(st->end - st->start);
-
-				/* Bytes just written by feeder_mixer start at fp_before */
-				const int16_t *sf = (const int16_t *)(st->start +
-				    fp_before % ring_size);
-				int f0 = (fp_before + 8 <= ring_size) ? sf[0] : 0;
-				int f1 = (fp_before + 8 <= ring_size) ? sf[1] : 0;
-				int f2 = (fp_before + 8 <= ring_size) ? sf[2] : 0;
-				int f3 = (fp_before + 8 <= ring_size) ? sf[3] : 0;
-
-				/* Bytes about to be USB-sent start at st->cur */
-				const int16_t *su = (const int16_t *)st->cur;
-				int ns0 = (st->cur + 8 <= st->end) ? su[0] : 0;
-				int ns1 = (st->cur + 8 <= st->end) ? su[1] : 0;
-				int ns2 = (st->cur + 8 <= st->end) ? su[2] : 0;
-				int ns3 = (st->cur + 8 <= st->end) ? su[3] : 0;
-
-				printf("line6 play cb#%u state=%s"
-				    " cur=%p(+%u) ring=[%u..%u]"
-				    " ready=%u->%u fp=%u->%u"
-				    " new=[%d,%d,%d,%d] usb=[%d,%d,%d,%d]\n",
-				    dbg_cnt,
-				    USB_GET_STATE(xfer) == USB_ST_SETUP ?
-				        "SETUP" : "XFRD",
-				    st->cur, (uint32_t)(st->cur - st->start),
-				    0, ring_size,
-				    ready_before, ready_after,
-				    fp_before, fp_after,
-				    f0, f1, f2, f3,
-				    ns0, ns1, ns2, ns3);
-			}
-		}
-
 		/* Compute per-frame lengths with rate jitter correction */
 		usbd_xfer_set_frames(xfer, st->intr_frames);
 		total = 0;
@@ -446,6 +405,8 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 			} else {
 				frame_len = st->bytes_per_frame[0];
 			}
+			if (frame_len == 0)
+				frame_len = st->sample_size;
 			usbd_xfer_set_frame_len(xfer, n, frame_len);
 			total += frame_len;
 		}
@@ -453,30 +414,22 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 		/* Copy from DMA ring buffer into USB isochronous packet */
 		offset = 0;
 		pc = usbd_xfer_get_frame(xfer, 0);
-		if (line6_test_tone) {
+		if (basound_debug_tone_enabled()) {
 			/*
-			 * Test tone mode: fill USB frames with a 1kHz square
-			 * wave (S16_LE stereo, amplitude 16384) to verify that
-			 * the hardware output path works independently of the
-			 * PCM stack.  Toggle polarity every 22 samples ≈ 1kHz.
-			 *
-			 * st->cur still advances so chn_intr sees correct
-			 * delta → feeder keeps draining the vchan bufsoft →
-			 * the app (e.g. dd if=/dev/zero) does not block.
+			 * Shared basound debug tone path. We still advance st->cur
+			 * so feeder/PCM progress remains consistent while testing.
 			 */
 			uint32_t remaining = total;
-			uint8_t tbuf[4]; /* one stereo S16_LE sample */
-			while (remaining >= 4) {
-				int16_t v = (line6_test_tone_phase % 44 < 22) ?
-				    16384 : -16384;
-				tbuf[0] = (uint8_t)(v & 0xff);
-				tbuf[1] = (uint8_t)((v >> 8) & 0xff);
-				tbuf[2] = tbuf[0]; /* same for right channel */
-				tbuf[3] = tbuf[1];
-				usbd_copy_in(pc, offset, tbuf, 4);
-				offset += 4;
-				remaining -= 4;
-				line6_test_tone_phase++;
+			uint8_t tbuf[512];
+			while (remaining > 0) {
+				uint32_t chunk = MIN(remaining,
+				    (uint32_t)sizeof(tbuf));
+				if (!basound_debug_tone_fill_s16le(tbuf, chunk, 2,
+				    44100))
+					memset(tbuf, 0, chunk);
+				usbd_copy_in(pc, offset, tbuf, chunk);
+				offset += chunk;
+				remaining -= chunk;
 			}
 			/* Advance ring pointer to keep feeder draining */
 			n = total;
@@ -501,15 +454,40 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 					st->cur = st->start;
 			}
 		}
+
+		/* Pointer seen by FreeBSD PCM layer is byte offset in ring. */
+		if (st->end > st->start)
+			st->hwptr_bytes = (uint32_t)(st->cur - st->start);
+
+		/*
+		 * Notify the PCM layer only after we advanced the hardware
+		 * pointer, so chn_getptr sees forward progress.
+		 */
+		if (st->pcm_ch != NULL) {
+			mtx_unlock(&sc->sc_lock);
+			chn_intr(st->pcm_ch);
+			mtx_lock(&sc->sc_lock);
+			if (!st->running)
+				break;
+		}
+
+		if (dbg_cnt % 200 == 0)
+			printf("line6 play cb#%u state=%s hwptr=%u total=%u\n",
+			    dbg_cnt,
+			    USB_GET_STATE(xfer) == USB_ST_SETUP ? "SETUP" : "XFRD",
+			    st->hwptr_bytes, offset);
 		usbd_transfer_submit(xfer);
 		break;
 	}
 
 	default:	/* Error */
 		if (error != USB_ERR_CANCELLED && st->running) {
+			uint32_t frame_len = st->bytes_per_frame[0];
+			if (frame_len == 0)
+				frame_len = st->sample_size;
 			/* Transient error: send one silent frame and recover */
 			usbd_xfer_set_frames(xfer, 1);
-			usbd_xfer_set_frame_len(xfer, 0, st->bytes_per_frame[0]);
+			usbd_xfer_set_frame_len(xfer, 0, frame_len);
 			usbd_transfer_submit(xfer);
 		}
 		break;
@@ -559,6 +537,8 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 					st->cur = st->start;
 			}
 		}
+		if (st->end > st->start)
+			st->hwptr_bytes = (uint32_t)(st->cur - st->start);
 
 		if (dbg_cnt % 200 == 0)
 			printf("line6 rec cb#%u cur+%u actlen=%d pcm_ch=%p name=%s intr=%u\n",
@@ -624,6 +604,32 @@ line6_send_cmd(struct usb_device *udev, uint16_t cmd1, uint16_t cmd2)
 	return (usbd_do_request(udev, NULL, &req, NULL));
 }
 
+static usb_error_t
+line6_send_cmd_retry(struct usb_device *udev, uint16_t cmd1, uint16_t cmd2,
+    int retries)
+{
+	usb_error_t err = USB_ERR_NORMAL_COMPLETION;
+
+	for (int i = 0; i < retries; i++) {
+		err = line6_send_cmd(udev, cmd1, cmd2);
+		if (err == 0)
+			return 0;
+		pause("line6cmd", hz / 20);
+	}
+	return err;
+}
+
+static int
+line6_toneport_enable(struct line6_bsd_softc *sc)
+{
+	if (line6_send_cmd_retry(sc->usbdev, 0x0301, 0x0000, 5) != 0)
+		return -EIO;
+
+	/* Default source: Microphone (best effort). */
+	(void)line6_send_cmd_retry(sc->usbdev, 0x0a01, 0x0000, 3);
+	return 0;
+}
+
 /*
  * Write data to a specific address on the Line6 device using vendor request 0x67.
  */
@@ -677,11 +683,11 @@ line6_pcm_open(struct snd_pcm_substream *substream)
 	runtime->hw.rate_max = 44100;
 	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 2;
-	runtime->hw.buffer_bytes_max = 1 << 20;
+	runtime->hw.buffer_bytes_max = 60000;
 	runtime->hw.period_bytes_min = 64;
-	runtime->hw.period_bytes_max = 1 << 16;
-	runtime->hw.periods_min = 2;
-	runtime->hw.periods_max = 128;
+	runtime->hw.period_bytes_max = 8192;
+	runtime->hw.periods_min = 1;
+	runtime->hw.periods_max = 1024;
 	
 	return 0;
 }
@@ -764,13 +770,21 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 		/* Derive USB frame size from the negotiated format + rate */
 		channels = AFMT_CHANNEL(ch->format);
+		if (channels == 0)
+			channels = 2;
 		if (ch->format & AFMT_S32_LE)
 			bps = 4;
-		else if (ch->format & AFMT_S24_LE)
+#ifdef AFMT_S24_PACKED
+		else if (ch->format & AFMT_S24_PACKED)
 			bps = 3;
+#endif
+		else if (ch->format & AFMT_S24_LE)
+			bps = 4;
 		else
 			bps = 2;	/* S16_LE default */
 		sample_size = channels * bps;
+		if (sample_size == 0)
+			sample_size = 4;	/* stereo S16_LE safety */
 
 		cfg = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) ?
 		    line6_play_cfg : line6_rec_cfg;
@@ -791,13 +805,29 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		 *
 		 * Must NOT be called with sc_lock held (sleepable lock internally).
 		 */
-		uerr = usbd_set_alt_interface_index(sc->usbdev,
-		    sc->audio_iface_index, LINE6_ALT_AUDIO);
+		uerr = line6_set_audio_alt(sc);
 		if (uerr != 0) {
 			device_printf(sc->dev,
-			    "set alt %u warning on iface %u: %s — continuing\n",
-			    LINE6_ALT_AUDIO, sc->audio_iface_index,
+			    "set audio alt warning on iface %u: %s — continuing\n",
+			    sc->audio_iface_index,
 			    usbd_errstr(uerr));
+		}
+
+		/*
+		 * TonePort/POD Studio command 0x0301 is required on some
+		 * devices, but failures are observed on certain firmware
+		 * revisions. Keep it best-effort so stream startup is not
+		 * blocked by control request quirks.
+		 */
+		if ((sc->capabilities & LINE6_CAP_INIT_TONEPORT) &&
+		    !sc->toneport_enabled) {
+			if (line6_toneport_enable(sc) < 0) {
+				device_printf(sc->dev,
+				    "toneport enable (0x0301) failed at stream "
+				    "start; continuing\n");
+			} else {
+				sc->toneport_enabled = 1;
+			}
 		}
 
 		/*
@@ -828,15 +858,21 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		if (st->frames_per_second == 0)
 			st->frames_per_second = 1000;	/* full-speed fallback */
 		st->intr_frames = LINE6_NFRAMES;
+		st->sample_size = sample_size;
 		st->bytes_per_frame[0] =
 		    (ch->speed / st->frames_per_second) * sample_size;
 		st->sample_rem = ch->speed % st->frames_per_second;
 		st->bytes_per_frame[1] = st->bytes_per_frame[0] + sample_size;
+		if (st->bytes_per_frame[0] == 0 && st->sample_rem == 0) {
+			st->bytes_per_frame[0] = sample_size;
+			st->bytes_per_frame[1] = sample_size;
+		}
 		st->sample_curr = 0;
 
 		st->start = (uint8_t *)runtime->dma_area;
 		st->end   = (uint8_t *)runtime->dma_area + runtime->dma_bytes;
 		st->cur   = (uint8_t *)runtime->dma_area;
+		st->hwptr_bytes = 0;
 		st->pcm_ch = ch->channel;
 		st->running = 1;
 		printf("line6 trigger: dir=%d pcm_ch=%p name=%s format=0x%08x speed=%u\n",
@@ -900,12 +936,11 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		    SNDRV_PCM_STREAM_PLAYBACK) ? 1 : 2;
 		usb_error_t uerr;
 
-		uerr = usbd_set_alt_interface_index(sc->usbdev,
-		    sc->audio_iface_index, LINE6_ALT_AUDIO);
+		uerr = line6_set_audio_alt(sc);
 		if (uerr != 0) {
 			device_printf(sc->dev,
-			    "set alt %u warning on iface %u: %s — continuing\n",
-			    LINE6_ALT_AUDIO, sc->audio_iface_index,
+			    "set audio alt warning on iface %u: %s — continuing\n",
+			    sc->audio_iface_index,
 			    usbd_errstr(uerr));
 		}
 
@@ -962,7 +997,10 @@ line6_pcm_pointer(struct snd_pcm_substream *substream)
 	if (st->start == NULL || st->cur == NULL || st->pcm_ch == NULL)
 		return 0;
 
-	bytes = (unsigned long)(st->cur - st->start);
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+		bytes = (unsigned long)(st->cur - st->start);
+	else
+		bytes = st->hwptr_bytes;
 	return bytes;
 }
 
@@ -1097,7 +1135,9 @@ line6_bsd_attach(device_t dev)
 	 * of interface 0, which is why ifaces_max=1 is normal and correct.
 	 */
 	sc->audio_iface_index = sc->ctrl_iface_index; /* always iface 0 */
+	sc->audio_altsetting = LINE6_ALT_AUDIO;
 	sc->audio_active = 0;
+	sc->toneport_enabled = 0;
 
 	/*
 	 * Do NOT call usbd_set_alt_interface_index(alt=0) here.
@@ -1126,16 +1166,14 @@ line6_bsd_attach(device_t dev)
 		ticks = (uint32_t)ts.tv_sec;
 		line6_write_data(sc->usbdev, 0x80c6, &ticks, 4);
 
-		/* 1. Enable device */
-		err = line6_send_cmd(sc->usbdev, 0x0301, 0x0000);
+		err = line6_toneport_enable(sc);
 		if (err != 0) {
-			device_printf(dev, "Initialization (0x0301) failed: %s\n",
-			    usbd_errstr(err));
+			device_printf(dev,
+			    "Initialization (0x0301) failed; will retry on "
+			    "stream start\n");
 		} else {
+			sc->toneport_enabled = 1;
 			device_printf(dev, "Device enabled (0x0301 success)\n");
-
-			/* 2. Select input source: Microphone (0x0a01) */
-			line6_send_cmd(sc->usbdev, 0x0a01, 0x0000);
 		}
 	}
 

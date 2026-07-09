@@ -1,5 +1,6 @@
 KMOD=	basound
 SRCS=	sys/dev/basound/basound.c \
+	sys/dev/basound/basound_debug.c \
 	sys/alsa/alsa_card.c \
 	sys/alsa/alsa_pcm.c \
 	sys/alsa/alsa_pcm_bsd.c \
@@ -24,6 +25,7 @@ SRCS=	sys/dev/basound/basound.c \
 
 CFLAGS+= -I${.CURDIR}/sys/alsa/include \
 	-I${.CURDIR}/sys/alsa \
+	-I${.CURDIR}/sys/dev/basound \
 	-I${.CURDIR}/sys/dev/basound/hdsp \
 	-I${.CURDIR}/sys/dev/usb
 
