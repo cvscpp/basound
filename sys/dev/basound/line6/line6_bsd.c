@@ -1086,10 +1086,7 @@ line6_pcm_pointer(struct snd_pcm_substream *substream)
 	if (st->start == NULL || st->cur == NULL || st->pcm_ch == NULL)
 		return 0;
 
-	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
-		bytes = (unsigned long)(st->cur - st->start);
-	else
-		bytes = st->hwptr_bytes;
+	bytes = st->hwptr_bytes;
 	return bytes;
 }
 
