@@ -44,6 +44,45 @@ SYSCTL_DECL(_hw_basound);
 SYSCTL_NODE(_hw_basound, OID_AUTO, line6, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "Line6 USB audio");
 
+struct line6_bsd_softc;
+static int line6_toneport_enable(struct line6_bsd_softc *sc);
+static int line6_toneport_set_capture_source(struct line6_bsd_softc *sc);
+static struct line6_bsd_softc *line6_active_sc;
+
+/*
+ * TonePort/POD Studio capture source selector (matches Linux toneport.c):
+ *   0 = Microphone   (0x0a01)
+ *   1 = Line         (0x0801)
+ *   2 = Instrument   (0x0b01)
+ *   3 = Inst & Mic   (0x0901)
+ */
+static int line6_capture_source = 0;
+
+static int
+sysctl_line6_capture_source(SYSCTL_HANDLER_ARGS)
+{
+	int err, v;
+
+	v = line6_capture_source;
+	err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (v < 0 || v > 3)
+		return (EINVAL);
+	line6_capture_source = v;
+
+	/* Apply immediately when a Line6 device is attached. */
+	if (line6_active_sc != NULL)
+		(void)line6_toneport_enable(line6_active_sc);
+
+	return (0);
+}
+
+SYSCTL_PROC(_hw_basound_line6, OID_AUTO, capture_source,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
+    sysctl_line6_capture_source, "I",
+    "TonePort/POD Studio capture source: 0=mic 1=line 2=instrument 3=inst+mic");
+
 /*
  * USB isochronous transport parameters.
  * Full-speed USB (12 Mbps) has 1 ms frames → 1000 fps.
@@ -363,6 +402,31 @@ line6_set_audio_alt(struct line6_bsd_softc *sc)
 	return err;
 }
 
+static uint32_t
+line6_set_playback_frame_lengths(struct line6_audio_stream *st,
+    struct usb_xfer *xfer)
+{
+	uint32_t total = 0;
+	uint32_t n, frame_len;
+
+	usbd_xfer_set_frames(xfer, st->intr_frames);
+	for (n = 0; n < st->intr_frames; n++) {
+		st->sample_curr += st->sample_rem;
+		if (st->sample_curr >= st->frames_per_second) {
+			st->sample_curr -= st->frames_per_second;
+			frame_len = st->bytes_per_frame[1];
+		} else {
+			frame_len = st->bytes_per_frame[0];
+		}
+		if (frame_len == 0)
+			frame_len = st->sample_size;
+		usbd_xfer_set_frame_len(xfer, n, frame_len);
+		total += frame_len;
+	}
+
+	return (total);
+}
+
 /*
  * USB isochronous playback callback.
  * Called with sc->sc_lock held (it is the USB transfer mutex).
@@ -380,7 +444,7 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 	struct line6_bsd_softc *sc =
 	    __containerof(st, struct line6_bsd_softc, play);
 	struct usb_page_cache *pc;
-	uint32_t total, n, offset, frame_len;
+	uint32_t total, n, offset;
 	int actlen, sumlen;
 	static uint32_t dbg_cnt = 0;
 
@@ -395,21 +459,7 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 			break;
 
 		/* Compute per-frame lengths with rate jitter correction */
-		usbd_xfer_set_frames(xfer, st->intr_frames);
-		total = 0;
-		for (n = 0; n < st->intr_frames; n++) {
-			st->sample_curr += st->sample_rem;
-			if (st->sample_curr >= st->frames_per_second) {
-				st->sample_curr -= st->frames_per_second;
-				frame_len = st->bytes_per_frame[1];
-			} else {
-				frame_len = st->bytes_per_frame[0];
-			}
-			if (frame_len == 0)
-				frame_len = st->sample_size;
-			usbd_xfer_set_frame_len(xfer, n, frame_len);
-			total += frame_len;
-		}
+		total = line6_set_playback_frame_lengths(st, xfer);
 
 		/* Copy from DMA ring buffer into USB isochronous packet */
 		offset = 0;
@@ -482,12 +532,8 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 
 	default:	/* Error */
 		if (error != USB_ERR_CANCELLED && st->running) {
-			uint32_t frame_len = st->bytes_per_frame[0];
-			if (frame_len == 0)
-				frame_len = st->sample_size;
-			/* Transient error: send one silent frame and recover */
-			usbd_xfer_set_frames(xfer, 1);
-			usbd_xfer_set_frame_len(xfer, 0, frame_len);
+			/* Transient error: re-arm with proper frame sizing */
+			(void)line6_set_playback_frame_lengths(st, xfer);
 			usbd_transfer_submit(xfer);
 		}
 		break;
@@ -559,15 +605,22 @@ tr_setup:
 		if (!st->running)
 			break;
 		usbd_xfer_set_frames(xfer, st->intr_frames);
-		for (i = 0; i < (int)st->intr_frames; i++)
-			usbd_xfer_set_frame_len(xfer, i, st->bytes_per_frame[1]);
+		for (i = 0; i < (int)st->intr_frames; i++) {
+			uint32_t frame_len = st->bytes_per_frame[1];
+			if (frame_len == 0)
+				frame_len = st->sample_size;
+			usbd_xfer_set_frame_len(xfer, i, frame_len);
+		}
 		usbd_transfer_submit(xfer);
 		break;
 
 	default:	/* Error */
 		if (error != USB_ERR_CANCELLED && st->running) {
+			uint32_t frame_len = st->bytes_per_frame[1];
+			if (frame_len == 0)
+				frame_len = st->sample_size;
 			usbd_xfer_set_frames(xfer, 1);
-			usbd_xfer_set_frame_len(xfer, 0, st->bytes_per_frame[1]);
+			usbd_xfer_set_frame_len(xfer, 0, frame_len);
 			usbd_transfer_submit(xfer);
 		}
 		break;
@@ -620,13 +673,36 @@ line6_send_cmd_retry(struct usb_device *udev, uint16_t cmd1, uint16_t cmd2,
 }
 
 static int
+line6_toneport_set_capture_source(struct line6_bsd_softc *sc)
+{
+	static const uint16_t capture_source_code[] = {
+		0x0a01,	/* microphone */
+		0x0801,	/* line */
+		0x0b01,	/* instrument */
+		0x0901,	/* inst + mic */
+	};
+	uint16_t cmd;
+	int src;
+
+	if (sc == NULL || !(sc->capabilities & LINE6_CAP_INIT_TONEPORT))
+		return -EOPNOTSUPP;
+
+	src = line6_capture_source;
+	if (src < 0 || src >= (int)(sizeof(capture_source_code) /
+	    sizeof(capture_source_code[0])))
+		src = 0;
+	cmd = capture_source_code[src];
+	if (line6_send_cmd_retry(sc->usbdev, cmd, 0x0000, 3) != 0)
+		return -EIO;
+	return 0;
+}
+
+static int
 line6_toneport_enable(struct line6_bsd_softc *sc)
 {
 	if (line6_send_cmd_retry(sc->usbdev, 0x0301, 0x0000, 5) != 0)
 		return -EIO;
-
-	/* Default source: Microphone (best effort). */
-	(void)line6_send_cmd_retry(sc->usbdev, 0x0a01, 0x0000, 3);
+	(void)line6_toneport_set_capture_source(sc);
 	return 0;
 }
 
@@ -827,6 +903,19 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 				    "start; continuing\n");
 			} else {
 				sc->toneport_enabled = 1;
+			}
+		}
+
+		/*
+		 * Re-apply capture source on capture stream start so sysctl
+		 * changes take effect without module reload.
+		 */
+		if ((sc->capabilities & LINE6_CAP_INIT_TONEPORT) &&
+		    substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+			if (line6_toneport_set_capture_source(sc) < 0) {
+				device_printf(sc->dev,
+				    "capture source command failed at stream "
+				    "start; continuing\n");
 			}
 		}
 
@@ -1242,6 +1331,7 @@ line6_bsd_attach(device_t dev)
 	}
 
 	sc->alsa_line6 = card;
+	line6_active_sc = sc;
 
 	device_printf(dev, "Line6 device attached - %s registered\n",
 	    info->name);
@@ -1262,6 +1352,8 @@ line6_bsd_detach(device_t dev)
 	sc = device_get_softc(dev);
 	if (sc == NULL)
 		return 0;
+	if (line6_active_sc == sc)
+		line6_active_sc = NULL;
 
 	/* Stop and tear down USB isochronous transfers if still running */
 	mtx_lock(&sc->sc_lock);

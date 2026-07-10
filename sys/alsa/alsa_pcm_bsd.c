@@ -199,6 +199,10 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 		uint32_t p2frames = 64;
 		while (p2frames < frames) p2frames <<= 1;
 		frames = p2frames;
+	} else {
+		/* Keep USB period above tiny defaults that add jitter/distortion. */
+		if (frames < 64)
+			frames = 64;
 	}
 
 	/* 3. Recalculate actual blocksize */
@@ -224,9 +228,11 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	if (ch->substream->pcm->private_data != NULL) {
 		blkcnt = 2;
 	} else {
-		blkcnt = 32768 / blocksize;
-		if (blkcnt < 4)
-			blkcnt = 4;
+		/*
+		 * USB: keep latency bounded and avoid excessively deep capture
+		 * rings (e.g. 64-byte blocks x 512 periods).
+		 */
+		blkcnt = 32;
 	}
 	sndbuf_resize(ch->buffer, blkcnt, blocksize);
 
