@@ -428,6 +428,38 @@ line6_set_playback_frame_lengths(struct line6_audio_stream *st,
 }
 
 /*
+ * Compute per-frame lengths for the CAPTURE (IN) direction with rate jitter
+ * correction.  The USB DMA buffer lays out frames contiguously at these
+ * configured lengths.  Returns total bytes expected across all frames.
+ *
+ * Must be called with the transfer lock held.
+ */
+static uint32_t
+line6_set_capture_frame_lengths(struct line6_audio_stream *st,
+    struct usb_xfer *xfer)
+{
+	uint32_t total = 0;
+	uint32_t n, frame_len;
+
+	usbd_xfer_set_frames(xfer, st->intr_frames);
+	for (n = 0; n < st->intr_frames; n++) {
+		st->sample_curr += st->sample_rem;
+		if (st->sample_curr >= st->frames_per_second) {
+			st->sample_curr -= st->frames_per_second;
+			frame_len = st->bytes_per_frame[1];
+		} else {
+			frame_len = st->bytes_per_frame[0];
+		}
+		if (frame_len == 0)
+			frame_len = st->sample_size;
+		usbd_xfer_set_frame_len(xfer, n, frame_len);
+		total += frame_len;
+	}
+
+	return (total);
+}
+
+/*
  * USB isochronous playback callback.
  * Called with sc->sc_lock held (it is the USB transfer mutex).
  *
@@ -555,7 +587,7 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 	struct line6_bsd_softc *sc =
 	    __containerof(st, struct line6_bsd_softc, rec);
 	struct usb_page_cache *pc;
-	uint32_t offset, n, len;
+	uint32_t n, len;
 	int actlen, nframes, i;
 	static uint32_t dbg_cnt = 0;
 
@@ -567,18 +599,44 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 		if (st->start == NULL || st->start == st->end)
 			goto tr_setup;
 
+		/*
+		 * Copy received data from the USB isochronous DMA buffer into
+		 * the PCM ring buffer.
+		 *
+		 * IMPORTANT: The USB DMA buffer lays out isochronous frames
+		 * contiguously at the CONFIGURED (submission-time) frame
+		 * lengths, not the actual received lengths.  We must read
+		 * each frame from its configured offset in the DMA buffer.
+		 * Tracking offsets by actual received lengths would cause
+		 * progressive misalignment and garbage data (fuzz).
+		 *
+		 * Use usbd_xfer_old_frame_length() to get the configured
+		 * length at submission time, which gives us the correct
+		 * inter-frame DMA buffer stride.
+		 */
 		pc = usbd_xfer_get_frame(xfer, 0);
-		offset = 0;
 		for (i = 0; i < nframes; i++) {
+			uint32_t frame_offset;
+			uint32_t j;
+
 			len = usbd_xfer_frame_len(xfer, i);
+			if (len == 0)
+				continue;
+
+			/* Compute DMA buffer offset from configured lengths */
+			frame_offset = 0;
+			for (j = 0; j < (uint32_t)i; j++)
+				frame_offset +=
+				    usbd_xfer_old_frame_length(xfer, j);
+
 			while (len > 0) {
 				n = (uint32_t)(st->end - st->cur);
 				if (n > len)
 					n = len;
-				usbd_copy_out(pc, offset, st->cur, n);
+				usbd_copy_out(pc, frame_offset, st->cur, n);
 				len -= n;
 				st->cur += n;
-				offset += n;
+				frame_offset += n;
 				if (st->cur >= st->end)
 					st->cur = st->start;
 			}
@@ -604,23 +662,27 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 tr_setup:
 		if (!st->running)
 			break;
-		usbd_xfer_set_frames(xfer, st->intr_frames);
-		for (i = 0; i < (int)st->intr_frames; i++) {
-			uint32_t frame_len = st->bytes_per_frame[1];
-			if (frame_len == 0)
-				frame_len = st->sample_size;
-			usbd_xfer_set_frame_len(xfer, i, frame_len);
-		}
+		/* Use jitter-corrected frame lengths so the DMA buffer layout
+		 * matches what the device actually sends. */
+		(void)line6_set_capture_frame_lengths(st, xfer);
 		usbd_transfer_submit(xfer);
 		break;
 
 	default:	/* Error */
 		if (error != USB_ERR_CANCELLED && st->running) {
-			uint32_t frame_len = st->bytes_per_frame[1];
-			if (frame_len == 0)
-				frame_len = st->sample_size;
-			usbd_xfer_set_frames(xfer, 1);
-			usbd_xfer_set_frame_len(xfer, 0, frame_len);
+			/* Re-arm with jitter correction on error recovery.
+			 * Use a single frame to minimise latency. */
+			st->sample_curr += st->sample_rem;
+			if (st->sample_curr >= st->frames_per_second) {
+				st->sample_curr -= st->frames_per_second;
+				usbd_xfer_set_frames(xfer, 1);
+				usbd_xfer_set_frame_len(xfer, 0,
+				    st->bytes_per_frame[1]);
+			} else {
+				usbd_xfer_set_frames(xfer, 1);
+				usbd_xfer_set_frame_len(xfer, 0,
+				    st->bytes_per_frame[0]);
+			}
 			usbd_transfer_submit(xfer);
 		}
 		break;
