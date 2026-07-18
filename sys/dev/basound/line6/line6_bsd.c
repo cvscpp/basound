@@ -110,8 +110,9 @@ struct line6_audio_stream {
 	uint8_t		*end;		/* DMA ring buffer end */
 	uint8_t		*cur;		/* Current read/write position */
 	uint32_t	 hwptr_bytes;	/* hardware pointer offset in DMA ring */
-	uint32_t	 sample_size;	/* bytes per PCM frame (all channels) */
-	uint32_t	 bytes_per_frame[2]; /* [0]=base bytes, [1]=base+sample_sz */
+	uint32_t	 sample_size;	/* bytes per PCM frame (all channels, S16_LE = 4) */
+	uint32_t	 usb_sample_size; /* bytes per frame on USB (S24_3LE = 6) */
+	uint32_t	 bytes_per_frame[2]; /* [0]=base bytes, [1]=base+usb_sample_sz */
 	uint32_t	 intr_frames;	/* USB frames per transfer */
 	uint32_t	 frames_per_second; /* 1000 for FS, 8000 for HS */
 	uint32_t	 sample_rem;	/* sample_rate % frames_per_second */
@@ -678,7 +679,8 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 
 		/*
 		 * Copy received data from the USB isochronous DMA buffer into
-		 * the PCM ring buffer.
+		 * the PCM ring buffer, converting from the USB format
+		 * (S24_3LE for TonePort, S16_LE for others).
 		 *
 		 * IMPORTANT: The USB DMA buffer lays out isochronous frames
 		 * contiguously at the CONFIGURED (submission-time) frame
@@ -690,6 +692,11 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 		 * Use usbd_xfer_old_frame_length() to get the configured
 		 * length at submission time, which gives us the correct
 		 * inter-frame DMA buffer stride.
+		 *
+		 * For TonePort 24-bit mode (usb_sample_size == 6):
+		 * Each USB frame contains N*6 bytes of S24_3LE interleaved
+		 * data: [L_b0][L_b1][L_b2][R_b0][R_b1][R_b2] per sample.
+		 * We extract the upper 16 bits as S16_LE: L = b2<<8 | b1.
 		 */
 		pc = usbd_xfer_get_frame(xfer, 0);
 		for (i = 0; i < nframes; i++) {
@@ -706,16 +713,62 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 				frame_offset +=
 				    usbd_xfer_old_frame_length(xfer, j);
 
-			while (len > 0) {
-				n = (uint32_t)(st->end - st->cur);
-				if (n > len)
-					n = len;
-				usbd_copy_out(pc, frame_offset, st->cur, n);
-				len -= n;
-				st->cur += n;
-				frame_offset += n;
-				if (st->cur >= st->end)
-					st->cur = st->start;
+			if (st->usb_sample_size == 6) {
+				/* S24_3LE to S16_LE conversion */
+				uint32_t nsamples = len / 6; /* stereo frames */
+				uint32_t s;
+
+				for (s = 0; s < nsamples; s++) {
+					uint8_t usb_frame[6];
+					int32_t ls24, rs24;
+
+					usbd_copy_out(pc, frame_offset + s * 6,
+					    usb_frame, 6);
+					/* S24_3LE: byte0 is LSB, byte2 is MSB */
+					ls24 = (int8_t)usb_frame[2];
+					ls24 = (ls24 << 16) |
+					    (usb_frame[1] << 8) |
+					    usb_frame[0];
+					rs24 = (int8_t)usb_frame[5];
+					rs24 = (rs24 << 16) |
+					    (usb_frame[4] << 8) |
+					    usb_frame[3];
+					/* Downshift to S16_LE (upper 16 bits) */
+					int16_t l16 = (int16_t)(ls24 >> 8);
+					int16_t r16 = (int16_t)(rs24 >> 8);
+					uint8_t pcm[4];
+
+					pcm[0] = l16 & 0xFF;
+					pcm[1] = (l16 >> 8) & 0xFF;
+					pcm[2] = r16 & 0xFF;
+					pcm[3] = (r16 >> 8) & 0xFF;
+					/* Write to PCM ring, handle wrap */
+					if (st->cur + 4 > st->end) {
+						uint32_t first =
+						    (uint32_t)(st->end - st->cur);
+						memcpy(st->cur, pcm, first);
+						memcpy(st->start,
+						    pcm + first, 4 - first);
+					} else {
+						memcpy(st->cur, pcm, 4);
+					}
+					st->cur += 4;
+					if (st->cur >= st->end)
+						st->cur = st->start;
+				}
+			} else {
+				while (len > 0) {
+					n = (uint32_t)(st->end - st->cur);
+					if (n > len)
+						n = len;
+					usbd_copy_out(pc, frame_offset,
+					    st->cur, n);
+					len -= n;
+					st->cur += n;
+					frame_offset += n;
+					if (st->cur >= st->end)
+						st->cur = st->start;
+				}
 			}
 		}
 		if (st->end > st->start)
@@ -1110,11 +1163,17 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		if (st->frames_per_second == 0)
 			st->frames_per_second = 1000;	/* full-speed fallback */
 		st->intr_frames = LINE6_NFRAMES;
-		st->sample_size = sample_size;
+		st->sample_size = sample_size;		/* PCM frame bytes (S16_LE stereo = 4) */
+		st->usb_sample_size = sample_size;	/* USB frame bytes, overridden for 24-bit */
+		if (sc->capabilities & LINE6_CAP_INIT_TONEPORT) {
+			/* TonePort/POD Studio devices use S24_3LE USB format:
+			 * 3 bytes per channel, 6 bytes per stereo frame. */
+			st->usb_sample_size = 6;
+		}
 		st->bytes_per_frame[0] =
-		    (ch->speed / st->frames_per_second) * sample_size;
+		    (ch->speed / st->frames_per_second) * st->usb_sample_size;
 		st->sample_rem = ch->speed % st->frames_per_second;
-		st->bytes_per_frame[1] = st->bytes_per_frame[0] + sample_size;
+		st->bytes_per_frame[1] = st->bytes_per_frame[0] + st->usb_sample_size;
 		if (st->bytes_per_frame[0] == 0 && st->sample_rem == 0) {
 			st->bytes_per_frame[0] = sample_size;
 			st->bytes_per_frame[1] = sample_size;
