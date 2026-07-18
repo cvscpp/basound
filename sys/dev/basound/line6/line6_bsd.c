@@ -1170,13 +1170,37 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			 * 3 bytes per channel, 6 bytes per stereo frame. */
 			st->usb_sample_size = 6;
 		}
-		st->bytes_per_frame[0] =
-		    (ch->speed / st->frames_per_second) * st->usb_sample_size;
-		st->sample_rem = ch->speed % st->frames_per_second;
-		st->bytes_per_frame[1] = st->bytes_per_frame[0] + st->usb_sample_size;
-		if (st->bytes_per_frame[0] == 0 && st->sample_rem == 0) {
-			st->bytes_per_frame[0] = sample_size;
-			st->bytes_per_frame[1] = sample_size;
+		/*
+		 * bytes_per_frame must use the format size that matches
+		 * the data MOVING OVER USB:
+		 *
+		 *   Playback (HOST→DEVICE): PCM ring is S16_LE (4 bytes/frame),
+		 *     and the device expects S16_LE on the OUT endpoint.
+		 *     → use sample_size (4).
+		 *
+		 *   Capture (DEVICE→HOST):  USB delivers S24_3LE on TonePort
+		 *     (6 bytes/frame) which we convert to S16_LE for the PCM
+		 *     ring.  But the USB frame length must match what the
+		 *     device actually sends. → use usb_sample_size (6).
+		 *
+		 * Using usb_sample_size for playback caused the USB frame
+		 * length to be 50% too large on TonePort (264 vs 176 bytes at
+		 * 44.1kHz), making the playback callback over-read the PCM ring
+		 * into garbage memory → memory corruption and kernel panic.
+		 */
+		{
+			uint32_t frame_byte_size =
+			    (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			    ? sample_size : st->usb_sample_size;
+			st->bytes_per_frame[0] =
+			    (ch->speed / st->frames_per_second) * frame_byte_size;
+			st->sample_rem = ch->speed % st->frames_per_second;
+			st->bytes_per_frame[1] =
+			    st->bytes_per_frame[0] + frame_byte_size;
+			if (st->bytes_per_frame[0] == 0 && st->sample_rem == 0) {
+				st->bytes_per_frame[0] = frame_byte_size;
+				st->bytes_per_frame[1] = frame_byte_size;
+			}
 		}
 		st->sample_curr = 0;
 
