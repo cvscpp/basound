@@ -321,6 +321,16 @@ struct line6_bsd_softc {
 #define PLAY_HELPER_BUF_SIZE	65536	/* silence ring, ~1.5s at 44.1k */
 	uint8_t		*play_helper_buf;
 	uint8_t		 play_helper;	/* non-zero while helper is active */
+
+	/* Software monitoring.
+	 * TonePort devices have no hardware monitoring, so we mix captured
+	 * audio into the playback stream in software.  monitor_volume follows
+	 * the Linux convention: 0=off, 256=unity gain.
+	 */
+#define MONITOR_BUF_SIZE		2048	/* max one USB frame of S16_LE */
+	uint8_t		 monitor_fbuf[MONITOR_BUF_SIZE];
+	uint32_t	 monitor_fsize;
+	int		 monitor_volume;
 };
 
 MALLOC_DEFINE(M_LINE6_BSD, "line6_bsd", "Line6 BSD softc");
@@ -575,6 +585,45 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 			    dbg_cnt,
 			    USB_GET_STATE(xfer) == USB_ST_SETUP ? "SETUP" : "XFRD",
 			    st->hwptr_bytes, offset);
+
+		/*
+		 * Software monitoring: mix captured audio into the playback
+		 * stream sent to the device, so the user hears their input.
+		 *
+		 * The monitor_fbuf holds the last USB frame of captured S16_LE
+		 * stereo audio saved by the rec callback.  Mix at the volume
+		 * set by the "Monitor Playback Volume" ALSA control.
+		 *
+		 * The data we just wrote to the USB buffer (pc at offset 0)
+		 * has already been sent to the DMA engine, so we read the
+		 * buffer back, add the monitor signal, and write it back.
+		 */
+		if (sc->monitor_volume > 0 && sc->monitor_fsize > 0 &&
+		    sc->monitor_fsize <= total && sc->monitor_fsize <= MONITOR_BUF_SIZE) {
+			uint32_t nsamples = sc->monitor_fsize / 2;
+			int16_t buf[512];
+			uint32_t j;
+
+			/* Read back what we just wrote */
+			usbd_copy_out(pc, 0, (uint8_t *)buf,
+			    MIN(sc->monitor_fsize, sizeof(buf)));
+			/* Mix monitor signal */
+			for (j = 0; j < MIN(nsamples, sizeof(buf)/2); j++) {
+				int16_t *mon = (int16_t *)sc->monitor_fbuf;
+				int32_t mixed;
+
+				mixed = (int32_t)buf[j] +
+				    ((int32_t)mon[j] * sc->monitor_volume) / 256;
+				if (mixed > 32767)
+					mixed = 32767;
+				if (mixed < -32768)
+					mixed = -32768;
+				buf[j] = (int16_t)mixed;
+			}
+			usbd_copy_in(pc, 0, (uint8_t *)buf,
+			    MIN(sc->monitor_fsize, sizeof(buf)));
+		}
+
 		usbd_transfer_submit(xfer);
 		break;
 	}
@@ -660,6 +709,31 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 		}
 		if (st->end > st->start)
 			st->hwptr_bytes = (uint32_t)(st->cur - st->start);
+
+		/*
+		 * Save last frame for software monitoring if volume is set.
+		 * The USB DMA buffer will be reused on the next transfer, so
+		 * we must copy the data into our persistent monitor_fbuf now.
+		 *
+		 * Recompute the last frame's offset from configured lengths.
+		 */
+		if (sc->monitor_volume > 0 && nframes > 0) {
+			int last = nframes - 1;
+			uint32_t mlen = usbd_xfer_frame_len(xfer, last);
+			uint32_t moff = 0;
+			uint32_t mi;
+
+			for (mi = 0; mi < (uint32_t)last; mi++)
+				moff += usbd_xfer_old_frame_length(xfer, mi);
+			if (mlen > 0 && mlen <= MONITOR_BUF_SIZE &&
+			    moff + mlen <= usbd_xfer_max_len(xfer)) {
+				usbd_copy_out(pc, moff,
+				    sc->monitor_fbuf, mlen);
+				sc->monitor_fsize = mlen;
+			}
+		} else if (sc->monitor_volume == 0) {
+			sc->monitor_fsize = 0;
+		}
 
 		if (dbg_cnt % 200 == 0)
 			printf("line6 rec cb#%u cur+%u actlen=%d pcm_ch=%p name=%s intr=%u\n",
@@ -1323,6 +1397,7 @@ static const struct snd_pcm_ops line6_pcm_ops = {
  * documented vendor-register for PCM or monitor volume, so we follow Linux
  * and handle volume at the PCM software layer only.
  */
+
 static int
 line6_control_pcm_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol)
 {
@@ -1335,7 +1410,7 @@ line6_control_pcm_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucon
 static int
 line6_control_monitor_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol)
 {
-	/* Monitor volume is software-only; no USB vendor command needed. */
+	/* Monitor volume is managed via sysctl hw.basound.line6.monitor_volume */
 	(void)kctl;
 	(void)ucontrol;
 	return 1;
@@ -1353,6 +1428,39 @@ static struct snd_kcontrol_new line6_controls[] = {
 		.put = line6_control_monitor_put,
 	},
 };
+
+/* Sysctl for monitor volume control */
+static int sysctl_monitor_volume = 0;
+
+static int
+sysctl_line6_monitor_volume(SYSCTL_HANDLER_ARGS)
+{
+	int err, v;
+
+	v = sysctl_monitor_volume;
+	err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (v < 0)
+		v = 0;
+	if (v > 256)
+		v = 256;
+	sysctl_monitor_volume = v;
+
+	/* Apply to active device */
+	if (line6_active_sc != NULL) {
+		line6_active_sc->monitor_volume = v;
+		if (v == 0)
+			line6_active_sc->monitor_fsize = 0;
+	}
+
+	return (0);
+}
+
+SYSCTL_PROC(_hw_basound_line6, OID_AUTO, monitor_volume,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
+    sysctl_line6_monitor_volume, "I",
+    "Monitor volume: 0=off 256=unity (software monitor mix)");
 
 /* USB device probe routine */
 static int
