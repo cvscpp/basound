@@ -308,6 +308,19 @@ struct line6_bsd_softc {
 	uint8_t		 audio_altsetting; /* preferred audio streaming alt */
 	uint32_t	 audio_active;	/* bitmask: 1=play, 2=rec; 0=none active */
 	uint8_t		 toneport_enabled; /* 0x0301 accepted at least once */
+
+	/* Helper playback stream for TonePort devices.
+	 * The TonePort firmware requires the ISO OUT endpoint (playback) to be
+	 * streaming data — even silence — for the capture path to route audio
+	 * correctly through the internal DSP.  Without this, capture produces
+	 * metallic distortion.
+	 *
+	 * When capture starts without playback, we start a "helper" playback
+	 * stream that sends zeros.  play_helper is set while active.
+	 */
+#define PLAY_HELPER_BUF_SIZE	65536	/* silence ring, ~1.5s at 44.1k */
+	uint8_t		*play_helper_buf;
+	uint8_t		 play_helper;	/* non-zero while helper is active */
 };
 
 MALLOC_DEFINE(M_LINE6_BSD, "line6_bsd", "Line6 BSD softc");
@@ -315,6 +328,10 @@ MALLOC_DEFINE(M_LINE6_BSD, "line6_bsd", "Line6 BSD softc");
 /* Forward declarations for USB isochronous callbacks */
 static usb_callback_t line6_play_callback;
 static usb_callback_t line6_rec_callback;
+
+/* Forward declarations for TonePort helper playback */
+static int line6_start_play_helper(struct line6_bsd_softc *sc, uint32_t sample_size);
+static void line6_stop_play_helper(struct line6_bsd_softc *sc);
 
 /* USB isochronous config for playback (HOST → DEVICE, OUT) */
 static const struct usb_config line6_play_cfg[LINE6_NCHANBUFS] = {
@@ -1051,6 +1068,33 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 		runtime->state = SNDRV_PCM_STATE_RUNNING;
 		runtime->dma_position = 0;
+
+		/*
+		 * TonePort/POD Studio devices need the ISO OUT endpoint to be
+		 * streaming for clean capture audio.  If only capture was
+		 * started (no playback), start a helper playback stream that
+		 * sends silence.
+		 */
+		if ((sc->capabilities & LINE6_CAP_INIT_TONEPORT) &&
+		    substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+		    !(sc->audio_active & 1)) {
+			int perr;
+
+			perr = line6_start_play_helper(sc, sample_size);
+			if (perr != 0)
+				device_printf(sc->dev,
+				    "play helper start failed: %d\n", perr);
+		}
+
+		/*
+		 * If playback started while helper was active, stop the
+		 * helper — real playback takes over.
+		 */
+		if ((sc->capabilities & LINE6_CAP_INIT_TONEPORT) &&
+		    substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+		    sc->play_helper)
+			line6_stop_play_helper(sc);
+
 		return 0;
 	}
 
@@ -1074,6 +1118,21 @@ line6_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		if (sc->audio_active == 0)
 			(void)usbd_set_alt_interface_index(sc->usbdev,
 			    sc->audio_iface_index, 0);
+
+		/*
+		 * If capture stopped and helper was active, stop the helper.
+		 * If playback stopped but capture is still active, start helper.
+		 */
+		if (sc->capabilities & LINE6_CAP_INIT_TONEPORT) {
+			if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+			    sc->play_helper)
+				line6_stop_play_helper(sc);
+			if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+			    sc->audio_active & 2) {
+				/* capture still active, start helper */
+				(void)line6_start_play_helper(sc, 4);
+			}
+		}
 
 		runtime->state = SNDRV_PCM_STATE_STOPPED;
 		return 0;
@@ -1150,6 +1209,100 @@ line6_pcm_pointer(struct snd_pcm_substream *substream)
 
 	bytes = st->hwptr_bytes;
 	return bytes;
+}
+
+/*
+ * Start the helper playback stream that sends silence to the TonePort.
+ * This keeps the ISO OUT endpoint active so the device's internal DSP
+ * routes capture audio correctly.  Without this, capture produces metallic
+ * distortion on TonePort/POD Studio devices.
+ *
+ * Must NOT be called with sc_lock held.
+ */
+static int
+line6_start_play_helper(struct line6_bsd_softc *sc, uint32_t sample_size)
+{
+	struct usb_config cfg_copy[LINE6_NCHANBUFS];
+	struct line6_audio_stream *ps = &sc->play;
+	usb_error_t uerr;
+
+	if (sc->play_helper)
+		return 0;		/* already running */
+	if (sc->play_helper_buf == NULL) {
+		sc->play_helper_buf = malloc(PLAY_HELPER_BUF_SIZE,
+		    M_ALSA, M_WAITOK | M_ZERO);
+		if (sc->play_helper_buf == NULL)
+			return -ENOMEM;
+	}
+
+	/* Set up isochronous transfers for the OUT endpoint */
+	memcpy(cfg_copy, line6_play_cfg, sizeof(cfg_copy));
+	for (int i = 0; i < LINE6_NCHANBUFS; i++)
+		cfg_copy[i].endpoint = sc->ep_audio_w;
+
+	uerr = usbd_transfer_setup(sc->usbdev, &sc->audio_iface_index,
+	    ps->xfer, cfg_copy, LINE6_NCHANBUFS, ps, &sc->sc_lock);
+	if (uerr != 0) {
+		device_printf(sc->dev,
+		    "play helper setup failed: %s\n", usbd_errstr(uerr));
+		return -EIO;
+	}
+
+	mtx_lock(&sc->sc_lock);
+	ps->frames_per_second = usbd_get_isoc_fps(sc->usbdev);
+	if (ps->frames_per_second == 0)
+		ps->frames_per_second = 1000;
+	ps->intr_frames = LINE6_NFRAMES;
+	ps->sample_size = sample_size;
+	ps->bytes_per_frame[0] =
+	    (44100 / ps->frames_per_second) * sample_size;
+	ps->sample_rem = 44100 % ps->frames_per_second;
+	ps->bytes_per_frame[1] = ps->bytes_per_frame[0] + sample_size;
+	if (ps->bytes_per_frame[0] == 0 && ps->sample_rem == 0) {
+		ps->bytes_per_frame[0] = sample_size;
+		ps->bytes_per_frame[1] = sample_size;
+	}
+	ps->sample_curr = 0;
+
+	/* Point the stream at the zeroed silence ring buffer */
+	memset(sc->play_helper_buf, 0, PLAY_HELPER_BUF_SIZE);
+	ps->start = sc->play_helper_buf;
+	ps->end   = sc->play_helper_buf + PLAY_HELPER_BUF_SIZE;
+	ps->cur   = sc->play_helper_buf;
+	ps->hwptr_bytes = 0;
+	ps->pcm_ch = NULL;		/* no PCM channel to notify */
+	ps->running = 1;
+	sc->play_helper = 1;
+
+	for (int i = 0; i < LINE6_NCHANBUFS; i++)
+		usbd_transfer_start(ps->xfer[i]);
+	mtx_unlock(&sc->sc_lock);
+
+	return 0;
+}
+
+/*
+ * Stop the helper playback stream.
+ */
+static void
+line6_stop_play_helper(struct line6_bsd_softc *sc)
+{
+	struct line6_audio_stream *ps = &sc->play;
+
+	if (!sc->play_helper)
+		return;
+
+	mtx_lock(&sc->sc_lock);
+	ps->running = 0;
+	for (int i = 0; i < LINE6_NCHANBUFS; i++)
+		usbd_transfer_stop(ps->xfer[i]);
+	mtx_unlock(&sc->sc_lock);
+
+	usbd_transfer_unsetup(ps->xfer, LINE6_NCHANBUFS);
+	sc->play_helper = 0;
+	ps->start = NULL;
+	ps->end = NULL;
+	ps->cur = NULL;
 }
 
 static const struct snd_pcm_ops line6_pcm_ops = {
@@ -1414,7 +1567,12 @@ line6_bsd_detach(device_t dev)
 	if (line6_active_sc == sc)
 		line6_active_sc = NULL;
 
-	/* Stop and tear down USB isochronous transfers if still running */
+	/* Stop helper playback and tear down USB isochronous transfers */
+	line6_stop_play_helper(sc);
+	if (sc->play_helper_buf != NULL) {
+		free(sc->play_helper_buf, M_ALSA);
+		sc->play_helper_buf = NULL;
+	}
 	mtx_lock(&sc->sc_lock);
 	sc->play.running = 0;
 	sc->rec.running = 0;
