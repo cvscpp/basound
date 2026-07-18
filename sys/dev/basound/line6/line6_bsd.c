@@ -326,8 +326,11 @@ struct line6_bsd_softc {
 	 * TonePort devices have no hardware monitoring, so we mix captured
 	 * audio into the playback stream in software.  monitor_volume follows
 	 * the Linux convention: 0=off, 256=unity gain.
+	 *
+	 * monitor_fbuf holds the last full capture transfer's worth of S16_LE
+	 * stereo data (up to 8 USB frames, ~1440 bytes at 44.1kHz).
 	 */
-#define MONITOR_BUF_SIZE		2048	/* max one USB frame of S16_LE */
+#define MONITOR_BUF_SIZE		8192	/* full capture transfer */
 	uint8_t		 monitor_fbuf[MONITOR_BUF_SIZE];
 	uint32_t	 monitor_fsize;
 	int		 monitor_volume;
@@ -519,6 +522,7 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 
 		/* Compute per-frame lengths with rate jitter correction */
 		total = line6_set_playback_frame_lengths(st, xfer);
+		uint32_t orig_total = total;
 
 		/* Copy from DMA ring buffer into USB isochronous packet */
 		offset = 0;
@@ -590,38 +594,45 @@ line6_play_callback(struct usb_xfer *xfer, usb_error_t error)
 		 * Software monitoring: mix captured audio into the playback
 		 * stream sent to the device, so the user hears their input.
 		 *
-		 * The monitor_fbuf holds the last USB frame of captured S16_LE
-		 * stereo audio saved by the rec callback.  Mix at the volume
-		 * set by the "Monitor Playback Volume" ALSA control.
+		 * monitor_fbuf holds the full capture transfer data saved by
+		 * the rec callback.  Mix at the volume set by the sysctl
+		 * hw.basound.line6.monitor_volume (0=off, 256=unity gain).
 		 *
-		 * The data we just wrote to the USB buffer (pc at offset 0)
-		 * has already been sent to the DMA engine, so we read the
-		 * buffer back, add the monitor signal, and write it back.
+		 * Process in chunks if needed to avoid excessive stack usage.
 		 */
 		if (sc->monitor_volume > 0 && sc->monitor_fsize > 0 &&
-		    sc->monitor_fsize <= total && sc->monitor_fsize <= MONITOR_BUF_SIZE) {
+		    sc->monitor_fsize <= orig_total &&
+		    sc->monitor_fsize <= MONITOR_BUF_SIZE) {
+#define MONITOR_MIX_CHUNK	2048	/* int16_t samples per chunk */
 			uint32_t nsamples = sc->monitor_fsize / 2;
-			int16_t buf[512];
+			uint32_t chunk;
 			uint32_t j;
 
-			/* Read back what we just wrote */
-			usbd_copy_out(pc, 0, (uint8_t *)buf,
-			    MIN(sc->monitor_fsize, sizeof(buf)));
-			/* Mix monitor signal */
-			for (j = 0; j < MIN(nsamples, sizeof(buf)/2); j++) {
+			for (chunk = 0; chunk < nsamples;
+			    chunk += MONITOR_MIX_CHUNK) {
+				uint32_t todo = MIN(nsamples - chunk,
+				    MONITOR_MIX_CHUNK);
+				int16_t buf[MONITOR_MIX_CHUNK];
 				int16_t *mon = (int16_t *)sc->monitor_fbuf;
-				int32_t mixed;
 
-				mixed = (int32_t)buf[j] +
-				    ((int32_t)mon[j] * sc->monitor_volume) / 256;
-				if (mixed > 32767)
-					mixed = 32767;
-				if (mixed < -32768)
-					mixed = -32768;
-				buf[j] = (int16_t)mixed;
+				usbd_copy_out(pc, chunk * 2,
+				    (uint8_t *)buf, todo * 2);
+				for (j = 0; j < todo; j++) {
+					int32_t mixed;
+
+					mixed = (int32_t)buf[j] +
+					    ((int32_t)mon[chunk + j] *
+					    sc->monitor_volume) / 256;
+					if (mixed > 32767)
+						mixed = 32767;
+					if (mixed < -32768)
+						mixed = -32768;
+					buf[j] = (int16_t)mixed;
+				}
+				usbd_copy_in(pc, chunk * 2,
+				    (uint8_t *)buf, todo * 2);
 			}
-			usbd_copy_in(pc, 0, (uint8_t *)buf,
-			    MIN(sc->monitor_fsize, sizeof(buf)));
+#undef MONITOR_MIX_CHUNK
 		}
 
 		usbd_transfer_submit(xfer);
@@ -711,25 +722,24 @@ line6_rec_callback(struct usb_xfer *xfer, usb_error_t error)
 			st->hwptr_bytes = (uint32_t)(st->cur - st->start);
 
 		/*
-		 * Save last frame for software monitoring if volume is set.
+		 * Save full capture transfer data for software monitoring.
 		 * The USB DMA buffer will be reused on the next transfer, so
 		 * we must copy the data into our persistent monitor_fbuf now.
 		 *
-		 * Recompute the last frame's offset from configured lengths.
+		 * Compute the total configured size from submitted frame
+		 * lengths, which is the same as what the playback side will
+		 * send in the next callback.
 		 */
 		if (sc->monitor_volume > 0 && nframes > 0) {
-			int last = nframes - 1;
-			uint32_t mlen = usbd_xfer_frame_len(xfer, last);
-			uint32_t moff = 0;
+			uint32_t mtotal = 0;
 			uint32_t mi;
 
-			for (mi = 0; mi < (uint32_t)last; mi++)
-				moff += usbd_xfer_old_frame_length(xfer, mi);
-			if (mlen > 0 && mlen <= MONITOR_BUF_SIZE &&
-			    moff + mlen <= usbd_xfer_max_len(xfer)) {
-				usbd_copy_out(pc, moff,
-				    sc->monitor_fbuf, mlen);
-				sc->monitor_fsize = mlen;
+			for (mi = 0; mi < (uint32_t)nframes; mi++)
+				mtotal += usbd_xfer_old_frame_length(xfer, mi);
+			if (mtotal > 0 && mtotal <= MONITOR_BUF_SIZE) {
+				usbd_copy_out(pc, 0,
+				    sc->monitor_fbuf, mtotal);
+				sc->monitor_fsize = mtotal;
 			}
 		} else if (sc->monitor_volume == 0) {
 			sc->monitor_fsize = 0;
