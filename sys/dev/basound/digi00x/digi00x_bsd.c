@@ -18,6 +18,7 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/callout.h>
+#include <sys/sysctl.h>
 
 #include <dev/firewire/firewire.h>
 #include <dev/firewire/firewirereg.h>
@@ -229,6 +230,117 @@ dg00x_discover(void *arg)
 		device_printf(sc->dev, "Failed to init card: %d\n", err);
 }
 
+/* ------------------------------------------------------------------ */
+/* Sysctl handlers                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * sysctl_dg00x_clock_source - RW: 0=internal, 1=SPDIF, 2=ADAT, 3=Word clock
+ */
+static int
+sysctl_dg00x_clock_source(SYSCTL_HANDLER_ARGS)
+{
+	struct snd_dg00x *dg00x = arg1;
+	enum snd_dg00x_clock clock;
+	uint32_t val;
+	int err;
+
+	err = dg00x_get_clock(dg00x, &clock);
+	if (err != 0)
+		return (err);
+	val = (uint32_t)clock;
+
+	err = sysctl_handle_int(oidp, &val, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+
+	if (val >= SND_DG00X_CLOCK_COUNT)
+		return (EINVAL);
+
+	clock = (enum snd_dg00x_clock)val;
+	return dg00x_write_quad(dg00x->fwdev,
+		 DG00X_ADDR_BASE + DG00X_OFFSET_CLOCK_SOURCE, (uint32_t)clock);
+}
+
+/*
+ * sysctl_dg00x_optical_mode - RW: 0=ADAT, 1=SPDIF
+ */
+static int
+sysctl_dg00x_optical_mode(SYSCTL_HANDLER_ARGS)
+{
+	struct snd_dg00x *dg00x = arg1;
+	uint32_t val;
+	int err;
+
+	err = dg00x_read_quad(dg00x->fwdev,
+		 DG00X_ADDR_BASE + DG00X_OFFSET_OPT_IFACE_MODE, &val);
+	if (err != 0)
+		return (err);
+
+	err = sysctl_handle_int(oidp, &val, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+
+	if (val >= SND_DG00X_OPT_IFACE_MODE_COUNT)
+		return (EINVAL);
+
+	return dg00x_write_quad(dg00x->fwdev,
+		 DG00X_ADDR_BASE + DG00X_OFFSET_OPT_IFACE_MODE, val);
+}
+
+/*
+ * sysctl_dg00x_rate - RO: current sample rate
+ */
+static int
+sysctl_dg00x_rate(SYSCTL_HANDLER_ARGS)
+{
+	struct snd_dg00x *dg00x = arg1;
+	unsigned int rate;
+	int err;
+
+	err = dg00x_get_local_rate(dg00x, &rate);
+	if (err != 0)
+		return (err);
+
+	return (sysctl_handle_int(oidp, &rate, 0, req));
+}
+
+/*
+ * sysctl_dg00x_external_rate - RO: detected external clock rate
+ */
+static int
+sysctl_dg00x_external_rate(SYSCTL_HANDLER_ARGS)
+{
+	struct snd_dg00x *dg00x = arg1;
+	unsigned int rate;
+	int err;
+
+	err = dg00x_get_external_rate(dg00x, &rate);
+	if (err != 0)
+		return (err);
+
+	return (sysctl_handle_int(oidp, &rate, 0, req));
+}
+
+/*
+ * sysctl_dg00x_external_detect - RO: external clock presence (0/1)
+ */
+static int
+sysctl_dg00x_external_detect(SYSCTL_HANDLER_ARGS)
+{
+	struct snd_dg00x *dg00x = arg1;
+	bool detect;
+	uint32_t val;
+	int err;
+
+	err = dg00x_check_external(dg00x, &detect);
+	if (err != 0)
+		return (err);
+	val = detect ? 1 : 0;
+
+	return (sysctl_handle_int(oidp, &val, 0, req));
+}
+
 /*
  * Initialize the ALSA card after discovering a Digidesign device.
  */
@@ -278,6 +390,42 @@ dg00x_init_card(struct digi00x_softc *sc)
 		 100 << fwdev->speed);
 
 	dg00x_proc_init(dg00x);
+
+	/* Register per-instance sysctl controls */
+	{
+		struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->dev);
+		struct sysctl_oid *tree = device_get_sysctl_tree(sc->dev);
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "clock_source",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    dg00x, 0, sysctl_dg00x_clock_source, "I",
+		    "Clock source: 0=internal, 1=SPDIF, 2=ADAT, 3=Word");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "optical_mode",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    dg00x, 0, sysctl_dg00x_optical_mode, "I",
+		    "Optical port mode: 0=ADAT, 1=SPDIF");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rate",
+		    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    dg00x, 0, sysctl_dg00x_rate, "IU",
+		    "Current sample rate");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "external_rate",
+		    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    dg00x, 0, sysctl_dg00x_external_rate, "IU",
+		    "Detected external clock rate");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "external_detect",
+		    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    dg00x, 0, sysctl_dg00x_external_detect, "I",
+		    "External clock present (0=no, 1=yes)");
+	}
 
 	err = dg00x_create_pcm(dg00x);
 	if (err != 0) {
