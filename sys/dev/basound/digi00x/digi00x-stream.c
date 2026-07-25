@@ -23,7 +23,7 @@ extern struct fw_xfer *fwmem_read_quad(struct fw_device *, caddr_t, uint8_t,
 				       uint16_t, uint32_t, void *,
 				       void (*)(struct fw_xfer *));
 extern struct fw_xfer *fwmem_write_quad(struct fw_device *, caddr_t, uint8_t,
-					uint16_t, uint32_t, uint32_t,
+					uint16_t, uint32_t, void *,
 					void (*)(struct fw_xfer *));
 
 /* ------------------------------------------------------------------ */
@@ -91,7 +91,7 @@ dg00x_write_quad(struct fw_device *fwdev, uint64_t addr, uint32_t val)
 	txn.done = 0;
 	txn.error = 0;
 	txn.xfer = fwmem_write_quad(fwdev, (caddr_t)&txn, fwdev->speed,
-				     (uint16_t)offset_hi, offset_lo, val,
+				     (uint16_t)offset_hi, offset_lo, &val,
 				     dg00x_txn_callback);
 	if (txn.xfer == NULL)
 		return (ENOMEM);
