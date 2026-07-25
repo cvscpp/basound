@@ -59,10 +59,21 @@ static int
 pcm_hw_params(struct snd_pcm_substream *substream,
 	      void *hw_params)
 {
-	struct snd_dg00x *dg00x = substream->private_data;
-	unsigned int rate = params_rate(hw_params);
+	struct snd_dg00x *dg00x = substream->pcm->private_data;
+	unsigned int rate;
 	bool rate_ok = false;
 	int i;
+
+	/*
+	 * basound_chan_setformat() and basound_chan_setblocksize() call
+	 * ops->hw_params(substream, NULL) to re-apply hardware settings
+	 * after a format or blocksize change.  When hw_params is NULL
+	 * we skip rate/channel validation and just return success.
+	 */
+	if (hw_params == NULL)
+		return (0);
+
+	rate = params_rate(hw_params);
 
 	/* Find supported channels for this rate */
 	for (i = 0; i < SND_DG00X_RATE_COUNT; i++) {

@@ -85,17 +85,28 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	substream->runtime->dma_addr  = b->buf_addr;
 	substream->runtime->dma_bytes = b->bufsize;
 
-	/* Initialize hardware format.  HDSP stores a struct hdsp * in
-	 * pcm->private_data with the exact channel count; other drivers
-	 * (e.g. USB Line6) leave private_data NULL and default to stereo. */
-	if (pcm->private_data != NULL) {
+	/* Initialize hardware format from ALSA driver constraints.
+	 *
+	 * HDSP stores a struct hdsp * in pcm->private_data and reads the
+	 * exact channel count from hdsp->ss_{out,in}_channels.
+	 *
+	 * Other drivers (digi00x, DICE) store their own private data in
+	 * pcm->private_data but set hw constraints via their .open callback,
+	 * so we defer channel/format selection until after ops->open(). */
+	if (strcmp(pcm->card->driver, "hdsp") == 0) {
 		struct hdsp *hdsp = pcm->private_data;
 		int hw_channels = (dir == PCMDIR_PLAY) ?
 		    hdsp->ss_out_channels : hdsp->ss_in_channels;
 		ch->format = SND_FORMAT(AFMT_S32_LE, hw_channels, 0);
 		c->format  = SND_FORMAT(AFMT_S32_LE, hw_channels, 0);
+	} else if (pcm->private_data != NULL) {
+		/* Non-HDSP driver with private data (e.g. digi00x):
+		 * set a temporary format; ops->open() below will set
+		 * runtime hw constraints that we re-read afterward. */
+		ch->format = SND_FORMAT(AFMT_S32_LE, 18, 0);
+		c->format  = SND_FORMAT(AFMT_S32_LE, 18, 0);
 	} else {
-		/* Non-HDSP device (e.g. USB audio): stereo S16_LE */
+		/* No private data (e.g. USB Line6): stereo S16_LE */
 		ch->format = SND_FORMAT(AFMT_S16_LE, 2, 0);
 		c->format  = SND_FORMAT(AFMT_S16_LE, 2, 0);
 	}
@@ -103,7 +114,7 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	ch->blocksize = 4096;
 
 	/* Initialize per-channel capabilities from ALSA constraints. */
-	if (pcm->private_data != NULL)
+	if (strcmp(pcm->card->driver, "hdsp") == 0)
 		ch->caps.fmtlist = basound_fmtlist;
 	else
 		ch->caps.fmtlist = basound_line6_fmtlist;
@@ -113,6 +124,17 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 
 	if (substream->pstr->ops && substream->pstr->ops->open) {
 		substream->pstr->ops->open(substream);
+		if (ch->runtime->hw.channels_max > 0) {
+			/* Use the runtime hw constraints set by the
+			 * driver's .open callback (digi00x, DICE, etc.). */
+			uint32_t fmt = (ch->runtime->hw.formats &
+					SNDRV_PCM_FMTBIT_S32_LE) ?
+			    AFMT_S32_LE : AFMT_S16_LE;
+			ch->format = SND_FORMAT(fmt,
+			    ch->runtime->hw.channels_max, 0);
+			c->format  = SND_FORMAT(fmt,
+			    ch->runtime->hw.channels_max, 0);
+		}
 		if (ch->runtime->hw.rate_min > 0) {
 			ch->caps.minspeed = ch->runtime->hw.rate_min;
 			ch->caps.maxspeed = ch->runtime->hw.rate_max;
@@ -509,8 +531,9 @@ static driver_t basound_pcm_driver = {
  * Register the PCM sub-driver under every basound bus type so that
  * device_probe_and_attach() finds it when the parent creates a "pcm" child.
  */
-DRIVER_MODULE(basound_pcm, basound_hdsp,  basound_pcm_driver, 0, 0);
-DRIVER_MODULE(basound_pcm, basound_line6, basound_pcm_driver, 0, 0);
+DRIVER_MODULE(basound_pcm, basound_hdsp,    basound_pcm_driver, 0, 0);
+DRIVER_MODULE(basound_pcm, basound_line6,   basound_pcm_driver, 0, 0);
+DRIVER_MODULE(basound_pcm, basound_digi00x, basound_pcm_driver, 0, 0);
 
 /*
  * basound_pcm_register — called from snd_card_register().
