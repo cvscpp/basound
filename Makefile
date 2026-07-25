@@ -21,12 +21,21 @@ SRCS=	sys/dev/basound/basound.c \
 	sys/dev/basound/dice/dice_bsd.c \
 	sys/dev/basound/line6/line6_bsd.c \
 	sys/dev/basound/maudio/maudio_midisport.c \
+	sys/dev/basound/digi00x/digi00x_bsd.c \
+	sys/dev/basound/digi00x/digi00x-stream.c \
+	sys/dev/basound/digi00x/digi00x-pcm.c \
+	sys/dev/basound/digi00x/digi00x-midi.c \
+	sys/dev/basound/digi00x/digi00x-transaction.c \
+	sys/dev/basound/digi00x/digi00x-hwdep.c \
+	sys/dev/basound/digi00x/digi00x-proc.c \
+	sys/dev/basound/digi00x/amdtp-dot.c \
 	device_if.h bus_if.h feeder_if.h mixer_if.h channel_if.h pci_if.h vnode_if.h
 
 CFLAGS+= -I${.CURDIR}/sys/alsa/include \
 	-I${.CURDIR}/sys/alsa \
 	-I${.CURDIR}/sys/dev/basound \
 	-I${.CURDIR}/sys/dev/basound/hdsp \
+	-I${.CURDIR}/sys/dev/basound/digi00x \
 	-I${.CURDIR}/sys/dev/usb
 
 .include <bsd.kmod.mk>
