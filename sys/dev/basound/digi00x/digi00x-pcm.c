@@ -7,15 +7,153 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/callout.h>
 
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 
 #include "digi00x.h"
+#include "alsa_pcm_bsd.h"
 
 /* The Digi 002/003 provides 18 channels at 44.1/48 kHz (8 analog + 8 ADAT + 2 SPDIF)
  * and 10 channels at 88.2/96 kHz (8 analog + 2 SPDIF). */
+
+/* ------------------------------------------------------------------ */
+/* Callout-based PCM streaming engine                                  */
+/*                                                                     *
+ * The digi00x hardware uses isochronous (ISO) packets on FireWire to
+ * transport audio data with DOT encoding.  The full ISO DMA pipeline
+ * (amdtp-stream, iso-resources, fw_iso_context) is not yet ported to
+ * FreeBSD, so this callout engine provides a working PCM timing source
+ * that lets JACK, Audacious, and other apps open, negotiate, and run
+ * the PCM stream.  Actual ISO data transfer requires the amdtp-domain
+ * infrastructure from the dice/ directory.
+ *
+ * Callout fires at each period boundary to:
+ *   1. Advance the software hwptr
+ *   2. Signal period completion to the PCM layer
+ *   3. Reschedule for the next period
+ * ------------------------------------------------------------------ */
+
+static void
+dg00x_pcm_stream_cb(void *arg)
+{
+	struct snd_dg00x *dg00x = (struct snd_dg00x *)arg;
+	struct dg00x_pcm_stream *ps_pb = &dg00x->pcm_playback;
+	struct dg00x_pcm_stream *ps_cap = &dg00x->pcm_capture;
+	unsigned int frames;
+	int ticks;
+
+	/* Advance playback position and signal period */
+	if (ps_pb->active) {
+		ps_pb->hwptr += ps_pb->period_bytes;
+		if (ps_pb->hwptr >= ps_pb->buffer_bytes)
+			ps_pb->hwptr -= ps_pb->buffer_bytes;
+		if (ps_pb->substream)
+			snd_pcm_period_elapsed(ps_pb->substream);
+	}
+
+	/* Advance capture position and signal period */
+	if (ps_cap->active) {
+		ps_cap->hwptr += ps_cap->period_bytes;
+		if (ps_cap->hwptr >= ps_cap->buffer_bytes)
+			ps_cap->hwptr -= ps_cap->buffer_bytes;
+		if (ps_cap->substream)
+			snd_pcm_period_elapsed(ps_cap->substream);
+	}
+
+	/* If neither stream is active, stop the callout */
+	if (!ps_pb->active && !ps_cap->active)
+		return;
+
+	/* Reschedule at the period interval of whichever stream is active.
+	 * Use the playback period if both are active. */
+	if (ps_pb->active) {
+		frames = ps_pb->period_bytes / (ps_pb->pcm_channels * 4);
+		ticks = frames * hz / ps_pb->rate;
+	} else {
+		frames = ps_cap->period_bytes / (ps_cap->pcm_channels * 4);
+		ticks = frames * hz / ps_cap->rate;
+	}
+	if (ticks < 1)
+		ticks = 1;
+	callout_reset(&ps_pb->callout, ticks, dg00x_pcm_stream_cb, dg00x);
+}
+
+static int
+dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
+		       struct snd_pcm_substream *substream)
+{
+	struct dg00x_pcm_stream *ps;
+	struct basound_chan *ch;
+	unsigned int channels, bps;
+	int ticks;
+
+	ps = (direction == SNDRV_PCM_STREAM_PLAYBACK) ?
+	     &dg00x->pcm_playback : &dg00x->pcm_capture;
+
+	if (ps->active)
+		return 0;
+
+	ch = substream->private_data;
+	if (ch == NULL || ch->buffer == NULL)
+		return -EINVAL;
+
+	channels = AFMT_CHANNEL(ch->format);
+	if (channels == 0)
+		channels = 2;
+	bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
+
+	ps->direction = direction;
+	ps->pcm_channels = channels;
+	ps->rate = ch->speed > 0 ? ch->speed : 48000;
+	ps->period_bytes = ch->blocksize;
+	ps->buffer_bytes = ch->buffer->bufsize;
+	ps->hwptr = 0;
+	ps->active = true;
+
+	/* Reset DOT state at stream start */
+	dot_reset_state(&ps->dot);
+
+	/* Begin the hardware streaming session so the device
+	 * transitions to streaming mode.  The ISO DMA buffers
+	 * will be set up when the amdtp infrastructure is ported. */
+	dg00x_begin_session(dg00x,
+			    dg00x->tx_resources.channel,
+			    dg00x->rx_resources.channel);
+
+	/* Schedule first period callback using dg00x as arg so the
+	 * callback can access both playback and capture streams. */
+	ticks = (ps->period_bytes / (ps->pcm_channels * bps)) * hz / ps->rate;
+	if (ticks < 1)
+		ticks = 1;
+	callout_reset(&dg00x->pcm_playback.callout, ticks,
+		      dg00x_pcm_stream_cb, dg00x);
+
+	return 0;
+}
+
+static void
+dg00x_pcm_stream_stop(struct snd_dg00x *dg00x, int direction)
+{
+	struct dg00x_pcm_stream *ps;
+
+	ps = (direction == SNDRV_PCM_STREAM_PLAYBACK) ?
+	     &dg00x->pcm_playback : &dg00x->pcm_capture;
+
+	if (!ps->active)
+		return;
+
+	ps->active = false;
+	callout_stop(&ps->callout);
+
+	dg00x_finish_session(dg00x);
+}
+
+/* ------------------------------------------------------------------ */
+/* PCM ops                                                             */
+/* ------------------------------------------------------------------ */
 
 static int
 pcm_open(struct snd_pcm_substream *substream)
@@ -101,15 +239,32 @@ pcm_hw_free(struct snd_pcm_substream *substream)
 static int
 pcm_prepare(struct snd_pcm_substream *substream)
 {
+	struct snd_dg00x *dg00x = (struct snd_dg00x *)substream->pcm->private_data;
+	struct basound_chan *ch = (struct basound_chan *)substream->private_data;
+
+	/* Reset position for the stream direction */
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		dg00x->pcm_playback.hwptr = 0;
+		dg00x->pcm_playback.rate = ch->speed > 0 ? ch->speed : 48000;
+	} else {
+		dg00x->pcm_capture.hwptr = 0;
+		dg00x->pcm_capture.rate = ch->speed > 0 ? ch->speed : 48000;
+	}
+
 	return (0);
 }
 
 static int
 pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
+	struct snd_dg00x *dg00x = (struct snd_dg00x *)substream->pcm->private_data;
+
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		return dg00x_pcm_stream_start(dg00x,
+			substream->stream, substream);
 	case SNDRV_PCM_TRIGGER_STOP:
+		dg00x_pcm_stream_stop(dg00x, substream->stream);
 		return (0);
 	default:
 		return -EINVAL;
@@ -119,7 +274,13 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 static unsigned long
 pcm_pointer(struct snd_pcm_substream *substream)
 {
-	return (0);
+	struct snd_dg00x *dg00x = (struct snd_dg00x *)substream->pcm->private_data;
+	struct dg00x_pcm_stream *ps;
+
+	ps = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) ?
+	     &dg00x->pcm_playback : &dg00x->pcm_capture;
+
+	return ps->hwptr;
 }
 
 static const struct snd_pcm_ops dg00x_pcm_ops = {
@@ -148,6 +309,16 @@ dg00x_create_pcm(struct snd_dg00x *dg00x)
 
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &dg00x_pcm_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &dg00x_pcm_ops);
+
+	/* Initialize streaming state and store substream references for
+	 * the callout callback to use for snd_pcm_period_elapsed(). */
+	callout_init(&dg00x->pcm_playback.callout, 1);
+	dg00x->pcm_playback.substream =
+	    pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+
+	callout_init(&dg00x->pcm_capture.callout, 1);
+	dg00x->pcm_capture.substream =
+	    pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
 
 	return (0);
 }

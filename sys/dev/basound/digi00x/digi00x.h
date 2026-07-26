@@ -58,6 +58,20 @@ struct dg00x_stream {
 	int midi_fifo_limit;
 };
 
+/* PCM streaming state — managed by the callout-based streaming engine */
+struct dg00x_pcm_stream {
+	struct callout  callout;       /* periodic timer for PCM timing */
+	unsigned long   hwptr;         /* current buffer position (bytes) */
+	unsigned int    period_bytes;  /* bytes per period */
+	unsigned int    buffer_bytes;  /* total buffer bytes */
+	unsigned int    pcm_channels;  /* negotiated channel count */
+	unsigned int    rate;          /* sample rate */
+	bool            active;        /* callout is running */
+	struct dot_state dot;          /* DOT encoder/decoder state */
+	int             direction;     /* SNDRV_PCM_STREAM_PLAYBACK or CAPTURE */
+	struct snd_pcm_substream *substream; /* PCM substream for period_elapsed() */
+};
+
 struct snd_dg00x {
 	struct snd_card *card;
 	struct fw_device *fwdev;
@@ -71,6 +85,10 @@ struct snd_dg00x {
 
 	struct dg00x_stream rx_stream;
 	struct dg00x_resources rx_resources;
+
+	/* Callout-based PCM streaming engines */
+	struct dg00x_pcm_stream pcm_playback;
+	struct dg00x_pcm_stream pcm_capture;
 
 	unsigned int substreams_counter;
 
