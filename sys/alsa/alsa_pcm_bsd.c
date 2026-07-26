@@ -482,6 +482,18 @@ basound_pcm_attach(device_t dev)
 	pcm_init(dev, pcm);
 
 	/*
+	 * For devices with private_data (HDSP, digi00x) the app must talk
+	 * directly to the hardware channel.  Disable vchans to prevent
+	 * chn_resizebuf negotiation failures between virtual and hardware
+	 * buffer sizes.
+	 */
+	if (pcm->private_data != NULL || is_line6) {
+		struct snddev_info *d = device_get_softc(dev);
+		d->pvchancount = 0;
+		d->rvchancount = 0;
+	}
+
+	/*
 	 * Enable bitperfect mode for HDSP and digi00x so the app's audio
 	 * flows directly to the hardware channel without feeder matrix
 	 * conversion (which cannot handle the 18-channel format).
