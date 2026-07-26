@@ -69,7 +69,7 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	substream->runtime = ch->runtime;
 
 	/* Allocate DMA-capable hardware buffer using the card-level DMA tag.
-	 * bus_dmamem_alloc uses dmatag->maxsize (4 MB) as the allocation size,
+	 * bus_dmamem_alloc uses dmatag->maxsize as the allocation size,
 	 * which matches the size we pass to sndbuf_alloc. */
 	if (pcm->card->dmatag == NULL) {
 		free(ch->runtime, M_ALSA);
@@ -259,24 +259,14 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	}
 
 	/*
-	 * HDSP uses a hardware double-buffer (exactly 2 periods): HDSP_BufferID
-	 * only ever reports position 0 or period_bytes.  Using blkcnt > 2 causes
-	 * the PCM layer's write pointer to drift ahead of the hardware read
-	 * pointer, eventually filling all blocks and stopping writes → silence.
-	 *
-	 * For non-HDSP devices (e.g. USB audio) keep a larger ring to absorb
-	 * ISO transfer jitter.
+	 * Allow the sndbuf staging buffer to grow to the app's desired
+	 * size.  The HDSP hardware uses a separate planar DMA buffer
+	 * (hdsp_alloc_dma_buffers) with exactly 2 periods; the sndbuf
+	 * is purely a staging area for the interleave/deinterleave
+	 * conversion in the interrupt handler and does NOT need to
+	 * match the hardware period layout.
 	 */
-	uint32_t blkcnt;
-	if (ch->substream->pcm->private_data != NULL) {
-		blkcnt = 2;
-	} else {
-		/*
-		 * USB: keep latency bounded and avoid excessively deep capture
-		 * rings (e.g. 64-byte blocks x 512 periods).
-		 */
-		blkcnt = 32;
-	}
+	uint32_t blkcnt = 32;
 	sndbuf_resize(ch->buffer, blkcnt, blocksize);
 
 	/* Keep runtime in sync with the logical buffer size so that
@@ -497,16 +487,16 @@ basound_pcm_attach(device_t dev)
 	pcm_init(dev, pcm);
 
 	/*
-	 * Enable bitperfect mode only for simple stereo USB devices (Line6)
-	 * that already work correctly with direct passthrough.
+	 * Enable bitperfect mode for HDSP and digi00x so the app's audio
+	 * flows directly to the hardware channel without feeder matrix
+	 * conversion (which cannot handle the 18-channel format).
 	 *
-	 * Multi-channel devices like HDSP and digi00x MUST NOT use
-	 * SD_F_BITPERFECT because the app (Audacious, JACK) opens with
-	 * stereo S16_LE while the hardware uses 18ch S32_LE.  Without
-	 * the feeder/vchan layer, format conversion is impossible and
-	 * buffer resize fails (vchan wants 4 periods, hw has only 2).
+	 * The HDSP interrupt handler (hdsp_deinterleave_to_planar) reads
+	 * the actual negotiated channel count from ch->format and copies
+	 * only the channels the app is actually using into the planar DMA
+	 * buffer — unused channels stay at zero.  This is safe.
 	 */
-	if (is_line6) {
+	if (pcm->private_data != NULL || is_line6) {
 		pcm_setflags(dev, pcm_getflags(dev) | SD_F_BITPERFECT);
 	}
 
@@ -523,9 +513,9 @@ basound_pcm_attach(device_t dev)
 		pcm_addchan(dev, PCMDIR_REC, &basound_chan_class, pcm);
 
 	/*
-	 * Pre-set vchan format/rate so the feeder chain knows how to
-	 * convert between the app's format (e.g. stereo S16_LE) and the
-	 * hardware's native format (e.g. 18ch S32_LE).
+	 * Pre-set vchan format/rate for non-bitperfect devices.
+	 * With SD_F_BITPERFECT set (HDSP, digi00x), no vchan is
+	 * created and these fields are unused.
 	 *
 	 * Without this, {p,r}vchanformat=0 causes vchan_create() to
 	 * call chn_reset(parent, 0, 0), which skips feeder_chain().  The
@@ -533,21 +523,7 @@ basound_pcm_attach(device_t dev)
 	 * before CHN_F_HAS_VCHAN was set), so playback won't mix children
 	 * and capture won't distribute to children.
 	 */
-	if (strcmp(card->driver, "hdsp") == 0) {
-		/* HDSP: S32_LE, 18 channels, 48000 Hz native */
-		struct snddev_info *d = device_get_softc(dev);
-		d->pvchanformat = SND_FORMAT(AFMT_S32_LE, 18, 0);
-		d->pvchanrate = 48000;
-		d->rvchanformat = SND_FORMAT(AFMT_S32_LE, 18, 0);
-		d->rvchanrate = 48000;
-	} else if (strcmp(card->driver, "Digi00x") == 0) {
-		/* digi00x: S32_LE, 18 channels, 48000 Hz native */
-		struct snddev_info *d = device_get_softc(dev);
-		d->pvchanformat = SND_FORMAT(AFMT_S32_LE, 18, 0);
-		d->pvchanrate = 48000;
-		d->rvchanformat = SND_FORMAT(AFMT_S32_LE, 18, 0);
-		d->rvchanrate = 48000;
-	} else if (pcm->private_data == NULL && !is_line6) {
+	if (pcm->private_data == NULL && !is_line6) {
 		struct snddev_info *d = device_get_softc(dev);
 		d->pvchanformat = SND_FORMAT(AFMT_S16_LE, 2, 0);
 		d->pvchanrate = 44100;
