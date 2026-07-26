@@ -352,10 +352,28 @@ snd_hdsp_enable_io(struct hdsp *hdsp)
  *
  *  1. Silence all 2048 entries (MINUS_INFINITY_GAIN = 0).
  *  2. Route each playback channel N directly to output N at unity gain.
+ *  3. For the Multiface, also route playback 0/1 to headphone outputs
+ *     (8/9) so stereo applications are audible on the headphone jack
+ *     without needing hdspmixer configuration.
  *
  * Without step 2 the DMA playback buffers are never connected to the
  * physical outputs and no sound is produced, even if the DMA engine is
  * running correctly.
+ *
+ * Output map (Multiface):
+ *   0-1: Analog line out 1/2
+ *   2-3: Analog line out 3/4
+ *   4-5: Analog line out 5/6
+ *   6-7: Analog line out 7/8
+ *   8-9: Headphone (phones)
+ *  10-17: ADAT
+ *
+ * Output map (Digiface / H9652 — all digital):
+ *   0-7: ADAT 1
+ *   8-15: ADAT 2
+ *  16-17: SPDIF
+ *   (Headphone on Digiface is the same physical jack as SPDIF,
+ *    controlled by the HDSP_LineOut bit — we keep it routed too.)
  */
 static int
 hdsp_init_mixer(struct hdsp *hdsp)
@@ -379,6 +397,23 @@ hdsp_init_mixer(struct hdsp *hdsp)
 			    "mixer init: unity gain write failed ch %d\n", i);
 			return -EIO;
 		}
+	}
+
+	/*
+	 * Route stereo out (playback 0/1) to headphone outputs (8/9) so that
+	 * stereo applications (JACK with 2 channels, Audacious, etc.) are
+	 * audible on the headphone jack without manual mixer setup.
+	 *
+	 * For Multiface, output 8/9 is the headphone (phones) jack.
+	 * For Digiface, output 8/1? is unused or SPDIF, so this is harmless.
+	 * This extra routing is additive — it does not alter the existing
+	 * playback N → output N paths.
+	 */
+	if (hdsp->max_channels >= 10) {
+		addr = hdsp_playback_to_output_key(hdsp, 0, 8);
+		hdsp_write_gain(hdsp, addr, UNITY_GAIN);
+		addr = hdsp_playback_to_output_key(hdsp, 1, 9);
+		hdsp_write_gain(hdsp, addr, UNITY_GAIN);
 	}
 
 	dev_info(hdsp->card->dev,
@@ -530,7 +565,14 @@ hdsp_deinterleave_to_planar(struct hdsp *hdsp, int period_idx)
 	if (ch == NULL || ch->buffer == NULL)
 		return;
 
-	nch = hdsp->ss_out_channels;
+	/* Use the actual stream channel count from the FreeBSD PCM format,
+	 * NOT hdsp->ss_out_channels (the hardware maximum).  Using the max
+	 * channel count would divide period_bytes by a larger denominator,
+	 * producing too few frames and reading past frame boundaries in the
+	 * interleaved sndbuf — causing severe distortion on all outputs. */
+	nch = AFMT_CHANNEL(ch->format);
+	if (nch == 0)
+		nch = 2;
 	period_frames = hdsp->playback_substream->runtime->period_bytes / (nch * 4);
 	if (period_frames == 0)
 		return;
@@ -575,7 +617,11 @@ hdsp_interleave_from_planar(struct hdsp *hdsp, int period_idx)
 	if (ch == NULL || ch->buffer == NULL)
 		return;
 
-	nch = hdsp->ss_in_channels;
+	/* Use the actual stream channel count, not the hardware maximum.
+	 * See hdsp_deinterleave_to_planar for the full explanation. */
+	nch = AFMT_CHANNEL(ch->format);
+	if (nch == 0)
+		nch = 2;
 	period_frames = hdsp->capture_substream->runtime->period_bytes / (nch * 4);
 	if (period_frames == 0)
 		return;
@@ -700,7 +746,72 @@ snd_hdsp_upload_firmware(struct hdsp *hdsp)
 	return 0;
 }
 
+/*
+ * snd_hdsp_open — set hardware constraints for the PCM substream.
+ *
+ * Without this callback the FreeBSD PCM layer has no way to learn what
+ * formats, sample rates and channel counts the HDSP supports.
+ * Applications such as Audacious that query device capabilities before
+ * opening a stream would fail with "device does not support the format"
+ * when they try to negotiate a stereo S16_LE stream that the constraints
+ * (defaulting to 18-channel S32_LE from basound_chan_init) reject.
+ *
+ * This callback is called from basound_chan_init after the substream is
+ * allocated but before the channel methods are invoked.  The hw struct
+ * fields we set here are re-read by basound_chan_init to populate the
+ * basound_chan format/speed/caps.
+ */
+static int
+snd_hdsp_open(struct snd_pcm_substream *substream)
+{
+	struct hdsp *hdsp = (struct hdsp *)substream->pcm->private_data;
+	struct snd_pcm_runtime *runtime = substream->runtime;
+
+	if (runtime == NULL)
+		return 0;
+
+	runtime->hw.info = SNDRV_PCM_INFO_MMAP |
+	                   SNDRV_PCM_INFO_MMAP_VALID |
+	                   SNDRV_PCM_INFO_INTERLEAVED;
+
+	/* S32_LE is the native HDSP format; S16_LE is available via sndbuf
+	 * format conversion in the FreeBSD PCM layer. */
+	runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE |
+	                      SNDRV_PCM_FMTBIT_S16_LE;
+
+	/* Single-speed: 32, 44.1, 48 kHz; double-speed: 64, 88.2, 96 kHz;
+	 * quad-speed: 176.4, 192 kHz.  HDSP hardware supports all of these. */
+	runtime->hw.rates = SNDRV_PCM_RATE_32000 |
+	                    SNDRV_PCM_RATE_44100 |
+	                    SNDRV_PCM_RATE_48000 |
+	                    SNDRV_PCM_RATE_64000 |
+	                    SNDRV_PCM_RATE_88200 |
+	                    SNDRV_PCM_RATE_96000 |
+	                    SNDRV_PCM_RATE_176400 |
+	                    SNDRV_PCM_RATE_192000;
+	runtime->hw.rate_min = 32000;
+	runtime->hw.rate_max = 192000;
+
+	/* Use the actual max channels for this card variant.
+	 * channels_min = 1 ensures mono apps can work; in practice JACK
+	 * and most apps request 2, 8, 18, or 26 channels. */
+	runtime->hw.channels_min = 1;
+	runtime->hw.channels_max = hdsp->max_channels;
+
+	/* Buffer: 2 periods max (hardware double-buffer), period up to 64 KB.
+	 * The sndbuf allocation in basound_chan_init gives 4 MB of DMA space
+	 * per direction; constrain to what the HDSP's double-buffer can use. */
+	runtime->hw.buffer_bytes_max = 2 * 65536;
+	runtime->hw.period_bytes_min = 64;     /* 1 frame stereo S32_LE = 8 bytes, min 8 frames */
+	runtime->hw.period_bytes_max = 65536;  /* max one period */
+	runtime->hw.periods_min = 2;
+	runtime->hw.periods_max = 2;
+
+	return 0;
+}
+
 const struct snd_pcm_ops hdsp_pcm_ops = {
+	.open      = snd_hdsp_open,
 	.hw_params = snd_hdsp_hw_params,
 	.prepare   = snd_hdsp_prepare,
 	.trigger   = snd_hdsp_trigger,

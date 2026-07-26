@@ -113,11 +113,6 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	ch->speed = 48000;
 	ch->blocksize = 4096;
 
-	/* Initialize per-channel capabilities from ALSA constraints. */
-	if (strcmp(pcm->card->driver, "hdsp") == 0)
-		ch->caps.fmtlist = basound_fmtlist;
-	else
-		ch->caps.fmtlist = basound_line6_fmtlist;
 	ch->caps.caps = DSP_CAP_DUPLEX;
 	ch->caps.minspeed = 32000;
 	ch->caps.maxspeed = 192000;
@@ -140,6 +135,27 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 			ch->caps.maxspeed = ch->runtime->hw.rate_max;
 			ch->speed = ch->caps.minspeed;
 		}
+	}
+
+	/* Select the format capability list based on the actual driver
+	 * constraints, NOT the driver name.
+	 *
+	 * Drivers that register PCM ops with an .open callback (digi00x,
+	 * DICE, HDSP) advertise multi-channel capabilities via runtime
+	 * constraints and should use the full basound_fmtlist so JACK,
+	 * Audacious and other apps discover the full channel range.
+	 *
+	 * Drivers without an .open callback (e.g. USB Line6) are simple
+	 * stereo-only devices that use basound_line6_fmtlist.
+	 *
+	 * NOTE: This must run AFTER ops->open() so that ch->runtime->hw
+	 * is populated with the real constraints before we inspect it. */
+	if (substream->pstr->ops && substream->pstr->ops->open &&
+	    ch->runtime != NULL &&
+	    ch->runtime->hw.channels_max > 2) {
+		ch->caps.fmtlist = basound_fmtlist;
+	} else {
+		ch->caps.fmtlist = basound_line6_fmtlist;
 	}
 
 	return ch;
