@@ -798,14 +798,21 @@ snd_hdsp_open(struct snd_pcm_substream *substream)
 	runtime->hw.channels_min = 1;
 	runtime->hw.channels_max = hdsp->max_channels;
 
-	/* Buffer: 2 periods max (hardware double-buffer), period up to 64 KB.
-	 * The sndbuf allocation in basound_chan_init gives 4 MB of DMA space
-	 * per direction; constrain to what the HDSP's double-buffer can use. */
-	runtime->hw.buffer_bytes_max = 2 * 65536;
-	runtime->hw.period_bytes_min = 64;     /* 1 frame stereo S32_LE = 8 bytes, min 8 frames */
-	runtime->hw.period_bytes_max = 65536;  /* max one period */
+	/*
+	 * Buffer constraints: the sndbuf is an interleaved staging buffer
+	 * that the FreeBSD PCM layer writes to and the interrupt handler
+	 * deinterleaves into the hardware planar DMA buffer.  It does NOT
+	 * need to match the HDSP's 2-period hardware double-buffer.
+	 *
+	 * The HDSP hardware's true period/latency is set independently in
+	 * snd_hdsp_hw_params via the HDSP_controlRegister latency bits.
+	 * Allow the app to negotiate a reasonable staging buffer size.
+	 */
+	runtime->hw.buffer_bytes_max = BASOUND_DMA_BUFSIZE;
+	runtime->hw.period_bytes_min = 64;
+	runtime->hw.period_bytes_max = 65536;
 	runtime->hw.periods_min = 2;
-	runtime->hw.periods_max = 2;
+	runtime->hw.periods_max = 1024;
 
 	return 0;
 }

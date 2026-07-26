@@ -16,4 +16,9 @@ struct basound_chan {
 	struct pcmchan_caps caps;
 };
 
+/* Must match BASOUND_DMA_BUFSIZE in alsa_card.c — the maximum single
+ * DMA allocation the card-level DMA tag supports.  256 KB is sufficient
+ * for the interleaved sndbuf staging buffer. */
+#define BASOUND_DMA_BUFSIZE	(256 * 1024)
+
 #endif /* _ALSA_PCM_BSD_H_ */
