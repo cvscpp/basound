@@ -8,12 +8,13 @@
 MALLOC_DEFINE(M_ALSA, "alsa", "ALSA shim memory");
 
 /*
- * 4 MB per channel — matches snd_hdsp_hw_params and sndbuf_alloc call site.
- * bus_dmamem_alloc uses dmatag->maxsize as the allocation size, so we must
- * create our own tag with the exact size rather than passing bus_get_dma_tag()
- * (which has maxsize == BUS_SPACE_MAXSIZE == 4 GB).
+ * 256 KB per channel — plenty for the interleaved sndbuf staging buffer
+ * that the FreeBSD PCM layer writes to.  The HDSP planar DMA buffers
+ * are allocated separately in hdsp_alloc_dma_buffers (~1.2 MB each).
+ * Using 4 MB here causes bus_dmamem_alloc to fail on systems with
+ * fragmented DMA address space, especially after module reloads.
  */
-#define BASOUND_DMA_BUFSIZE	(4 * 1024 * 1024)
+#define BASOUND_DMA_BUFSIZE	(256 * 1024)
 
 int
 snd_card_new(struct device *parent, int idx, const char *xid,

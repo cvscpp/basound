@@ -14,6 +14,11 @@
 #include "feeder_if.h"
 #include "hdsp.h"
 
+/* Must match BASOUND_DMA_BUFSIZE in alsa_card.c — the maximum single
+ * DMA allocation the card-level DMA tag supports.  256 KB is sufficient
+ * for the interleaved sndbuf staging buffer. */
+#define BASOUND_DMA_BUFSIZE	(256 * 1024)
+
 MALLOC_DECLARE(M_ALSA);
 
 static uint32_t basound_fmtlist[] = {
@@ -72,7 +77,7 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 		return NULL;
 	}
 	if (sndbuf_alloc(b, pcm->card->dmatag, 0,
-	    4 * 1024 * 1024) != 0) {
+	    BASOUND_DMA_BUFSIZE) != 0) {
 		free(ch->runtime, M_ALSA);
 		free(ch, M_ALSA);
 		return NULL;
