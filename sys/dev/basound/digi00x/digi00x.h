@@ -72,6 +72,18 @@ struct dg00x_pcm_stream {
 	struct snd_pcm_substream *substream; /* PCM substream for period_elapsed() */
 };
 
+/* ISO DMA channel for FreeBSD native firewire streaming.
+ * Defined here so it's embedded in snd_dg00x. */
+struct dg00x_iso_channel {
+	int		dmach;		/* -1 = not allocated */
+	void		*xferq;		/* struct fw_xferq * (firewire.h) */
+	void		*fc;		/* struct firewire_comm * */
+	void		*bulkxfer;	/* struct fw_bulkxfer * array */
+	void		**mbufs;	/* struct mbuf ** array */
+	void		*ctx;		/* backpointer to snd_dg00x */
+	int		direction;	/* SNDRV_PCM_STREAM_PLAYBACK or CAPTURE */
+};
+
 struct snd_dg00x {
 	struct snd_card *card;
 	struct fw_device *fwdev;
@@ -89,6 +101,10 @@ struct snd_dg00x {
 	/* Callout-based PCM streaming engines */
 	struct dg00x_pcm_stream pcm_playback;
 	struct dg00x_pcm_stream pcm_capture;
+
+	/* ISO DMA channel state for real streaming */
+	struct dg00x_iso_channel iso_tx;
+	struct dg00x_iso_channel iso_rx;
 
 	unsigned int substreams_counter;
 
@@ -178,5 +194,13 @@ int dg00x_create_hwdep(struct snd_dg00x *dg00x);
 
 /* Proc init */
 void dg00x_proc_init(struct snd_dg00x *dg00x);
+
+/* FreeBSD-native ISO streaming engine (digi00x-streaming.c) */
+int  dg00x_streaming_init(struct snd_dg00x *dg00x);
+void dg00x_streaming_fini(struct snd_dg00x *dg00x);
+int  dg00x_streaming_start_tx(struct snd_dg00x *dg00x);
+int  dg00x_streaming_start_rx(struct snd_dg00x *dg00x);
+void dg00x_streaming_stop_tx(struct snd_dg00x *dg00x);
+void dg00x_streaming_stop_rx(struct snd_dg00x *dg00x);
 
 #endif

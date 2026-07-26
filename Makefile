@@ -23,6 +23,7 @@ SRCS=	sys/dev/basound/basound.c \
 	sys/dev/basound/maudio/maudio_midisport.c \
 	sys/dev/basound/digi00x/digi00x_bsd.c \
 	sys/dev/basound/digi00x/digi00x-stream.c \
+	sys/dev/basound/digi00x/digi00x-streaming.c \
 	sys/dev/basound/digi00x/digi00x-pcm.c \
 	sys/dev/basound/digi00x/digi00x-midi.c \
 	sys/dev/basound/digi00x/digi00x-transaction.c \
