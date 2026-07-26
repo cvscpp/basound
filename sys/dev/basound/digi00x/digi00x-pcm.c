@@ -116,12 +116,9 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	/* Reset DOT state at stream start */
 	dot_reset_state(&ps->dot);
 
-	/* Begin the hardware streaming session so the device
-	 * transitions to streaming mode.  The ISO DMA buffers
-	 * will be set up when the amdtp infrastructure is ported. */
-	dg00x_begin_session(dg00x,
-			    dg00x->tx_resources.channel,
-			    dg00x->rx_resources.channel);
+	/* Session begin/end is managed by pcm_trigger() which calls
+	 * dg00x_begin_session()/dg00x_finish_session() and the ISO DMA
+	 * streaming engine.  The callout provides PCM timing only. */
 
 	/* Schedule first period callback using dg00x as arg so the
 	 * callback can access both playback and capture streams. */
@@ -147,8 +144,6 @@ dg00x_pcm_stream_stop(struct snd_dg00x *dg00x, int direction)
 
 	ps->active = false;
 	callout_stop(&ps->callout);
-
-	dg00x_finish_session(dg00x);
 }
 
 /* ------------------------------------------------------------------ */
@@ -258,14 +253,52 @@ static int
 pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_dg00x *dg00x = (struct snd_dg00x *)substream->pcm->private_data;
+	int err;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		return dg00x_pcm_stream_start(dg00x,
+		/* Start the callout-based timing engine first */
+		err = dg00x_pcm_stream_start(dg00x,
 			substream->stream, substream);
-	case SNDRV_PCM_TRIGGER_STOP:
-		dg00x_pcm_stream_stop(dg00x, substream->stream);
+		if (err < 0)
+			return (err);
+
+		/* Then start the real ISO DMA streaming.
+		 * If the ISO channels are not available, the callout
+		 * engine still provides timing for the PCM layer. */
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+			/* Try to init streaming if not already done */
+			if (dg00x->iso_tx.dmach < 0)
+				dg00x_streaming_init(dg00x);
+			dg00x_streaming_start_tx(dg00x);
+		} else {
+			if (dg00x->iso_rx.dmach < 0)
+				dg00x_streaming_init(dg00x);
+			dg00x_streaming_start_rx(dg00x);
+		}
+
+		/* Begin hardware session */
+		dg00x_begin_session(dg00x,
+		    dg00x->tx_resources.channel,
+		    dg00x->rx_resources.channel);
+
 		return (0);
+
+	case SNDRV_PCM_TRIGGER_STOP:
+		/* Stop ISO DMA first */
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			dg00x_streaming_stop_tx(dg00x);
+		else
+			dg00x_streaming_stop_rx(dg00x);
+
+		/* Stop callout timing engine */
+		dg00x_pcm_stream_stop(dg00x, substream->stream);
+
+		/* Finish session */
+		dg00x_finish_session(dg00x);
+
+		return (0);
+
 	default:
 		return -EINVAL;
 	}
