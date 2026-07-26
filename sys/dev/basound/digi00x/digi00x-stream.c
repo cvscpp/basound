@@ -46,13 +46,18 @@ dg00x_txn_callback(struct fw_xfer *xfer)
 }
 
 /*
- * Synchronous quadlet read using fwmem_read_quad + fw_xferwait.
+ * Synchronous quadlet read using fwmem_read_quad + timeout-based wait.
+ *
+ * Uses tsleep() with a 5-second timeout instead of fw_xferwait() (which
+ * blocks forever and makes the process unkillable in D state when the
+ * FireWire device doesn't respond).
  */
 int
 dg00x_read_quad(struct fw_device *fwdev, uint64_t addr, uint32_t *val)
 {
 	struct dg00x_txn txn;
 	uint32_t offset_hi, offset_lo;
+	int ret;
 
 	if (fwdev == NULL || fwdev->fc == NULL)
 		return (EIO);
@@ -68,19 +73,44 @@ dg00x_read_quad(struct fw_device *fwdev, uint64_t addr, uint32_t *val)
 	if (txn.xfer == NULL)
 		return (ENOMEM);
 
-	fw_xferwait(txn.xfer);
-	fw_xfer_free(txn.xfer);
+	/* Wait for transaction completion with 5-second timeout.
+	 * Do NOT use fw_xferwait() — it has no timeout and hangs forever
+	 * in D state if the device is unresponsive. */
+	while (!txn.done) {
+		ret = tsleep(&txn, PCATCH, "dg00xrd", 5 * hz);
+		if (ret == EWOULDBLOCK || ret == EINTR) {
+			txn.error = ETIMEDOUT;
+			break;
+		}
+		if (txn.done)
+			break;
+		txn.error = EIO;
+		break;
+	}
+
+	/* If we timed out, the xfer may still be pending.
+	 * Freeing it is risky (use-after-free if callback fires later),
+	 * but the alternative is a permanently hung process.
+	 * We accept the small leak on timeout. */
+	if (txn.xfer != NULL)
+		fw_xfer_free(txn.xfer);
+
 	return (txn.error);
 }
 
 /*
- * Synchronous quadlet write using fwmem_write_quad + fw_xferwait.
+ * Synchronous quadlet write using fwmem_write_quad + timeout-based wait.
+ *
+ * Uses tsleep() with a 5-second timeout instead of fw_xferwait() (which
+ * blocks forever and makes the process unkillable in D state when the
+ * FireWire device doesn't respond).
  */
 int
 dg00x_write_quad(struct fw_device *fwdev, uint64_t addr, uint32_t val)
 {
 	struct dg00x_txn txn;
 	uint32_t offset_hi, offset_lo;
+	int ret;
 
 	if (fwdev == NULL || fwdev->fc == NULL)
 		return (EIO);
@@ -96,8 +126,28 @@ dg00x_write_quad(struct fw_device *fwdev, uint64_t addr, uint32_t val)
 	if (txn.xfer == NULL)
 		return (ENOMEM);
 
-	fw_xferwait(txn.xfer);
-	fw_xfer_free(txn.xfer);
+	/* Wait for transaction completion with 5-second timeout.
+	 * Do NOT use fw_xferwait() — it has no timeout and hangs forever
+	 * in D state if the device is unresponsive. */
+	while (!txn.done) {
+		ret = tsleep(&txn, PCATCH, "dg00xwr", 5 * hz);
+		if (ret == EWOULDBLOCK || ret == EINTR) {
+			txn.error = ETIMEDOUT;
+			break;
+		}
+		if (txn.done)
+			break;
+		txn.error = EIO;
+		break;
+	}
+
+	/* If we timed out, the xfer may still be pending.
+	 * Freeing it is risky (use-after-free if callback fires later),
+	 * but the alternative is a permanently hung process.
+	 * We accept the small leak on timeout. */
+	if (txn.xfer != NULL)
+		fw_xfer_free(txn.xfer);
+
 	return (txn.error);
 }
 

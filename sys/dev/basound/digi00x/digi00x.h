@@ -60,13 +60,12 @@ struct dg00x_stream {
 
 /* PCM streaming state — managed by the callout-based streaming engine */
 struct dg00x_pcm_stream {
-	struct callout  callout;       /* periodic timer for PCM timing */
 	unsigned long   hwptr;         /* current buffer position (bytes) */
 	unsigned int    period_bytes;  /* bytes per period */
 	unsigned int    buffer_bytes;  /* total buffer bytes */
 	unsigned int    pcm_channels;  /* negotiated channel count */
 	unsigned int    rate;          /* sample rate */
-	bool            active;        /* callout is running */
+	bool            active;        /* stream is active */
 	struct dot_state dot;          /* DOT encoder/decoder state */
 	int             direction;     /* SNDRV_PCM_STREAM_PLAYBACK or CAPTURE */
 	struct snd_pcm_substream *substream; /* PCM substream for period_elapsed() */
@@ -101,6 +100,10 @@ struct snd_dg00x {
 	/* Callout-based PCM streaming engines */
 	struct dg00x_pcm_stream pcm_playback;
 	struct dg00x_pcm_stream pcm_capture;
+
+	/* Single shared callout for both playback and capture timing */
+	struct callout callout;
+	unsigned int active_streams; /* count of active pcm streams */
 
 	/* ISO DMA channel state for real streaming */
 	struct dg00x_iso_channel iso_tx;

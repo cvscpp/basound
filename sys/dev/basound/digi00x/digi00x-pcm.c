@@ -20,20 +20,16 @@
  * and 10 channels at 88.2/96 kHz (8 analog + 2 SPDIF). */
 
 /* ------------------------------------------------------------------ */
-/* Callout-based PCM streaming engine                                  */
-/*                                                                     *
- * The digi00x hardware uses isochronous (ISO) packets on FireWire to
- * transport audio data with DOT encoding.  The full ISO DMA pipeline
- * (amdtp-stream, iso-resources, fw_iso_context) is not yet ported to
- * FreeBSD, so this callout engine provides a working PCM timing source
- * that lets JACK, Audacious, and other apps open, negotiate, and run
- * the PCM stream.  Actual ISO data transfer requires the amdtp-domain
- * infrastructure from the dice/ directory.
- *
- * Callout fires at each period boundary to:
- *   1. Advance the software hwptr
- *   2. Signal period completion to the PCM layer
- *   3. Reschedule for the next period
+/* Single shared callout for PCM timing engine                         *
+ *                                                                     *
+ * Uses a single callout per device to drive both playback and capture *
+ * period advancement.  A counter (active_streams) tracks how many     *
+ * directions are active.  The callout is stopped only when both       *
+ * streams become inactive.                                            *
+ *                                                                     *
+ * When the session is fully active and ISO DMA is working, this       *
+ * callout provides the PCM timing signal (snd_pcm_period_elapsed)     *
+ * so that the PCM layer advances its pointer correctly.               *
  * ------------------------------------------------------------------ */
 
 static void
@@ -78,7 +74,7 @@ dg00x_pcm_stream_cb(void *arg)
 	}
 	if (ticks < 1)
 		ticks = 1;
-	callout_reset(&ps_pb->callout, ticks, dg00x_pcm_stream_cb, dg00x);
+	callout_reset(&dg00x->callout, ticks, dg00x_pcm_stream_cb, dg00x);
 }
 
 static int
@@ -116,17 +112,16 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	/* Reset DOT state at stream start */
 	dot_reset_state(&ps->dot);
 
-	/* Session begin/end is managed by pcm_trigger() which calls
-	 * dg00x_begin_session()/dg00x_finish_session() and the ISO DMA
-	 * streaming engine.  The callout provides PCM timing only. */
+	dg00x->active_streams++;
 
-	/* Schedule first period callback using dg00x as arg so the
-	 * callback can access both playback and capture streams. */
-	ticks = (ps->period_bytes / (ps->pcm_channels * bps)) * hz / ps->rate;
-	if (ticks < 1)
-		ticks = 1;
-	callout_reset(&dg00x->pcm_playback.callout, ticks,
-		      dg00x_pcm_stream_cb, dg00x);
+	/* Schedule first period callback only if this is the first stream. */
+	if (dg00x->active_streams == 1) {
+		ticks = (ps->period_bytes / (ps->pcm_channels * bps)) * hz / ps->rate;
+		if (ticks < 1)
+			ticks = 1;
+		callout_reset(&dg00x->callout, ticks,
+			      dg00x_pcm_stream_cb, dg00x);
+	}
 
 	return 0;
 }
@@ -143,7 +138,12 @@ dg00x_pcm_stream_stop(struct snd_dg00x *dg00x, int direction)
 		return;
 
 	ps->active = false;
-	callout_stop(&ps->callout);
+	if (dg00x->active_streams > 0)
+		dg00x->active_streams--;
+
+	/* Only stop the shared callout when both streams are inactive. */
+	if (dg00x->active_streams == 0)
+		callout_stop(&dg00x->callout);
 }
 
 /* ------------------------------------------------------------------ */
@@ -163,7 +163,7 @@ pcm_open(struct snd_pcm_substream *substream)
 
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
 
-	runtime->hw.channels_min = 10;
+	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 18;
 
 	runtime->hw.rates = SNDRV_PCM_RATE_44100 |
@@ -257,27 +257,36 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		/* Start the callout-based timing engine first */
+		/* Allocate isochronous resources if not already done */
+		if (dg00x->tx_resources.channel < 0 &&
+		    dg00x->rx_resources.channel < 0) {
+			err = dg00x_alloc_isoc_resources(dg00x);
+			if (err < 0)
+				return (err);
+		}
+
+		/* Initialize streaming engine if not already done */
+		if (dg00x->iso_tx.dmach < 0 &&
+		    dg00x->iso_rx.dmach < 0) {
+			err = dg00x_streaming_init(dg00x);
+			if (err < 0)
+				return (err);
+		}
+
+		/* Start the callout-based timing engine */
 		err = dg00x_pcm_stream_start(dg00x,
 			substream->stream, substream);
 		if (err < 0)
 			return (err);
 
-		/* Then start the real ISO DMA streaming.
-		 * If the ISO channels are not available, the callout
-		 * engine still provides timing for the PCM layer. */
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-			/* Try to init streaming if not already done */
-			if (dg00x->iso_tx.dmach < 0)
-				dg00x_streaming_init(dg00x);
+		/* Start real ISO DMA streaming */
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			dg00x_streaming_start_tx(dg00x);
-		} else {
-			if (dg00x->iso_rx.dmach < 0)
-				dg00x_streaming_init(dg00x);
+		else
 			dg00x_streaming_start_rx(dg00x);
-		}
 
-		/* Begin hardware session */
+		/* Begin hardware session (only if both channels are ready).
+		 * We always begin the session; finish_session is ref-counted. */
 		dg00x_begin_session(dg00x,
 		    dg00x->tx_resources.channel,
 		    dg00x->rx_resources.channel);
@@ -291,11 +300,13 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		else
 			dg00x_streaming_stop_rx(dg00x);
 
-		/* Stop callout timing engine */
+		/* Stop callout timing engine (ref-counted via active_streams) */
 		dg00x_pcm_stream_stop(dg00x, substream->stream);
 
-		/* Finish session */
-		dg00x_finish_session(dg00x);
+		/* Only finish the hardware session when ALL streams have
+		 * stopped — the device cannot handle a partial session stop. */
+		if (dg00x->active_streams == 0)
+			dg00x_finish_session(dg00x);
 
 		return (0);
 
@@ -343,13 +354,13 @@ dg00x_create_pcm(struct snd_dg00x *dg00x)
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &dg00x_pcm_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &dg00x_pcm_ops);
 
-	/* Initialize streaming state and store substream references for
-	 * the callout callback to use for snd_pcm_period_elapsed(). */
-	callout_init(&dg00x->pcm_playback.callout, 1);
+	/* Initialize shared callout and active stream counter */
+	callout_init(&dg00x->callout, 1);
+	dg00x->active_streams = 0;
+
+	/* Store substream references for the callout callback */
 	dg00x->pcm_playback.substream =
 	    pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
-
-	callout_init(&dg00x->pcm_capture.callout, 1);
 	dg00x->pcm_capture.substream =
 	    pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
 

@@ -306,6 +306,19 @@ basound_chan_getcaps(kobj_t obj, void *data)
 	return &ch->caps;
 }
 
+static struct pcmchan_matrix basound_matrix_2 = {
+	.id = 1,
+	.channels = 2,
+	.ext = 0,
+	.map = {
+		{ .type = 0,  .members = (1 << 0) },
+		{ .type = 1,  .members = (1 << 1) },
+		{ .type = 2,  .members = 0         }
+	},
+	.mask = 0x0003,
+	.offset = { 0, 1 }
+};
+
 static struct pcmchan_matrix basound_matrix_18 = {
 	.id = 100,
 	.channels = 18,
@@ -370,7 +383,9 @@ basound_chan_getmatrix(kobj_t obj, void *data, uint32_t format)
 	uint32_t channels = AFMT_CHANNEL(format);
 	struct pcmchan_matrix *m;
 
-	if (channels == 18)
+	if (channels == 2)
+		m = &basound_matrix_2;
+	else if (channels == 18)
 		m = &basound_matrix_18;
 	else if (channels == 26)
 		m = &basound_matrix_26;
