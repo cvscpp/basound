@@ -389,9 +389,16 @@ static int
 basound_chan_trigger(kobj_t obj, void *data, int go)
 {
 	struct basound_chan *ch = data;
-	struct snd_pcm_substream *substream = ch->substream;
-	const struct snd_pcm_ops *ops = substream->pstr->ops;
+	struct snd_pcm_substream *substream;
+	const struct snd_pcm_ops *ops;
 	int alsa_cmd;
+
+	if (ch == NULL)
+		return (EINVAL);
+	substream = ch->substream;
+	if (substream == NULL || substream->pstr == NULL)
+		return (EINVAL);
+	ops = substream->pstr->ops;
 
 	if (go == PCMTRIG_EMLDMAWR || go == PCMTRIG_EMLDMARD)
 		return 0;
@@ -478,20 +485,21 @@ basound_pcm_attach(device_t dev)
 	 * (we use device_set_driver + device_attach directly). */
 	device_set_desc_copy(dev, pcm->id[0] ? pcm->id : "HDSP PCM");
 
-	/* dev's softc is PCM_SOFTC_SIZE bytes — safe for snddev_info */
-	pcm_init(dev, pcm);
-
 	/*
-	 * For devices with private_data (HDSP, digi00x) the app must talk
-	 * directly to the hardware channel.  Disable vchans to prevent
-	 * chn_resizebuf negotiation failures between virtual and hardware
-	 * buffer sizes.
+	 * For devices with private_data (HDSP, digi00x, DICE) the app
+	 * must talk directly to the hardware channel.  Set vchan counts
+	 * to zero BEFORE pcm_init() so that pcm_init does not create
+	 * virtual channels — otherwise the app opens a vchan instead of
+	 * the hardware channel, and the indirection crashes in trigger.
 	 */
 	if (pcm->private_data != NULL || is_line6) {
 		struct snddev_info *d = device_get_softc(dev);
 		d->pvchancount = 0;
 		d->rvchancount = 0;
 	}
+
+	/* dev's softc is PCM_SOFTC_SIZE bytes — safe for snddev_info */
+	pcm_init(dev, pcm);
 
 	/*
 	 * Enable bitperfect mode for HDSP and digi00x so the app's audio
@@ -544,6 +552,18 @@ basound_pcm_attach(device_t dev)
 	if (pcm_register(dev, status) != 0) {
 		dev_err(card->dev, "pcm_register failed\n");
 		return ENXIO;
+	}
+
+	/*
+	 * pcm_register() resets pvchancount/rvchancount via
+	 * MAX(d->pvchancount, d->devcount), undoing our vchan
+	 * disable above.  Set them back to zero AFTER register
+	 * so no virtual channels are ever created.
+	 */
+	if (pcm->private_data != NULL || is_line6) {
+		struct snddev_info *d = device_get_softc(dev);
+		d->pvchancount = 0;
+		d->rvchancount = 0;
 	}
 
 	return 0;
