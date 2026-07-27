@@ -485,19 +485,6 @@ basound_pcm_attach(device_t dev)
 	 * (we use device_set_driver + device_attach directly). */
 	device_set_desc_copy(dev, pcm->id[0] ? pcm->id : "HDSP PCM");
 
-	/*
-	 * For devices with private_data (HDSP, digi00x, DICE) the app
-	 * must talk directly to the hardware channel.  Set vchan counts
-	 * to zero BEFORE pcm_init() so that pcm_init does not create
-	 * virtual channels — otherwise the app opens a vchan instead of
-	 * the hardware channel, and the indirection crashes in trigger.
-	 */
-	if (pcm->private_data != NULL || is_line6) {
-		struct snddev_info *d = device_get_softc(dev);
-		d->pvchancount = 0;
-		d->rvchancount = 0;
-	}
-
 	/* dev's softc is PCM_SOFTC_SIZE bytes — safe for snddev_info */
 	pcm_init(dev, pcm);
 
@@ -555,13 +542,18 @@ basound_pcm_attach(device_t dev)
 	}
 
 	/*
-	 * pcm_register() resets pvchancount/rvchancount via
-	 * MAX(d->pvchancount, d->devcount), undoing our vchan
-	 * disable above.  Set them back to zero AFTER register
-	 * so no virtual channels are ever created.
+	 * pcm_register() unconditionally sets SD_F_PVCHANS | SD_F_RVCHANS
+	 * when playcount/reccount > 0, which causes dsp_open() to call
+	 * vchan_create() on every open — even for bitperfect devices.
+	 *
+	 * For HDSP/digi00x/DICE/Line6, the app must talk directly to
+	 * the hardware channel.  Clear the vchan flags and counters
+	 * AFTER pcm_register() so dsp_open() skips vchan_create and
+	 * opens the real hardware channel instead.
 	 */
 	if (pcm->private_data != NULL || is_line6) {
 		struct snddev_info *d = device_get_softc(dev);
+		d->flags &= ~(SD_F_PVCHANS | SD_F_RVCHANS);
 		d->pvchancount = 0;
 		d->rvchancount = 0;
 	}
