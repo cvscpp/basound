@@ -114,7 +114,14 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	ps->pcm_channels = channels;
 	ps->rate = ch->speed > 0 ? ch->speed : 48000;
 	ps->period_bytes = ch->blocksize;
-	ps->buffer_bytes = ch->buffer->bufsize;
+	/*
+	 * Use runtime->dma_bytes for buffer bounds, not ch->buffer->bufsize.
+	 * The sndbuf staging buffer and the runtime DMA area are the same
+	 * underlying memory (dma_area = b->buf, set in basound_chan_init),
+	 * but using runtime->dma_bytes keeps the wrap check consistent with
+	 * whatever ALSA hw_params may have negotiated.
+	 */
+	ps->buffer_bytes = substream->runtime->dma_bytes;
 	ps->hwptr = 0;
 	ps->period_accum = 0;
 	ps->tx_dbc = 0;

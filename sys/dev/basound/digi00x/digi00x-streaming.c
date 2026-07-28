@@ -27,9 +27,11 @@
 #include <sys/malloc.h>
 #include <sys/bus.h>
 #include <sys/mbuf.h>
+#include <machine/bus.h>
 
 #include <dev/firewire/firewire.h>
 #include <dev/firewire/firewirereg.h>
+#include <dev/firewire/fwdma.h>
 
 #include <sys/lock.h>
 #include <sys/mutex.h>
@@ -161,6 +163,14 @@ dg00x_iso_open(struct firewire_comm *fc, struct dg00x_iso_channel *ch,
 		ISO_BX(ch)[i].mbuf = m;
 		ISO_BX(ch)[i].start = mtod(m, caddr_t);
 		ISO_BX(ch)[i].end = mtod(m, caddr_t) + DG00X_ISO_PACKET_SIZE;
+		/*
+		 * poffset identifies which segment of the multi-segment
+		 * DMA buffer (xferq->buf) this chunk corresponds to.
+		 * fwohci uses poffset in fwdma_sync_multiseg() to flush
+		 * the correct segment before DMA.  Each chunk maps 1:1
+		 * to a segment (bnpacket = 1).
+		 */
+		ISO_BX(ch)[i].poffset = i;
 		STAILQ_INSERT_TAIL(&xferq->stfree, &ISO_BX(ch)[i], link);
 	}
 	xferq->bulkxfer = ISO_BX(ch);
@@ -230,24 +240,33 @@ dg00x_frames_this_packet(struct dg00x_pcm_stream *ps)
 /*
  * Fill a single ISO chunk (one packet) with DOT-encoded AMDTP data.
  *
+ * With FWXFERQ_EXTBUF, the fwohci transmits from the multi-segment DMA
+ * buffer (xferq->buf), NOT from the mbuf attached to the bulkxfer.
+ * Each chunk maps to one segment via bx->poffset.
+ *
+ * Segment layout (as expected by fwohci_txbufdb):
+ *   [0..3]:   fw_isohdr quadlet (sy, len) — fwohci reads len for DMA count
+ *   [4..7]:   CIP header quadlet 0 (SID, DBS, FN, QPC, SPH, DBC)
+ *   [8..11]:  CIP header quadlet 1 (EOH, FMT, FDF, SYT)
+ *   [12..]:   Data blocks: [MIDI] [PCM×nch] [MIDI] [PCM×nch] …
+ *             where MIDI = 0x80000000 (placeholder — no MIDI data)
+ *
  * - Calls dg00x_frames_this_packet() to determine how many audio frames
  *   this packet carries (rate/8000, with fractional distribution).
- * - Sets DBS = pcm_channels + 1 (PCM quadlets + 1 MIDI quadlet per
- *   data block) in the CIP header.
+ * - Sets DBS = pcm_channels + 1 in the CIP header.
  * - Uses the current tx_dbc as the CIP DBC and advances it by the
  *   frame count (DBC counts data blocks, wrapping at 256).
  * - Advances hwptr and calls dg00x_pcm_update_position().
- *
- * On the wire: [CIP(2)] [MIDI] [PCM×nch] [MIDI] [PCM×nch] …
- *   where MIDI = 0x80000000 (placeholder — no MIDI data).
  */
 static void
-dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_bulkxfer *bx)
+dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
+		    struct fw_bulkxfer *bx)
 {
 	struct dg00x_pcm_stream *ps = &dg00x->pcm_playback;
 	unsigned int dbs = ps->pcm_channels + 1;
 	unsigned int frames, dbc;
-	unsigned int bytes;
+	unsigned int bytes, pkt_len;
+	struct fw_pkt *fp;
 	uint32_t *payload;
 	unsigned int i;
 
@@ -255,17 +274,53 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_bulkxfer *bx)
 	dbc = ps->tx_dbc;
 	ps->tx_dbc = (dbc + frames) & 0xff;
 
-	payload = mtod(bx->mbuf, uint32_t *);
+	/*
+	 * Total payload after the 8-byte isochronous header:
+	 *   8 (CIP header) + frames * dbs * 4 (data blocks)
+	 */
+	pkt_len = 8 + frames * dbs * 4;
+
+	/* Get pointer to the DMA buffer segment for this chunk */
+	fp = (struct fw_pkt *)fwdma_v_addr(xferq->buf, bx->poffset);
+	if (fp == NULL)
+		return;
+
+	/*
+	 * Set the isochronous header quadlet:
+	 *   sy=0, tcode=0xa (set by fwohci), chtag=0 (set by fwohci)
+	 *   len = pkt_len (payload length in bytes)
+	 *   spd is set by fwohci
+	 *
+	 * fw_pkt.stream layout (little-endian):
+	 *   bits [0:15]  = len
+	 *   bits [16:23] = chtag
+	 *   bits [24:27] = tcode
+	 *   bits [28:31] = sy
+	 */
+#if BYTE_ORDER == BIG_ENDIAN
+	fp->mode.ld[0] = (0 << 28) | (0xa << 24) | (0 << 16) | pkt_len;
+#else
+	fp->mode.ld[0] = (pkt_len << 16) | (0 << 24) | (0xa << 28);
+#endif
+
+	/*
+	 * Payload starts at fp->mode.stream.payload (offset 4 in segment).
+	 * Layout: [CIP hdr q0] [CIP hdr q1] [MIDIq] [PCM×nch] [MIDIq] …
+	 */
+	payload = (uint32_t *)fp->mode.stream.payload;
 
 	dg00x_build_cip_header(&payload[0],
 	    dg00x->fwdev->fc->nodeid,
 	    dbs, dbc,
 	    CIP_FMT_AM, AMDTP_FDF_AM824, 0xffff);
 
-	/* Zero the MIDI quadlet at the start of every data block */
+	/* Zero the MIDI quadlet at the start of every data block.
+	 * Data blocks start at payload[2] (after 2-quadlet CIP header). */
 	for (i = 0; i < frames; i++)
 		payload[CIP_HEADER_QUADLETS + i * dbs] = 0x80000000;
 
+	/* DOT-encode PCM data.  PCM starts at payload[3] (after CIP[2] + MIDI[1]).
+	 * dbs is the stride between consecutive data blocks (MIDI + PCM). */
 	dot_write_pcm(&ps->dot,
 	    &payload[CIP_HEADER_QUADLETS + 1],
 	    (const int32_t *)ps->substream->runtime->dma_area +
@@ -403,8 +458,8 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 {
 	struct dg00x_iso_channel *ch = &dg00x->iso_tx;
 	struct dg00x_pcm_stream *ps = &dg00x->pcm_playback;
-	struct fw_xferq *xferq = ISO_XFERQ(ch);
-	struct firewire_comm *fc = ISO_FC(ch);
+	struct fw_xferq *xferq;
+	struct firewire_comm *fc;
 	struct fw_bulkxfer *bx;
 	int i;
 	int err;
@@ -417,6 +472,22 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	    ps->substream->runtime == NULL ||
 	    ps->substream->runtime->dma_area == NULL)
 		return (-EINVAL);
+
+	xferq = ISO_XFERQ(ch);
+	fc = ISO_FC(ch);
+
+	/*
+	 * Defensive: the firewire_comm, xferq, and DMA buffer must all
+	 * be valid.  On a subsequent START after a STOP, the xferq->buf
+	 * was freed by fwohci_db_free() and will be re-allocated by
+	 * itx_enable() -> fwohci_db_init().  However, the xferq pointer
+	 * itself and fc must remain valid across sessions.
+	 */
+	if (fc == NULL || xferq == NULL) {
+		printf("digi00x: start_tx: fc=%p xferq=%p\n",
+		    (void *)fc, (void *)xferq);
+		return (-ENODEV);
+	}
 
 	/*
 	 * Hold FW_GLOCK while manipulating the xferq queues to
@@ -445,7 +516,7 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 			break;
 		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
 
-		dg00x_fill_tx_chunk(dg00x, bx);
+		dg00x_fill_tx_chunk(dg00x, xferq, bx);
 
 		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
 	}
@@ -599,7 +670,7 @@ dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
 	while ((bx = STAILQ_FIRST(&xferq->stfree)) != NULL) {
 		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
 
-		dg00x_fill_tx_chunk(dg00x, bx);
+		dg00x_fill_tx_chunk(dg00x, xferq, bx);
 
 		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
 		refilled++;
