@@ -418,9 +418,34 @@ basound_chan_trigger(kobj_t obj, void *data, int go)
 	}
 
 	if (ops && ops->trigger) {
-		/* ALSA ops return Linux-style negative errno; FreeBSD channel
-		 * methods must return 0 on success or a positive errno. */
-		int err = ops->trigger(substream, alsa_cmd);
+		/*
+		 * Release CHN_LOCK before calling the ALSA trigger ops.
+		 *
+		 * digi00x's trigger does FireWire transactions (tsleep with
+		 * 5-second timeout) and itx_disable (pause 1s).  Holding
+		 * CHN_LOCK across those sleeps blocks chn_intr (called from
+		 * the DMA callout via snd_pcm_period_elapsed), creating a
+		 * deadlock during STOP: the callout blocks on CHN_LOCK in
+		 * chn_intr while the trigger sleeps in pause(), and the
+		 * callout is then in the middle of refill when the trigger
+		 * continues with itx_disable + db_free + queue drain —
+		 * a corrupted DMA queue causes a panic/reboot.
+		 *
+		 * chn_trigger() calls us with CHN_LOCK held and drops it
+		 * after we return on success.  On error it returns with
+		 * CHN_LOCK held — we must re-acquire before returning
+		 * failure so the caller's invariants stay intact.
+		 */
+		struct pcm_channel *pc = ch->channel;
+		int err;
+
+		CHN_UNLOCK(pc);
+		err = ops->trigger(substream, alsa_cmd);
+		CHN_LOCK(pc);
+
+		/* ALSA ops return Linux-style negative errno; FreeBSD
+		 * channel methods must return 0 on success or a positive
+		 * errno. */
 		return (err < 0) ? -err : err;
 	}
 

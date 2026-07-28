@@ -287,7 +287,9 @@ dg00x_finish_session(struct snd_dg00x *dg00x)
 	dg00x_write_quad(dg00x->fwdev,
 			 DG00X_ADDR_BASE + DG00X_OFFSET_ISOC_CHANNELS, 0);
 
-	DELAY(50000); /* 50ms delay after session end */
+	/* Allow hardware to quiesce after session end.
+	 * pause() sleeps rather than busy-spinning. */
+	pause("dg00xfe", hz / 20);	/* ~50 ms */
 }
 
 int
@@ -327,7 +329,14 @@ dg00x_begin_session(struct snd_dg00x *dg00x, int tx_ch, int rx_ch)
 		if (err != 0)
 			break;
 
-		DELAY(20000); /* 20ms between steps */
+		/*
+		 * The hardware needs time between successive countdown
+		 * writes.  Use pause() (which sleeps via tsleep) instead
+		 * of DELAY() (which busy-spins the CPU).  CHN_LOCK is not
+		 * held here (basound_chan_trigger releases it before
+		 * calling us), so sleeping is safe.
+		 */
+		pause("dg00xbs", hz / 50);	/* ~20 ms */
 	}
 
 	return (err);

@@ -120,6 +120,14 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	ps->tx_dbc = 0;
 	ps->active = true;
 
+	/* AMDTP fractional framing: FireWire runs at 8000 ISO cycles/sec.
+	 * Each packet must carry rate/8000 frames on average.  The
+	 * remainder is distributed via a modulo accumulator so that
+	 * the long-term average matches the sample rate exactly. */
+	ps->frames_per_packet = ps->rate / 8000;
+	ps->frame_remainder   = ps->rate % 8000;
+	ps->frame_cycle       = 0;
+
 	/* Reset DOT state at stream start */
 	dot_reset_state(&ps->dot);
 
@@ -139,14 +147,25 @@ dg00x_pcm_stream_stop(struct snd_dg00x *dg00x, int direction)
 	if (!ps->active)
 		return;
 
+	/*
+	 * Clear active under dg00x->lock to serialise with the callout
+	 * refill path.  The refill function reads active under the same
+	 * lock and will bail out if it sees active==false — preventing
+	 * it from calling itx_enable after we call itx_disable below.
+	 */
+	mtx_lock(&dg00x->lock);
 	ps->active = false;
 	ps->period_accum = 0;
 	if (dg00x->active_streams > 0)
 		dg00x->active_streams--;
 
-	/* Stop the shared callout when both streams are inactive */
+	/* Stop the shared callout when both streams are inactive.
+	 * callout_stop only cancels a pending callout; a currently
+	 * running callout will see active==false under dg00x->lock
+	 * and bail out before touching xferq queues. */
 	if (dg00x->active_streams == 0)
 		callout_stop(&dg00x->callout);
+	mtx_unlock(&dg00x->lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -246,10 +265,20 @@ pcm_prepare(struct snd_pcm_substream *substream)
 		dg00x->pcm_playback.period_accum = 0;
 		dg00x->pcm_playback.tx_dbc = 0;
 		dg00x->pcm_playback.rate = ch->speed > 0 ? ch->speed : 48000;
+		dg00x->pcm_playback.frames_per_packet =
+		    dg00x->pcm_playback.rate / 8000;
+		dg00x->pcm_playback.frame_remainder =
+		    dg00x->pcm_playback.rate % 8000;
+		dg00x->pcm_playback.frame_cycle = 0;
 	} else {
 		dg00x->pcm_capture.hwptr = 0;
 		dg00x->pcm_capture.period_accum = 0;
 		dg00x->pcm_capture.rate = ch->speed > 0 ? ch->speed : 48000;
+		dg00x->pcm_capture.frames_per_packet =
+		    dg00x->pcm_capture.rate / 8000;
+		dg00x->pcm_capture.frame_remainder =
+		    dg00x->pcm_capture.rate % 8000;
+		dg00x->pcm_capture.frame_cycle = 0;
 	}
 
 	return (0);
@@ -350,14 +379,23 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		return (0);
 
 	case SNDRV_PCM_TRIGGER_STOP:
-		/* Stop ISO DMA */
+		/*
+		 * Mark stream inactive FIRST (under dg00x->lock).
+		 * This tells the callout refill path to stop touching
+		 * the xferq queues.  If we called itx_disable first,
+		 * the callout could still be mid-refill, and after
+		 * db_free clears FWXFERQ_RUNNING, the callout would
+		 * call itx_enable — re-initialising the freed DB and
+		 * starting DMA just as we drain the queues below.
+		 * Kernel panic.
+		 */
+		dg00x_pcm_stream_stop(dg00x, substream->stream);
+
+		/* Now stop ISO DMA safely — the callout has bailed out */
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			dg00x_streaming_stop_tx(dg00x);
 		else
 			dg00x_streaming_stop_rx(dg00x);
-
-		/* Mark stream inactive */
-		dg00x_pcm_stream_stop(dg00x, substream->stream);
 
 		/*
 		 * Only finish the hardware session when ALL streams have

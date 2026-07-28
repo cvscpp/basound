@@ -74,6 +74,27 @@ struct dg00x_pcm_stream {
 	struct dot_state dot;          /* DOT encoder/decoder state */
 	int             direction;     /* SNDRV_PCM_STREAM_PLAYBACK or CAPTURE */
 	struct snd_pcm_substream *substream; /* PCM substream for period_elapsed() */
+
+	/*
+	 * AMDTP fractional framing: FireWire runs at 8000 ISO cycles/sec.
+	 * Each packet must carry rate/8000 frames on average.
+	 *
+	 *   frames_per_packet = rate / 8000        (integer base)
+	 *   frame_remainder   = rate % 8000         (fractional part)
+	 *   frame_cycle       = accumulated remainder
+	 *
+	 * Each packet: frame_cycle += frame_remainder.
+	 * When frame_cycle >= 8000, send an extra frame and subtract 8000.
+	 *
+	 * Examples:
+	 *   44100 → base=5, rem=4100  (5 or 6 frames/packet)
+	 *   48000 → base=6, rem=0     (always 6 frames/packet)
+	 *   88200 → base=11, rem=200  (11 or 12 frames/packet)
+	 *   96000 → base=12, rem=0    (always 12 frames/packet)
+	 */
+	unsigned int    frames_per_packet;
+	unsigned int    frame_cycle;
+	unsigned int    frame_remainder;
 };
 
 /* Called from ISO DMA handlers to track transfer progress.
