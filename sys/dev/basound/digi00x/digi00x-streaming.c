@@ -339,6 +339,7 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	struct dg00x_pcm_stream *ps = &dg00x->pcm_playback;
 	struct fw_xferq *xferq = ISO_XFERQ(ch);
 	struct firewire_comm *fc = ISO_FC(ch);
+	struct fw_bulkxfer *bx;
 	int i;
 
 	if (ch->dmach < 0 || !ps->active)
@@ -350,11 +351,16 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	    ps->substream->runtime->dma_area == NULL)
 		return (-EINVAL);
 
-	/* Reset queue state.  Chunks are in stfree from dg00x_iso_open.
-	 * We move them to stvalid after filling with audio data. */
-	STAILQ_INIT(&xferq->stfree);
-	STAILQ_INIT(&xferq->stdma);
-	STAILQ_INIT(&xferq->stvalid);
+	/*
+	 * Drain all chunks back to stfree for a clean starting state.
+	 * Use STAILQ_CONCAT to move the entire list atomically — no
+	 * per-element iteration that could corrupt link pointers.
+	 * Don't use STAILQ_INIT on stfree — that would orphan elements
+	 * that the fwohci may still be DMAing from.
+	 */
+	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
+	STAILQ_CONCAT(&xferq->stfree, &xferq->stvalid);
+
 	dot_reset_state(&ps->dot);
 
 	/* Pre-fill all chunks to seed the ISO pipeline.  hwptr and
@@ -362,7 +368,10 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	 * driven refill path (dg00x_streaming_refill_tx) continues
 	 * from where we leave off. */
 	for (i = 0; i < DG00X_ISO_NCHUNKS; i++) {
-		struct fw_bulkxfer *bx = &ISO_BX(ch)[i];
+		bx = STAILQ_FIRST(&xferq->stfree);
+		if (bx == NULL)
+			break;
+		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
 
 		dg00x_fill_tx_chunk(dg00x, bx, i);
 

@@ -125,13 +125,6 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 
 	dg00x->active_streams++;
 
-	/* Schedule the shared callout on the first active stream.
-	 * Fire at 1 ms intervals for timely TX refill. */
-	if (dg00x->active_streams == 1) {
-		callout_reset(&dg00x->callout, DG00X_REFILL_TICKS,
-		    dg00x_pcm_stream_cb, dg00x);
-	}
-
 	return (0);
 }
 
@@ -322,14 +315,37 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		}
 
 		/*
-		 * Start the ISO DMA.  Handlers won't fire until
-		 * itx/irx_enable is called below, so it's safe that
-		 * ps->active is already set.
+		 * Start the ISO DMA.  The callout is NOT running yet,
+		 * so there is no risk of the callout racing with
+		 * dg00x_streaming_start_tx's queue manipulation.
+		 *
+		 * Handlers won't fire until itx/irx_enable is called
+		 * below, so it's safe that ps->active is already set.
 		 */
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-			dg00x_streaming_start_tx(dg00x);
+			err = dg00x_streaming_start_tx(dg00x);
 		else
-			dg00x_streaming_start_rx(dg00x);
+			err = dg00x_streaming_start_rx(dg00x);
+		if (err < 0) {
+			if (was_idle)
+				dg00x_finish_session(dg00x);
+			dg00x_pcm_stream_stop(dg00x,
+			    substream->stream);
+			return (err);
+		}
+
+		/*
+		 * Start the callout NOW — after the ISO DMA is fully
+		 * set up and the hardware session is active.  Starting
+		 * it earlier risks the callout calling itx_enable
+		 * before dg00x_streaming_start_tx, which then destroys
+		 * the active DMA queues with STAILQ_INIT → corruption
+		 * → panic → reboot.
+		 */
+		if (dg00x->active_streams == 1) {
+			callout_reset(&dg00x->callout, DG00X_REFILL_TICKS,
+			    dg00x_pcm_stream_cb, dg00x);
+		}
 
 		return (0);
 
