@@ -153,6 +153,15 @@ struct hdsp {
  */
 #define HDSP_CHANNEL_BUFFER_BYTES   (8192 * 4 * 2)
 
+/*
+ * Total DMA area that must be allocated for the hardware to access.
+ * The HDSP always DMA's 26 channels' worth of data regardless of the
+ * I/O box type (Multiface, Digiface, etc.).  We allocate for 27 channels
+ * (26 + 1 extra) to match Linux, which adds a guard channel because the
+ * hardware writes one byte beyond the last page.
+ */
+#define HDSP_DMA_AREA_BYTES	(27 * HDSP_CHANNEL_BUFFER_BYTES)
+
 #define HDSP_DllError (1<<21)
 #define HDSP_PROGRAM	        0x020
 #define HDSP_CONFIG_MODE_0	0x040

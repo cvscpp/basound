@@ -494,7 +494,14 @@ hdsp_alloc_one_dma_buf(struct hdsp *hdsp, struct snd_dma_buffer *dmab,
 int
 hdsp_alloc_dma_buffers(struct hdsp *hdsp)
 {
-	size_t bufsz = (size_t)hdsp->max_channels * HDSP_CHANNEL_BUFFER_BYTES;
+	/*
+	 * The HDSP DMA engine always operates on all 26 channels regardless
+	 * of the attached I/O box.  Allocate the full DMA area plus one guard
+	 * channel (matching Linux) to prevent the hardware from reading or
+	 * writing past the end of the buffer, which causes a PCI bus fault
+	 * and machine reboot.
+	 */
+	size_t bufsz = HDSP_DMA_AREA_BYTES;
 	int err;
 
 	err = hdsp_alloc_one_dma_buf(hdsp, &hdsp->playback_dma_buf,
@@ -550,10 +557,11 @@ static void
 hdsp_deinterleave_to_planar(struct hdsp *hdsp, int period_idx)
 {
 	struct basound_chan *ch;
-	const uint32_t *src;
+	const uint8_t *src;
 	uint32_t *dst;
 	uint32_t nch, period_frames, ch_buf_words, fr, c;
 	uint32_t src_off, dst_off;
+	uint32_t bps; /* bytes per sample */
 
 	if (hdsp->playback_substream == NULL ||
 	    hdsp->playback_substream->runtime == NULL ||
@@ -565,29 +573,40 @@ hdsp_deinterleave_to_planar(struct hdsp *hdsp, int period_idx)
 	if (ch == NULL || ch->buffer == NULL)
 		return;
 
-	/* Use the actual stream channel count from the FreeBSD PCM format,
+	/*
+	 * Use the actual stream channel count from the FreeBSD PCM format,
 	 * NOT hdsp->ss_out_channels (the hardware maximum).  Using the max
 	 * channel count would divide period_bytes by a larger denominator,
 	 * producing too few frames and reading past frame boundaries in the
-	 * interleaved sndbuf — causing severe distortion on all outputs. */
+	 * interleaved sndbuf — causing severe distortion on all outputs.
+	 *
+	 * Use the actual bytes-per-sample from the format (2 for S16_LE,
+	 * 4 for S32_LE) instead of hardcoding 4.  Previously the 4-byte
+	 * assumption produced half the correct frame count for stereo
+	 * S16_LE streams, leaving periods only half-filled.
+	 */
 	nch = AFMT_CHANNEL(ch->format);
 	if (nch == 0)
 		nch = 2;
-	period_frames = hdsp->playback_substream->runtime->period_bytes / (nch * 4);
+	bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
+	period_frames = hdsp->playback_substream->runtime->period_bytes /
+	    (nch * bps);
 	if (period_frames == 0)
 		return;
 
 	ch_buf_words = HDSP_CHANNEL_BUFFER_BYTES / 4;
-	src = (const uint32_t *)ch->buffer->buf;
+	src = (const uint8_t *)ch->buffer->buf;
 	dst = (uint32_t *)hdsp->playback_buffer;
 
-	src_off = period_idx * period_frames * nch;
+	src_off = period_idx * period_frames * nch * bps;
 	dst_off = period_idx * period_frames;
 
 	for (fr = 0; fr < period_frames; fr++)
 		for (c = 0; c < nch; c++)
 			dst[c * ch_buf_words + dst_off + fr] =
-			    src[src_off + fr * nch + c];
+			    (bps == 4) ?
+			    ((const uint32_t *)src)[(src_off / 4) + fr * nch + c] :
+			    ((const uint16_t *)src)[(src_off / 2) + fr * nch + c];
 }
 
 /*
@@ -603,9 +622,10 @@ hdsp_interleave_from_planar(struct hdsp *hdsp, int period_idx)
 {
 	struct basound_chan *ch;
 	const uint32_t *src;
-	uint32_t *dst;
+	uint8_t *dst;
 	uint32_t nch, period_frames, ch_buf_words, fr, c;
 	uint32_t src_off, dst_off;
+	uint32_t bps; /* bytes per sample */
 
 	if (hdsp->capture_substream == NULL ||
 	    hdsp->capture_substream->runtime == NULL ||
@@ -617,26 +637,35 @@ hdsp_interleave_from_planar(struct hdsp *hdsp, int period_idx)
 	if (ch == NULL || ch->buffer == NULL)
 		return;
 
-	/* Use the actual stream channel count, not the hardware maximum.
-	 * See hdsp_deinterleave_to_planar for the full explanation. */
+	/*
+	 * Use the actual stream channel count from the FreeBSD PCM format,
+	 * NOT hdsp->ss_in_channels.  Also use the actual bytes-per-sample
+	 * (2 for S16_LE, 4 for S32_LE) instead of hardcoding 4.
+	 */
 	nch = AFMT_CHANNEL(ch->format);
 	if (nch == 0)
 		nch = 2;
-	period_frames = hdsp->capture_substream->runtime->period_bytes / (nch * 4);
+	bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
+	period_frames = hdsp->capture_substream->runtime->period_bytes /
+	    (nch * bps);
 	if (period_frames == 0)
 		return;
 
 	ch_buf_words = HDSP_CHANNEL_BUFFER_BYTES / 4;
 	src = (const uint32_t *)hdsp->capture_buffer;
-	dst = (uint32_t *)ch->buffer->buf;
+	dst = (uint8_t *)ch->buffer->buf;
 
 	src_off = period_idx * period_frames;
-	dst_off = period_idx * period_frames * nch;
+	dst_off = period_idx * period_frames * nch * bps;
 
 	for (fr = 0; fr < period_frames; fr++)
-		for (c = 0; c < nch; c++)
-			dst[dst_off + fr * nch + c] =
-			    src[c * ch_buf_words + src_off + fr];
+		for (c = 0; c < nch; c++) {
+			uint32_t s = src[c * ch_buf_words + src_off + fr];
+			if (bps == 4)
+				((uint32_t *)dst)[(dst_off / 4) + fr * nch + c] = s;
+			else
+				((uint16_t *)dst)[(dst_off / 2) + fr * nch + c] = (uint16_t)s;
+		}
 }
 
 int

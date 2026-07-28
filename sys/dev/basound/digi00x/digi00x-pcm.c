@@ -20,17 +20,32 @@
  * and 10 channels at 88.2/96 kHz (8 analog + 2 SPDIF). */
 
 /* ------------------------------------------------------------------ */
-/* Single shared callout for PCM timing engine                         *
+/* Callout-based period signalling and TX refill                       */
+/*                                                                     */
+/* ISO DMA handlers advance hwptr and accumulate progress into         *
+ * period_accum.  A shared callout fires at 1 ms intervals to:        *
+ *   1. Refill TX ISO chunks from stfree → stvalid (keeping the       *
+ *      FireWire ISO pipeline fed)                                     *
+ *   2. Signal snd_pcm_period_elapsed when a full period of bytes     *
+ *      has been accumulated                                           *
  *                                                                     *
- * Uses a single callout per device to drive both playback and capture *
- * period advancement.  A counter (active_streams) tracks how many     *
- * directions are active.  The callout is stopped only when both       *
- * streams become inactive.                                            *
+ * This avoids calling chn_intr (which acquires CHN_LOCK) from the     *
+ * fwohci interrupt context, preventing a lock-ordering conflict       *
+ * with the FireWire bus.                                              *
  *                                                                     *
- * When the session is fully active and ISO DMA is working, this       *
- * callout provides the PCM timing signal (snd_pcm_period_elapsed)     *
- * so that the PCM layer advances its pointer correctly.               *
+ * NOTE: fwohci does NOT call a handler for TX (only RX).  All TX      *
+ * refilling is driven from this callout.                              *
  * ------------------------------------------------------------------ */
+
+#define DG00X_REFILL_TICKS	1	/* 1 ms at hz=1000 */
+
+void
+dg00x_pcm_update_position(struct dg00x_pcm_stream *ps, unsigned int bytes)
+{
+
+	if (ps->active)
+		ps->period_accum += bytes;
+}
 
 static void
 dg00x_pcm_stream_cb(void *arg)
@@ -38,44 +53,40 @@ dg00x_pcm_stream_cb(void *arg)
 	struct snd_dg00x *dg00x = (struct snd_dg00x *)arg;
 	struct dg00x_pcm_stream *ps_pb = &dg00x->pcm_playback;
 	struct dg00x_pcm_stream *ps_cap = &dg00x->pcm_capture;
-	unsigned int frames;
-	int ticks;
 
-	/* Advance playback position and signal period */
-	if (ps_pb->active) {
-		ps_pb->hwptr += ps_pb->period_bytes;
-		if (ps_pb->hwptr >= ps_pb->buffer_bytes)
-			ps_pb->hwptr -= ps_pb->buffer_bytes;
-		if (ps_pb->substream)
-			snd_pcm_period_elapsed(ps_pb->substream);
+	/* Refill TX ISO chunks to keep the FireWire pipeline fed.
+	 * The fwohci does not call a handler for TX; refilling must
+	 * be driven externally. */
+	dg00x_streaming_refill_tx(dg00x);
+
+	/* Signal period_elapsed for active streams that have
+	 * accumulated at least one full period of data.  The PCM
+	 * layer will check hwptr via pcm_pointer. */
+	if (ps_pb->active && ps_pb->substream != NULL &&
+	    ps_pb->period_accum >= ps_pb->period_bytes) {
+		ps_pb->period_accum -= ps_pb->period_bytes;
+		snd_pcm_period_elapsed(ps_pb->substream);
+	}
+	if (ps_cap->active && ps_cap->substream != NULL &&
+	    ps_cap->period_accum >= ps_cap->period_bytes) {
+		ps_cap->period_accum -= ps_cap->period_bytes;
+		snd_pcm_period_elapsed(ps_cap->substream);
 	}
 
-	/* Advance capture position and signal period */
-	if (ps_cap->active) {
-		ps_cap->hwptr += ps_cap->period_bytes;
-		if (ps_cap->hwptr >= ps_cap->buffer_bytes)
-			ps_cap->hwptr -= ps_cap->buffer_bytes;
-		if (ps_cap->substream)
-			snd_pcm_period_elapsed(ps_cap->substream);
-	}
-
-	/* If neither stream is active, stop the callout */
+	/* Stop callout if neither stream is active */
 	if (!ps_pb->active && !ps_cap->active)
 		return;
 
-	/* Reschedule at the period interval of whichever stream is active.
-	 * Use the playback period if both are active. */
-	if (ps_pb->active) {
-		frames = ps_pb->period_bytes / (ps_pb->pcm_channels * 4);
-		ticks = frames * hz / ps_pb->rate;
-	} else {
-		frames = ps_cap->period_bytes / (ps_cap->pcm_channels * 4);
-		ticks = frames * hz / ps_cap->rate;
-	}
-	if (ticks < 1)
-		ticks = 1;
-	callout_reset(&dg00x->callout, ticks, dg00x_pcm_stream_cb, dg00x);
+	/* Reschedule at the TX refill interval (1 ms).  This is fast
+	 * enough to keep the ISO pipeline fed (8000 cycles/sec means
+	 * we need to refill at least every DG00X_ISO_NCHUNKS/8 ms). */
+	callout_reset(&dg00x->callout, DG00X_REFILL_TICKS,
+	    dg00x_pcm_stream_cb, dg00x);
 }
+
+/* ------------------------------------------------------------------ */
+/* Stream start / stop helpers                                         */
+/* ------------------------------------------------------------------ */
 
 static int
 dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
@@ -83,23 +94,21 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 {
 	struct dg00x_pcm_stream *ps;
 	struct basound_chan *ch;
-	unsigned int channels, bps;
-	int ticks;
+	unsigned int channels;
 
 	ps = (direction == SNDRV_PCM_STREAM_PLAYBACK) ?
 	     &dg00x->pcm_playback : &dg00x->pcm_capture;
 
 	if (ps->active)
-		return 0;
+		return (0);
 
 	ch = substream->private_data;
 	if (ch == NULL || ch->buffer == NULL)
-		return -EINVAL;
+		return (-EINVAL);
 
 	channels = AFMT_CHANNEL(ch->format);
 	if (channels == 0)
 		channels = 2;
-	bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
 
 	ps->direction = direction;
 	ps->pcm_channels = channels;
@@ -107,6 +116,8 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	ps->period_bytes = ch->blocksize;
 	ps->buffer_bytes = ch->buffer->bufsize;
 	ps->hwptr = 0;
+	ps->period_accum = 0;
+	ps->tx_dbc = 0;
 	ps->active = true;
 
 	/* Reset DOT state at stream start */
@@ -114,16 +125,14 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 
 	dg00x->active_streams++;
 
-	/* Schedule first period callback only if this is the first stream. */
+	/* Schedule the shared callout on the first active stream.
+	 * Fire at 1 ms intervals for timely TX refill. */
 	if (dg00x->active_streams == 1) {
-		ticks = (ps->period_bytes / (ps->pcm_channels * bps)) * hz / ps->rate;
-		if (ticks < 1)
-			ticks = 1;
-		callout_reset(&dg00x->callout, ticks,
-			      dg00x_pcm_stream_cb, dg00x);
+		callout_reset(&dg00x->callout, DG00X_REFILL_TICKS,
+		    dg00x_pcm_stream_cb, dg00x);
 	}
 
-	return 0;
+	return (0);
 }
 
 static void
@@ -138,10 +147,11 @@ dg00x_pcm_stream_stop(struct snd_dg00x *dg00x, int direction)
 		return;
 
 	ps->active = false;
+	ps->period_accum = 0;
 	if (dg00x->active_streams > 0)
 		dg00x->active_streams--;
 
-	/* Only stop the shared callout when both streams are inactive. */
+	/* Stop the shared callout when both streams are inactive */
 	if (dg00x->active_streams == 0)
 		callout_stop(&dg00x->callout);
 }
@@ -216,7 +226,7 @@ pcm_hw_params(struct snd_pcm_substream *substream,
 		}
 	}
 	if (!rate_ok)
-		return -EINVAL;
+		return (-EINVAL);
 
 	/* Set sample rate on device */
 	dg00x_set_local_rate(dg00x, rate);
@@ -240,9 +250,12 @@ pcm_prepare(struct snd_pcm_substream *substream)
 	/* Reset position for the stream direction */
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		dg00x->pcm_playback.hwptr = 0;
+		dg00x->pcm_playback.period_accum = 0;
+		dg00x->pcm_playback.tx_dbc = 0;
 		dg00x->pcm_playback.rate = ch->speed > 0 ? ch->speed : 48000;
 	} else {
 		dg00x->pcm_capture.hwptr = 0;
+		dg00x->pcm_capture.period_accum = 0;
 		dg00x->pcm_capture.rate = ch->speed > 0 ? ch->speed : 48000;
 	}
 
@@ -252,11 +265,21 @@ pcm_prepare(struct snd_pcm_substream *substream)
 static int
 pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	struct snd_dg00x *dg00x = (struct snd_dg00x *)substream->pcm->private_data;
+	struct snd_dg00x *dg00x;
 	int err;
+	bool was_idle;
+
+	if (substream == NULL || substream->pcm == NULL)
+		return (-EINVAL);
+
+	dg00x = (struct snd_dg00x *)substream->pcm->private_data;
+	if (dg00x == NULL)
+		return (-EINVAL);
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		was_idle = (dg00x->active_streams == 0);
+
 		/* Allocate isochronous resources if not already done */
 		if (dg00x->tx_resources.channel < 0 &&
 		    dg00x->rx_resources.channel < 0) {
@@ -273,45 +296,65 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 				return (err);
 		}
 
-		/* Start the callout-based timing engine */
+		/* Mark the PCM stream active first so the ISO DMA
+		 * start functions (which check ps->active) proceed. */
 		err = dg00x_pcm_stream_start(dg00x,
-			substream->stream, substream);
+		    substream->stream, substream);
 		if (err < 0)
 			return (err);
 
-		/* Start real ISO DMA streaming */
+		/*
+		 * Begin the hardware session BEFORE starting ISO DMA.
+		 * The Digi hardware must be in session mode before it
+		 * will accept isochronous packets.  Starting DMA first
+		 * confuses the device and can leave it in an undefined
+		 * state that triggers a bus reset or panic.
+		 */
+		if (was_idle) {
+			err = dg00x_begin_session(dg00x,
+			    dg00x->tx_resources.channel,
+			    dg00x->rx_resources.channel);
+			if (err < 0) {
+				dg00x_pcm_stream_stop(dg00x,
+				    substream->stream);
+				return (err);
+			}
+		}
+
+		/*
+		 * Start the ISO DMA.  Handlers won't fire until
+		 * itx/irx_enable is called below, so it's safe that
+		 * ps->active is already set.
+		 */
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			dg00x_streaming_start_tx(dg00x);
 		else
 			dg00x_streaming_start_rx(dg00x);
 
-		/* Begin hardware session (only if both channels are ready).
-		 * We always begin the session; finish_session is ref-counted. */
-		dg00x_begin_session(dg00x,
-		    dg00x->tx_resources.channel,
-		    dg00x->rx_resources.channel);
-
 		return (0);
 
 	case SNDRV_PCM_TRIGGER_STOP:
-		/* Stop ISO DMA first */
+		/* Stop ISO DMA */
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			dg00x_streaming_stop_tx(dg00x);
 		else
 			dg00x_streaming_stop_rx(dg00x);
 
-		/* Stop callout timing engine (ref-counted via active_streams) */
+		/* Mark stream inactive */
 		dg00x_pcm_stream_stop(dg00x, substream->stream);
 
-		/* Only finish the hardware session when ALL streams have
-		 * stopped — the device cannot handle a partial session stop. */
+		/*
+		 * Only finish the hardware session when ALL streams have
+		 * stopped.  The device cannot handle a partial session stop
+		 * while the other direction is still running.
+		 */
 		if (dg00x->active_streams == 0)
 			dg00x_finish_session(dg00x);
 
 		return (0);
 
 	default:
-		return -EINVAL;
+		return (-EINVAL);
 	}
 }
 
@@ -354,11 +397,12 @@ dg00x_create_pcm(struct snd_dg00x *dg00x)
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &dg00x_pcm_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &dg00x_pcm_ops);
 
-	/* Initialize shared callout and active stream counter */
-	callout_init(&dg00x->callout, 1);
 	dg00x->active_streams = 0;
 
-	/* Store substream references for the callout callback */
+	/* Initialize shared callout for period_elapsed + TX refill */
+	callout_init(&dg00x->callout, 1);
+
+	/* Store substream references for the ISO DMA handlers */
 	dg00x->pcm_playback.substream =
 	    pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
 	dg00x->pcm_capture.substream =

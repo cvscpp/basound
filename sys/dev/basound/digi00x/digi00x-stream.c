@@ -77,8 +77,15 @@ dg00x_read_quad(struct fw_device *fwdev, uint64_t addr, uint32_t *val)
 	 * Do NOT use fw_xferwait() — it has no timeout and hangs forever
 	 * in D state if the device is unresponsive. */
 	while (!txn.done) {
-		ret = tsleep(&txn, PCATCH, "dg00xrd", 5 * hz);
-		if (ret == EWOULDBLOCK || ret == EINTR) {
+		/*
+		 * Use a non-interruptible sleep with a 5-second timeout.
+		 * PCATCH is NOT used because signal interruption in the
+		 * session control path (pcm_trigger → begin_session)
+		 * can leave the device in an inconsistent state.
+		 * The 5-second timeout prevents a permanent hang.
+		 */
+		ret = tsleep(&txn, 0, "dg00xrd", 5 * hz);
+		if (ret == EWOULDBLOCK) {
 			txn.error = ETIMEDOUT;
 			break;
 		}
@@ -126,12 +133,11 @@ dg00x_write_quad(struct fw_device *fwdev, uint64_t addr, uint32_t val)
 	if (txn.xfer == NULL)
 		return (ENOMEM);
 
-	/* Wait for transaction completion with 5-second timeout.
-	 * Do NOT use fw_xferwait() — it has no timeout and hangs forever
-	 * in D state if the device is unresponsive. */
+	/* Non-interruptible sleep with 5-second timeout.
+	 * See dg00x_read_quad for rationale. */
 	while (!txn.done) {
-		ret = tsleep(&txn, PCATCH, "dg00xwr", 5 * hz);
-		if (ret == EWOULDBLOCK || ret == EINTR) {
+		ret = tsleep(&txn, 0, "dg00xwr", 5 * hz);
+		if (ret == EWOULDBLOCK) {
 			txn.error = ETIMEDOUT;
 			break;
 		}
@@ -268,6 +274,10 @@ dg00x_get_external_rate(struct snd_dg00x *dg00x, unsigned int *rate)
 void
 dg00x_finish_session(struct snd_dg00x *dg00x)
 {
+	/* Guard against close-without-open: fwdev must be valid */
+	if (dg00x->fwdev == NULL)
+		return;
+
 	/* Write 0x00000003 to streaming set (stop) */
 	dg00x_write_quad(dg00x->fwdev,
 			 DG00X_ADDR_BASE + DG00X_OFFSET_STREAMING_SET,
@@ -306,9 +316,11 @@ dg00x_begin_session(struct snd_dg00x *dg00x, int tx_ch, int rx_ch)
 	if (curr == 0)
 		curr = 2;
 
-	/* Countdown from curr-1 ... 0 */
-	curr--;
+	/* Countdown from curr-1 down to 0.  The Digi hardware expects
+	 * a sequence of writes in decreasing order ending at 0 to
+	 * start the streaming session. */
 	while (curr > 0) {
+		curr--;
 		err = dg00x_write_quad(dg00x->fwdev,
 				       DG00X_ADDR_BASE + DG00X_OFFSET_STREAMING_SET,
 				       htobe32(curr));
@@ -316,7 +328,6 @@ dg00x_begin_session(struct snd_dg00x *dg00x, int tx_ch, int rx_ch)
 			break;
 
 		DELAY(20000); /* 20ms between steps */
-		curr--;
 	}
 
 	return (err);

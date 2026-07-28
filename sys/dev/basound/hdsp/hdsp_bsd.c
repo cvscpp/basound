@@ -64,6 +64,11 @@ hdsp_bsd_attach(device_t dev)
 	sc->chip.pci->vendor = pci_get_vendor(dev);
 	sc->chip.pci->device = pci_get_device(dev);
 
+	/* Enable PCI bus mastering so the HDSP DMA engine can
+	 * read/write system memory.  Without this the hardware
+	 * generates a PCI master abort → NMI → machine reboot. */
+	pci_enable_busmaster(dev);
+
 	/* Read PCI revision byte — selects which FPGA bitstream to upload */
 	sc->chip.firmware_rev = pci_get_revid(dev);
 

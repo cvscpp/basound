@@ -371,6 +371,8 @@ dg00x_init_card(struct digi00x_softc *sc)
 	dg00x->is_console = (sc->unit == MODEL_CONSOLE);
 	dg00x->tx_resources.channel = -1;
 	dg00x->rx_resources.channel = -1;
+	dg00x->iso_tx.dmach = -1;
+	dg00x->iso_rx.dmach = -1;
 
 	strcpy(card->driver, "Digi00x");
 	switch (sc->unit) {
@@ -473,6 +475,7 @@ dg00x_detach(device_t dev)
 	callout_drain(&sc->discover_callout);
 
 	if (sc->dg00x != NULL) {
+		callout_drain(&sc->dg00x->callout);
 		snd_card_free(sc->dg00x->card);
 		sc->dg00x = NULL;
 	}

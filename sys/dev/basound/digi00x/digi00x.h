@@ -58,18 +58,28 @@ struct dg00x_stream {
 	int midi_fifo_limit;
 };
 
-/* PCM streaming state — managed by the callout-based streaming engine */
+/* PCM streaming state — hwptr is driven by ISO DMA handlers.
+ * A shared callout periodically fires snd_pcm_period_elapsed from
+ * a safe context (NOT from the fwohci interrupt), letting the PCM
+ * layer consult the DMA-driven hwptr to detect period boundaries. */
 struct dg00x_pcm_stream {
 	unsigned long   hwptr;         /* current buffer position (bytes) */
+	unsigned long   period_accum;  /* bytes accumulated since last period_elapsed */
 	unsigned int    period_bytes;  /* bytes per period */
 	unsigned int    buffer_bytes;  /* total buffer bytes */
 	unsigned int    pcm_channels;  /* negotiated channel count */
 	unsigned int    rate;          /* sample rate */
+	unsigned int    tx_dbc;        /* TX data block counter for CIP header */
 	bool            active;        /* stream is active */
 	struct dot_state dot;          /* DOT encoder/decoder state */
 	int             direction;     /* SNDRV_PCM_STREAM_PLAYBACK or CAPTURE */
 	struct snd_pcm_substream *substream; /* PCM substream for period_elapsed() */
 };
+
+/* Called from ISO DMA handlers to track transfer progress.
+ * Accumulates transferred bytes for use by the callout-driven
+ * period signalling path. */
+void dg00x_pcm_update_position(struct dg00x_pcm_stream *ps, unsigned int bytes);
 
 /* ISO DMA channel for FreeBSD native firewire streaming.
  * Defined here so it's embedded in snd_dg00x. */
@@ -97,11 +107,12 @@ struct snd_dg00x {
 	struct dg00x_stream rx_stream;
 	struct dg00x_resources rx_resources;
 
-	/* Callout-based PCM streaming engines */
+	/* ISO DMA-driven PCM streaming engines */
 	struct dg00x_pcm_stream pcm_playback;
 	struct dg00x_pcm_stream pcm_capture;
 
-	/* Single shared callout for both playback and capture timing */
+	/* Shared callout — fires snd_pcm_period_elapsed from a safe
+	 * context so the PCM layer can consult the DMA-driven hwptr. */
 	struct callout callout;
 	unsigned int active_streams; /* count of active pcm streams */
 
@@ -205,5 +216,6 @@ int  dg00x_streaming_start_tx(struct snd_dg00x *dg00x);
 int  dg00x_streaming_start_rx(struct snd_dg00x *dg00x);
 void dg00x_streaming_stop_tx(struct snd_dg00x *dg00x);
 void dg00x_streaming_stop_rx(struct snd_dg00x *dg00x);
+void dg00x_streaming_refill_tx(struct snd_dg00x *dg00x);
 
 #endif
