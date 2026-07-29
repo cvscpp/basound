@@ -145,6 +145,39 @@ dg00x_iso_open(struct firewire_comm *fc, struct dg00x_iso_channel *ch,
 	STAILQ_INIT(&xferq->stdma);
 	STAILQ_INIT(&xferq->stvalid);
 
+	/*
+	 * Allocate multi-segment DMA data buffer for EXTBUF mode.
+	 *
+	 * fwohci_db_init() allocates the DMA descriptor buffer (dbch->am)
+	 * but NOT the data buffer (xferq->buf).  In EXTBUF mode fwohci
+	 * expects the driver to supply the data buffer via xferq->buf.
+	 * fwdma_v_addr(xferq->buf, poffset) and fwdma_bus_addr() are
+	 * called by both our driver (dg00x_fill_tx_chunk) and fwohci
+	 * (fwohci_add_tx_buf / fwohci_itxbuf_enable) to access the
+	 * virtual / bus address of each segment — without this
+	 * allocation, those calls dereference NULL → panic → reboot.
+	 *
+	 * Each segment is DG00X_ISO_PACKET_SIZE bytes (2048), one
+	 * segment per bulkxfer chunk (bnpacket == 1).
+	 */
+	xferq->buf = fwdma_malloc_multiseg(fc,
+	    DG00X_ISO_PACKET_SIZE,	/* esize: bytes per index */
+	    DG00X_ISO_PACKET_SIZE,	/* ssize: bytes per DMA segment */
+	    DG00X_ISO_NCHUNKS,		/* nseg: number of segments */
+	    M_NOWAIT);			/* flags: M_NOWAIT (safe under CHN_LOCK) */
+	if (xferq->buf == NULL) {
+		/* Cleanup already allocated mbufs on failure */
+		int j;
+		for (j = 0; j < DG00X_ISO_NCHUNKS; j++)
+			if (ISO_MB(ch)[j] != NULL)
+				m_freem(ISO_MB(ch)[j]);
+		free(ch->mbufs, M_DG00X_ISO);
+		ch->mbufs = NULL;
+		free(ch->bulkxfer, M_DG00X_ISO);
+		ch->bulkxfer = NULL;
+		return (-ENOMEM);
+	}
+
 	for (i = 0; i < DG00X_ISO_NCHUNKS; i++) {
 		struct mbuf *m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (m == NULL) {
@@ -156,6 +189,8 @@ dg00x_iso_open(struct firewire_comm *fc, struct dg00x_iso_channel *ch,
 			ch->mbufs = NULL;
 			free(ch->bulkxfer, M_DG00X_ISO);
 			ch->bulkxfer = NULL;
+			fwdma_free_multiseg(xferq->buf);
+			xferq->buf = NULL;
 			return (-ENOMEM);
 		}
 		m->m_len = DG00X_ISO_PACKET_SIZE;
@@ -199,6 +234,16 @@ dg00x_iso_close(struct dg00x_iso_channel *ch)
 		ch->bulkxfer = NULL;
 	}
 	if (xferq) {
+		/*
+		 * Free the multi-segment DMA data buffer that was
+		 * allocated in dg00x_iso_open().  This MUST happen
+		 * before the channel is destroyed — after this point
+		 * fwohci must not touch the DMA context.
+		 */
+		if (xferq->buf != NULL) {
+			fwdma_free_multiseg(xferq->buf);
+			xferq->buf = NULL;
+		}
 		xferq->flag &= ~(FWXFERQ_OPEN | FWXFERQ_HANDLER |
 				 FWXFERQ_STREAM | FWXFERQ_EXTBUF);
 		xferq->sc = NULL;
@@ -462,7 +507,6 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	struct firewire_comm *fc;
 	struct fw_bulkxfer *bx;
 	int i;
-	int err;
 
 	if (ch->dmach < 0 || !ps->active)
 		return (0);
@@ -480,37 +524,26 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 		return (-ENODEV);
 
 	/*
-	 * Step 1: Drain all chunks back to stfree for a clean starting
-	 * state.  Hold FW_GLOCK to serialise with any in-flight TX
-	 * completion interrupts from a previous session.
+	 * Drain all chunks back to stfree, fill them with audio data,
+	 * then enable TX DMA in a single sequence.
+	 *
+	 * Holding FW_GLOCK across the drain+fill prevents any in-flight
+	 * TX completion interrupts from a previous session from
+	 * concurrently modifying the xferq queues.
+	 *
+	 * A single itx_enable() call handles both the DMA descriptor
+	 * allocation (fwohci_db_init) and the chunk move (stvalid →
+	 * stdma via fwohci_add_tx_buf).  This MUST NOT be split into
+	 * two itx_enable calls: the first call with an empty stvalid
+	 * triggers fwohci_db_init with M_NOWAIT, and if the descriptor
+	 * buffer allocation fails, fwohci_db_init accesses the NULL
+	 * pointer's dma_tag field (offset 0x18) → page fault → reboot.
 	 */
 	FW_GLOCK(fc);
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stvalid);
 	dot_reset_state(&ps->dot);
-	FW_GUNLOCK(fc);
 
-	/*
-	 * Step 2: Enable TX DMA — this allocates xferq->buf (DMA
-	 * descriptor buffer) via fwohci_db_init().  At this point
-	 * stvalid is empty so no data transfer starts.
-	 *
-	 * CRITICAL: itx_enable MUST be called BEFORE the pre-fill
-	 * loop below.  dg00x_fill_tx_chunk calls fwdma_v_addr() on
-	 * xferq->buf, which would fault (NULL deref → panic → reboot)
-	 * if the buffer hasn't been allocated yet.
-	 */
-	err = fc->itx_enable(fc, ch->dmach);
-	if (err < 0)
-		return (err);
-
-	/*
-	 * Step 3: Pre-fill all chunks to seed the ISO pipeline.
-	 * xferq->buf is now valid so fwdma_v_addr() will not fault.
-	 * dg00x_fill_tx_chunk advances hwptr, period_accum, tx_dbc,
-	 * and dot state internally.
-	 */
-	FW_GLOCK(fc);
 	for (i = 0; i < DG00X_ISO_NCHUNKS; i++) {
 		bx = STAILQ_FIRST(&xferq->stfree);
 		if (bx == NULL)
@@ -523,14 +556,7 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	}
 	FW_GUNLOCK(fc);
 
-	/*
-	 * Step 4: Enable DMA again — now stvalid has chunks so
-	 * fwohci_itxbuf_enable will move them to stdma and start
-	 * the DMA engine.  The second itx_enable is safe because
-	 * FWXFERQ_RUNNING is already set (from step 2), so
-	 * fwohci_db_init() is skipped and only the buffer move
-	 * (stvalid → stdma) and DMA context programming occurs.
-	 */
+	/* Single itx_enable: allocates descriptors + starts DMA */
 	return (fc->itx_enable(fc, ch->dmach));
 }
 
