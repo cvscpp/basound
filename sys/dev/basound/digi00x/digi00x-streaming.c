@@ -286,22 +286,22 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		return;
 
 	/*
-	 * Set the isochronous header quadlet:
-	 *   sy=0, tcode=0xa (set by fwohci), chtag=0 (set by fwohci)
-	 *   len = pkt_len (payload length in bytes)
-	 *   spd is set by fwohci
+	 * Set the isochronous header quadlet.
 	 *
-	 * fw_pkt.stream layout (little-endian):
+	 * fw_pkt.stream layout in the uint32_t (LE bit numbering):
 	 *   bits [0:15]  = len
 	 *   bits [16:23] = chtag
-	 *   bits [24:27] = tcode
+	 *   bits [24:27] = tcode (0xa = isochronous data block)
 	 *   bits [28:31] = sy
+	 *
+	 * The OHCI DMA engine reads this quadlet from host memory in
+	 * byte-address order.  On little-endian x86 (the only platform
+	 * this driver currently runs on), the uint32_t's LSB is at the
+	 * lowest memory address, matching the bit layout above directly.
+	 *
+	 * On a hypothetical big-endian host, byteswap would be needed.
 	 */
-#if BYTE_ORDER == BIG_ENDIAN
-	fp->mode.ld[0] = (0 << 28) | (0xa << 24) | (0 << 16) | pkt_len;
-#else
-	fp->mode.ld[0] = (pkt_len << 16) | (0 << 24) | (0xa << 28);
-#endif
+	fp->mode.ld[0] = pkt_len | (0xa << 24);
 
 	/*
 	 * Payload starts at fp->mode.stream.payload (offset 4 in segment).
@@ -476,40 +476,41 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	xferq = ISO_XFERQ(ch);
 	fc = ISO_FC(ch);
 
-	/*
-	 * Defensive: the firewire_comm, xferq, and DMA buffer must all
-	 * be valid.  On a subsequent START after a STOP, the xferq->buf
-	 * was freed by fwohci_db_free() and will be re-allocated by
-	 * itx_enable() -> fwohci_db_init().  However, the xferq pointer
-	 * itself and fc must remain valid across sessions.
-	 */
-	if (fc == NULL || xferq == NULL) {
-		printf("digi00x: start_tx: fc=%p xferq=%p\n",
-		    (void *)fc, (void *)xferq);
+	if (fc == NULL || xferq == NULL)
 		return (-ENODEV);
-	}
 
 	/*
-	 * Hold FW_GLOCK while manipulating the xferq queues to
-	 * prevent racing with any in-flight TX completion interrupts
-	 * from a previous session that hasn't fully drained.
+	 * Step 1: Drain all chunks back to stfree for a clean starting
+	 * state.  Hold FW_GLOCK to serialise with any in-flight TX
+	 * completion interrupts from a previous session.
 	 */
 	FW_GLOCK(fc);
-
-	/*
-	 * Drain all chunks back to stfree for a clean starting state.
-	 * Use STAILQ_CONCAT to move the entire list atomically — no
-	 * per-element iteration that could corrupt link pointers.
-	 * Don't use STAILQ_INIT on stfree — that would orphan elements
-	 * that the fwohci may still be DMAing from.
-	 */
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stvalid);
-
 	dot_reset_state(&ps->dot);
+	FW_GUNLOCK(fc);
 
-	/* Pre-fill all chunks to seed the ISO pipeline.  dg00x_fill_tx_chunk
-	 * advances hwptr, period_accum, tx_dbc, and dot state internally. */
+	/*
+	 * Step 2: Enable TX DMA — this allocates xferq->buf (DMA
+	 * descriptor buffer) via fwohci_db_init().  At this point
+	 * stvalid is empty so no data transfer starts.
+	 *
+	 * CRITICAL: itx_enable MUST be called BEFORE the pre-fill
+	 * loop below.  dg00x_fill_tx_chunk calls fwdma_v_addr() on
+	 * xferq->buf, which would fault (NULL deref → panic → reboot)
+	 * if the buffer hasn't been allocated yet.
+	 */
+	err = fc->itx_enable(fc, ch->dmach);
+	if (err < 0)
+		return (err);
+
+	/*
+	 * Step 3: Pre-fill all chunks to seed the ISO pipeline.
+	 * xferq->buf is now valid so fwdma_v_addr() will not fault.
+	 * dg00x_fill_tx_chunk advances hwptr, period_accum, tx_dbc,
+	 * and dot state internally.
+	 */
+	FW_GLOCK(fc);
 	for (i = 0; i < DG00X_ISO_NCHUNKS; i++) {
 		bx = STAILQ_FIRST(&xferq->stfree);
 		if (bx == NULL)
@@ -520,16 +521,17 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 
 		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
 	}
-
-	/*
-	 * itx_enable acquires FW_GLOCK internally — drop ours first
-	 * to avoid recursive locking.
-	 */
 	FW_GUNLOCK(fc);
 
-	err = fc->itx_enable(fc, ch->dmach);
-
-	return (err);
+	/*
+	 * Step 4: Enable DMA again — now stvalid has chunks so
+	 * fwohci_itxbuf_enable will move them to stdma and start
+	 * the DMA engine.  The second itx_enable is safe because
+	 * FWXFERQ_RUNNING is already set (from step 2), so
+	 * fwohci_db_init() is skipped and only the buffer move
+	 * (stvalid → stdma) and DMA context programming occurs.
+	 */
+	return (fc->itx_enable(fc, ch->dmach));
 }
 
 int
@@ -558,9 +560,19 @@ dg00x_streaming_stop_tx(struct snd_dg00x *dg00x)
 	xferq = ISO_XFERQ(ch);
 	fc = ISO_FC(ch);
 
-	/* Disable DMA first, so the fwohci stops touching our queues.
-	 * After itx_disable returns, the OHCI is quiesced — no new
-	 * TX completion interrupts will fire. */
+	/*
+	 * Hold dg00x->lock while disabling DMA and draining queues.
+	 * This serialises with dg00x_streaming_refill_tx() which also
+	 * holds dg00x->lock across the fill+enable sequence, preventing
+	 * concurrent manipulation of xferq queues and preventing a
+	 * use-after-free of the DMA descriptor buffer (xferq->buf)
+	 * that could otherwise occur when refill calls itx_enable
+	 * while stop calls itx_disable.
+	 */
+	mtx_lock(&dg00x->lock);
+
+	/* Disable DMA first.  After itx_disable returns, the OHCI
+	 * context is quiesced — no new TX completion interrupts. */
 	fc->itx_disable(fc, ch->dmach);
 
 	/*
@@ -581,6 +593,8 @@ dg00x_streaming_stop_tx(struct snd_dg00x *dg00x)
 	}
 
 	FW_GUNLOCK(fc);
+
+	mtx_unlock(&dg00x->lock);
 }
 
 void
@@ -596,14 +610,19 @@ dg00x_streaming_stop_rx(struct snd_dg00x *dg00x)
  * (after filling with fresh audio data) and restart the DMA if
  * it has stalled.  Called from the PCM callout at ~1 ms intervals.
  *
- * Must hold FW_GLOCK(fc) while touching the xferq STAILQ queues
- * (stfree, stvalid, stdma).  The fwohci TX completion interrupt
- * handler also modifies stfree under FW_GLOCK, so operating
- * without the lock risks corrupting the linked list → panic.
+ * Holds dg00x->lock across the entire operation, serialising with
+ * dg00x_streaming_stop_tx() which also holds dg00x->lock while
+ * calling itx_disable.  This prevents the callout's itx_enable from
+ * racing with the stop path's itx_disable — the mutual exclusion
+ * guarantees that only one thread manipulates the xferq queues and
+ * the DMA descriptor buffer at any time.
  *
- * dg00x->lock is held briefly to read ps->active safely.  This
- * serialises with dg00x_pcm_stream_stop which clears active
- * under the same lock before calling itx_disable.
+ * FW_GLOCK(fc) is held while touching the xferq STAILQ queues
+ * (stfree, stvalid, stdma) to serialise with the fwohci TX completion
+ * interrupt handler which also modifies stfree under FW_GLOCK.
+ *
+ * Lock ordering: dg00x->lock → FW_GLOCK.  Both the refill and stop
+ * paths follow this order, preventing deadlock.
  */
 void
 dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
@@ -618,55 +637,33 @@ dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
 	if (ch->dmach < 0)
 		return;
 
-	/*
-	 * Serialise the active check with dg00x_pcm_stream_stop.
-	 * Once active is cleared under dg00x->lock, the callout
-	 * must never touch the xferq queues or call itx_enable
-	 * because STOP will proceed with itx_disable (db_free)
-	 * followed by drain.  Touching the queues after db_free
-	 * re-inits the descriptor buffer and restarts DMA just
-	 * as STOP is draining — corrupting the active DMA.
-	 */
+	/* Hold dg00x->lock across the ENTIRE refill+enable sequence.
+	 * This prevents the stop path (which also holds dg00x->lock
+	 * across itx_disable) from interleaving between our queue
+	 * manipulation and itx_enable call.  Without this, a race
+	 * can occur where itx_enable re-allocates the DMA descriptor
+	 * buffer after itx_disable has freed it, or where both threads
+	 * manipulate the STAILQ queues concurrently → list corruption
+	 * → kernel panic. */
 	mtx_lock(&dg00x->lock);
-	if (!ps->active) {
-		mtx_unlock(&dg00x->lock);
-		return;
-	}
-	mtx_unlock(&dg00x->lock);
+
+	if (!ps->active)
+		goto out_unlock;
 
 	if (ps->substream == NULL ||
 	    ps->substream->runtime == NULL ||
 	    ps->substream->runtime->dma_area == NULL)
-		return;
+		goto out_unlock;
 
 	xferq = ISO_XFERQ(ch);
 	fc = ISO_FC(ch);
 
-	/*
-	 * Lock the firewire xferq to prevent the TX completion
+	/* Lock the firewire xferq to prevent the TX completion
 	 * interrupt handler from concurrently modifying stfree.
 	 * fwohci_txbuf_update runs under FW_GLOCK and moves
-	 * chunks from stdma → stfree.  Without this lock, our
-	 * STAILQ_REMOVE_HEAD can race with its STAILQ_INSERT_TAIL,
-	 * corrupting the singly-linked list and causing a panic
-	 * or infinite loop.
-	 */
+	 * chunks from stdma → stfree. */
 	FW_GLOCK(fc);
 
-	/* Re-check active under FW_GLOCK: STOP may have cleared it
-	 * between our mtx_unlock and FW_GLOCK above.  If so, bail
-	 * out without touching the queues — STOP is about to drain. */
-	mtx_lock(&dg00x->lock);
-	if (!ps->active) {
-		mtx_unlock(&dg00x->lock);
-		FW_GUNLOCK(fc);
-		return;
-	}
-	mtx_unlock(&dg00x->lock);
-
-	/* Move completed chunks from stfree to stvalid, filling each
-	 * with fresh audio data.  dg00x_fill_tx_chunk handles hwptr,
-	 * period_accum, tx_dbc, and dot state internally. */
 	while ((bx = STAILQ_FIRST(&xferq->stfree)) != NULL) {
 		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
 
@@ -678,28 +675,12 @@ dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
 
 	FW_GUNLOCK(fc);
 
-	/*
-	 * Final active check BEFORE calling itx_enable.
-	 *
-	 * If STOP called itx_disable + db_free while we were filling
-	 * chunks above, the descriptor buffer was freed, FWXFERQ_RUNNING
-	 * is clear, and itx_enable would re-init the DB and start DMA —
-	 * right as STOP is about to drain stdma.  Kernel panic.
-	 *
-	 * Checking active here prevents this: STOP sets active=false
-	 * before itx_disable, so if we see active==false, we must NOT
-	 * call itx_enable.  The chunks we filled will be drained by
-	 * STOP's subsequent FW_GLOCK drain.
-	 */
-	mtx_lock(&dg00x->lock);
-	if (!ps->active) {
-		mtx_unlock(&dg00x->lock);
-		return;
-	}
-	mtx_unlock(&dg00x->lock);
-
-	/* If we refilled chunks and the DMA isn't running, restart it.
-	 * itx_enable acquires FW_GLOCK internally. */
+	/* Restart DMA if stalled.  dg00x->lock is still held,
+	 * preventing the stop path from concurrently calling
+	 * itx_disable — so there is no race on xferq->buf. */
 	if (refilled > 0 && (xferq->flag & FWXFERQ_RUNNING) == 0)
 		fc->itx_enable(fc, ch->dmach);
+
+out_unlock:
+	mtx_unlock(&dg00x->lock);
 }
