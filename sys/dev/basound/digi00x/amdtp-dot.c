@@ -90,6 +90,41 @@ dot_write_pcm(struct dot_state *state, uint32_t *dest,
 	}
 }
 
+/*
+ * Encode PCM into DOT data blocks, filling `channels` device channels per
+ * frame.  The first `src_channels` channels come from the interleaved
+ * host buffer; the remainder are filled with dot-encoded silence
+ * (0x40000000) so the encoder state advances across the whole data block
+ * and stays in sync with the device's decoder.
+ *
+ * The Digi 002/003 always carries its full channel complement in every
+ * data block (18 channels at 44.1/48 kHz, 10 at 88.2/96 kHz), regardless
+ * of how many channels the PCM application opened.  Transmitting a shorter
+ * block (e.g. a stereo data block) makes the device's DOT decoder lose
+ * sync and produces silence on all outputs, including the phones jack.
+ */
+void
+dot_write_pcm_padded(struct dot_state *state, uint32_t *dest,
+		     const int32_t *src, unsigned int src_channels,
+		     unsigned int channels, unsigned int frames,
+		     unsigned int data_block_quadlets)
+{
+	unsigned int i, c;
+
+	for (i = 0; i < frames; i++) {
+		for (c = 0; c < channels; c++) {
+			uint32_t sample = 0x40000000;
+
+			if (c < src_channels)
+				sample |= ((uint32_t)src[c] >> 8);
+			dest[c] = htobe32(sample);
+			dot_encode_step(state, &dest[c]);
+		}
+		dest += data_block_quadlets;
+		src += src_channels;
+	}
+}
+
 void
 dot_read_pcm(struct dot_state *state, int32_t *dest,
 	     const uint32_t *src, unsigned int channels,

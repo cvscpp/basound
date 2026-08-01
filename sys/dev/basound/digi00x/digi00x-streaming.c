@@ -308,7 +308,9 @@ dg00x_frames_this_packet(struct dg00x_pcm_stream *ps)
  *
  * - Calls dg00x_frames_this_packet() to determine how many audio frames
  *   this packet carries (rate/8000, with fractional distribution).
- * - Sets DBS = pcm_channels + 1 in the CIP header.
+ * - Sets DBS = device_channels + 1 in the CIP header (the Digi 002/003
+ *   always carries its full channel complement: 18 at 44.1/48 kHz,
+ *   10 at 88.2/96 kHz, plus one MIDI quadlet per data block).
  * - Uses the current tx_dbc as the CIP DBC and advances it by the
  *   frame count (DBC counts data blocks, wrapping at 256).
  * - Advances hwptr and calls dg00x_pcm_update_position().
@@ -318,12 +320,20 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		    struct fw_bulkxfer *bx)
 {
 	struct dg00x_pcm_stream *ps = &dg00x->pcm_playback;
-	unsigned int dbs = ps->pcm_channels + 1;
-	unsigned int frames, dbc;
+	unsigned int dbs = ps->device_channels + 1;
+	unsigned int nch, frames, dbc;
 	unsigned int bytes, pkt_len;
 	struct fw_pkt *fp;
 	uint32_t *payload;
 	unsigned int i;
+
+	/*
+	 * Number of app channels to consume from the interleaved runtime
+	 * buffer.  Never more than the device channel complement.
+	 */
+	nch = ps->pcm_channels;
+	if (nch > ps->device_channels)
+		nch = ps->device_channels;
 
 	frames = dg00x_frames_this_packet(ps);
 	dbc = ps->tx_dbc;
@@ -386,15 +396,27 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	for (i = 0; i < frames; i++)
 		payload[CIP_HEADER_QUADLETS + i * dbs] = 0x00000080;
 
-	/* DOT-encode PCM data.  PCM starts at payload[3] (after CIP[2] + MIDI[1]).
-	 * dbs is the stride between consecutive data blocks (MIDI + PCM). */
-	dot_write_pcm(&ps->dot,
+	/*
+	 * DOT-encode PCM data.  PCM starts at payload[3] (after CIP[2] +
+	 * MIDI[1]).  dbs is the stride between consecutive data blocks
+	 * (MIDI + PCM).
+	 *
+	 * The Digi 002/003 always carries its full channel complement per
+	 * data block (18 at 44.1/48 kHz, 10 at 88.2/96 kHz), so encode
+	 * device_channels quadlets per frame: the app's nch channels are
+	 * mapped to the first channels and the remainder are dot-encoded
+	 * silence.  This keeps the encoder/decoder DOT state in sync —
+	 * transmitting only the app channel count makes the device's DOT
+	 * decoder lose sync and produces silence on all outputs.
+	 */
+	dot_write_pcm_padded(&ps->dot,
 	    &payload[CIP_HEADER_QUADLETS + 1],
 	    (const int32_t *)ps->substream->runtime->dma_area +
 	    (ps->hwptr / 4),
-	    ps->pcm_channels, frames, dbs);
+	    nch, ps->device_channels, frames, dbs);
 
-	bytes = frames * ps->pcm_channels * 4;
+	/* Bytes consumed from the interleaved app buffer */
+	bytes = frames * nch * 4;
 	ps->hwptr += bytes;
 	if (ps->hwptr >= ps->buffer_bytes)
 		ps->hwptr = 0;
@@ -450,6 +472,7 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 		    ps->substream->runtime->dma_area != NULL &&
 		    xferq->buf != NULL) {
 			uint32_t *payload;
+			unsigned int nch;
 
 			payload = (uint32_t *)fwdma_v_addr(xferq->buf,
 							   bx->poffset);
@@ -458,17 +481,25 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 			 * The device sends the same number of frames per
 			 * ISO packet as we expect for TX (rate/8000
 			 * average).  Use the same fractional framing.
+			 *
+			 * The device transmits its full channel complement
+			 * per data block (18 at 44.1/48 kHz, 10 at 88.2/96
+			 * kHz), so stride by device_channels + 1 and copy
+			 * only the first nch channels into the app buffer.
 			 */
 			frames = dg00x_frames_this_packet(ps);
-			dbs = ps->pcm_channels + 1;
+			dbs = ps->device_channels + 1;
+			nch = ps->pcm_channels;
+			if (nch > ps->device_channels)
+				nch = ps->device_channels;
 
 			dot_read_pcm(&ps->dot,
 			    (int32_t *)ps->substream->runtime->dma_area +
 			    (ps->hwptr / 4),
 			    payload + CIP_HEADER_QUADLETS + 1,
-			    ps->pcm_channels, frames, dbs);
+			    nch, frames, dbs);
 
-			bytes = frames * ps->pcm_channels * 4;
+			bytes = frames * nch * 4;
 			ps->hwptr += bytes;
 			if (ps->hwptr >= ps->buffer_bytes)
 				ps->hwptr = 0;

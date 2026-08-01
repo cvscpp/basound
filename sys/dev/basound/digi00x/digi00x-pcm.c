@@ -56,6 +56,23 @@ dg00x_rate_to_fdf(unsigned int rate)
 	}
 }
 
+/*
+ * Rate index into snd_dg00x_stream_rates / snd_dg00x_stream_pcm_channels.
+ * Used to look up the full channel complement the Digi 002/003 always
+ * carries per data block (18 at 44.1/48 kHz, 10 at 88.2/96 kHz).
+ */
+static unsigned int
+dg00x_rate_index(unsigned int rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < SND_DG00X_RATE_COUNT; i++) {
+		if (snd_dg00x_stream_rates[i] == rate)
+			return (i);
+	}
+	return (SND_DG00X_RATE_48000);
+}
+
 void
 dg00x_pcm_update_position(struct dg00x_pcm_stream *ps, unsigned int bytes)
 {
@@ -131,6 +148,15 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	ps->pcm_channels = channels;
 	ps->rate = ch->speed > 0 ? ch->speed : 48000;
 	ps->fdf = dg00x_rate_to_fdf(ps->rate);
+	/*
+	 * The device always carries its full channel complement per data
+	 * block (18 at 44.1/48 kHz, 10 at 88.2/96 kHz), independent of
+	 * the channel count the PCM application opened.  The TX fill and
+	 * RX handlers use this stride; the app's channels are mapped to
+	 * the first channels of the block.
+	 */
+	ps->device_channels =
+	    snd_dg00x_stream_pcm_channels[dg00x_rate_index(ps->rate)];
 	ps->period_bytes = ch->blocksize;
 	/*
 	 * Use runtime->dma_bytes for buffer bounds, not ch->buffer->bufsize.
@@ -292,6 +318,9 @@ pcm_prepare(struct snd_pcm_substream *substream)
 		dg00x->pcm_playback.rate = ch->speed > 0 ? ch->speed : 48000;
 		dg00x->pcm_playback.fdf =
 		    dg00x_rate_to_fdf(dg00x->pcm_playback.rate);
+		dg00x->pcm_playback.device_channels =
+		    snd_dg00x_stream_pcm_channels[
+			dg00x_rate_index(dg00x->pcm_playback.rate)];
 		dg00x->pcm_playback.frames_per_packet =
 		    dg00x->pcm_playback.rate / 8000;
 		dg00x->pcm_playback.frame_remainder =
@@ -303,6 +332,9 @@ pcm_prepare(struct snd_pcm_substream *substream)
 		dg00x->pcm_capture.rate = ch->speed > 0 ? ch->speed : 48000;
 		dg00x->pcm_capture.fdf =
 		    dg00x_rate_to_fdf(dg00x->pcm_capture.rate);
+		dg00x->pcm_capture.device_channels =
+		    snd_dg00x_stream_pcm_channels[
+			dg00x_rate_index(dg00x->pcm_capture.rate)];
 		dg00x->pcm_capture.frames_per_packet =
 		    dg00x->pcm_capture.rate / 8000;
 		dg00x->pcm_capture.frame_remainder =

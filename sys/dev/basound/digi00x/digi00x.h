@@ -67,7 +67,13 @@ struct dg00x_pcm_stream {
 	unsigned long   period_accum;  /* bytes accumulated since last period_elapsed */
 	unsigned int    period_bytes;  /* bytes per period */
 	unsigned int    buffer_bytes;  /* total buffer bytes */
-	unsigned int    pcm_channels;  /* negotiated channel count */
+	unsigned int    pcm_channels;  /* channels negotiated with the PCM app */
+	unsigned int    device_channels; /* full channel complement carried on
+					   the bus: 18 at 44.1/48 kHz, 10 at
+					   88.2/96 kHz — the Digi 002/003
+					   always transmits this many channels
+					   per data block regardless of the
+					   app channel count */
 	unsigned int    rate;          /* sample rate */
 	unsigned int    tx_dbc;        /* TX data block counter for CIP header */
 	unsigned int    fdf;           /* CIP FDF field = sampling-frequency

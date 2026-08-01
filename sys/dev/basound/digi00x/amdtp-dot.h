@@ -44,6 +44,14 @@ void dot_write_pcm(struct dot_state *state, uint32_t *dest,
 		   const int32_t *src, unsigned int channels,
 		   unsigned int frames, unsigned int data_block_quadlets);
 
+/* Like dot_write_pcm but fills `channels` device channels per frame,
+ * taking the first `src_channels` from the interleaved host buffer and
+ * padding the rest with dot-encoded silence. */
+void dot_write_pcm_padded(struct dot_state *state, uint32_t *dest,
+			  const int32_t *src, unsigned int src_channels,
+			  unsigned int channels, unsigned int frames,
+			  unsigned int data_block_quadlets);
+
 /* PCM read helpers - decode from DOT-encoded big-endian to host s32 */
 void dot_read_pcm(struct dot_state *state, int32_t *dest,
 		  const uint32_t *src, unsigned int channels,
