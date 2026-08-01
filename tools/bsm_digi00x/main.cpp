@@ -23,7 +23,7 @@ int main(int argc, char **argv) {
 	Fl::scheme("gtk+");
 	Fl::visual(FL_DOUBLE | FL_INDEX);
 
-	MixerWindow win(600, 440, "bsm_digi00x — Digi 002/003 Control Panel");
+	MixerWindow win(960, 640, "bsm_digi00x — Digi 002/003 Control Panel");
 	win.show(argc, argv);
 
 	/* Auto-connect after the window is shown.

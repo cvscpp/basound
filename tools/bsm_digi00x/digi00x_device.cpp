@@ -16,7 +16,9 @@ Digi00xDevice::Digi00xDevice()
     : opened_(false),
       pcm_unit_(-1),
       dg00x_unit_(-1),
-      vu_fd_(-1)
+      vu_fd_(-1),
+      vu_nch_(0),
+      vu_rate_(0)
 {
 }
 
@@ -216,57 +218,125 @@ bool Digi00xDevice::get_external_detect() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Channel geometry                                                     */
+/* ------------------------------------------------------------------ */
+
+int Digi00xDevice::get_device_channels() {
+	int rate = get_rate();
+	return (rate > 48000) ? 10 : 18;
+}
+
+int Digi00xDevice::get_capture_channels() {
+	int rate = get_rate();
+	return (rate > 48000) ? 8 : 18;
+}
+
+/* ------------------------------------------------------------------ */
 /* VU polling                                                           */
 /* ------------------------------------------------------------------ */
 
-bool Digi00xDevice::poll_capture_levels(uint16_t &peak_l, uint16_t &peak_r) {
-	peak_l = peak_r = 0;
-
+bool Digi00xDevice::poll_capture_levels(std::vector<uint32_t> &peaks) {
+	peaks.clear();
 	if (!opened_ || pcm_unit_ < 0)
 		return false;
 
-	/* Cache the VU fd so we don't open/close on every poll cycle */
-	if (vu_fd_ < 0) {
+	int rate = get_rate();
+	if (rate <= 0)
+		rate = 48000;
+	int nch = get_capture_channels();
+	int frames_per_block = 512;
+
+	/* Re-open the VU fd when the negotiated geometry changes
+	 * (rate change → channel count change). */
+	if (vu_fd_ < 0 || vu_nch_ != nch || vu_rate_ != rate) {
+		if (vu_fd_ >= 0) {
+			::close(vu_fd_);
+			vu_fd_ = -1;
+		}
 		vu_fd_ = ::open(pcm_path_.c_str(), O_RDONLY | O_NONBLOCK);
 		if (vu_fd_ < 0)
 			return false;
 
-		/* Set 16-bit stereo, 44100 Hz */
-		int fmt = AFMT_S16_LE;
+		/* Native S32_LE multichannel — the driver's natural format. */
+		int fmt = AFMT_S32_LE;
 		if (::ioctl(vu_fd_, SNDCTL_DSP_SETFMT, &fmt) < 0) {
 			::close(vu_fd_);
 			vu_fd_ = -1;
 			return false;
 		}
-		int ch = 2;
-		if (::ioctl(vu_fd_, SNDCTL_DSP_CHANNELS, &ch) < 0 || ch != 2) {
+		int ch = nch;
+		if (::ioctl(vu_fd_, SNDCTL_DSP_CHANNELS, &ch) < 0 || ch != nch) {
 			::close(vu_fd_);
 			vu_fd_ = -1;
 			return false;
 		}
-		int frag = 0x00060004;
+		int frag = (12 << 16) | 0x0006; /* 6 fragments of 4096 bytes */
 		::ioctl(vu_fd_, SNDCTL_DSP_SETFRAGMENT, &frag);
 
-		int speed = 44100;
+		/* Match the device rate; setspeed only runs ALSA prepare,
+		 * it never rewrites the device rate register, so this is
+		 * safe even while another app (e.g. Audacious) is playing. */
+		int speed = rate;
 		::ioctl(vu_fd_, SNDCTL_DSP_SPEED, &speed);
+
+		vu_nch_ = nch;
+		vu_rate_ = rate;
 	}
 
-	int16_t buf[256];
-	ssize_t nread = ::read(vu_fd_, buf, sizeof(buf));
+	std::vector<int32_t> buf(nch * frames_per_block);
+	ssize_t nread = ::read(vu_fd_, buf.data(), buf.size() * sizeof(int32_t));
 	if (nread <= 0)
 		return false;
 
-	int nsamples = (int)(nread / sizeof(int16_t));
-	uint16_t max_l = 0, max_r = 0;
+	int frames = (int)(nread / (nch * (int)sizeof(int32_t)));
+	if (frames <= 0)
+		return false;
 
-	for (int i = 0; i + 1 < nsamples; i += 2) {
-		uint16_t abs_l = (uint16_t)(buf[i] < 0 ? -buf[i] : buf[i]);
-		uint16_t abs_r = (uint16_t)(buf[i+1] < 0 ? -buf[i+1] : buf[i+1]);
-		if (abs_l > max_l) max_l = abs_l;
-		if (abs_r > max_r) max_r = abs_r;
+	/* Per-channel peak in 24-bit scale (the driver delivers 24-bit
+	 * audio in the top bits of each 32-bit sample). */
+	peaks.assign(nch, 0);
+	for (int f = 0; f < frames; f++) {
+		for (int c = 0; c < nch; c++) {
+			int32_t v = buf[f * nch + c] >> 8;
+			uint32_t a = (v < 0) ? (uint32_t)(-v) : (uint32_t)v;
+			if (a > peaks[c])
+				peaks[c] = a;
+		}
 	}
-
-	peak_l = max_l;
-	peak_r = max_r;
 	return true;
 }
+
+bool Digi00xDevice::get_playback_levels(std::vector<uint32_t> &peaks, int &nch) {
+	peaks.clear();
+	nch = 0;
+	if (!opened_ || dg00x_unit_ < 0)
+		return false;
+
+	std::string s = sysctl_str(sysctl_path("tx_peaks").c_str());
+	if (s.empty())
+		return false;
+
+	/* Format: "N p0 p1 ... pN-1" */
+	char *end = nullptr;
+	long n = strtol(s.c_str(), &end, 10);
+	if (n <= 0 || end == nullptr || *end == '\0')
+		return false;
+
+	/* Parse the peak values; tolerate a truncated string. */
+	long max_n = (n > 18) ? 18 : n;
+	peaks.reserve(max_n);
+	char *p = end;
+	for (long i = 0; i < max_n && p != nullptr && *p != '\0'; i++) {
+		long v = strtol(p, &end, 10);
+		if (end == p)
+			break;	/* parse stalled — stop, keep what we have */
+		peaks.push_back((uint32_t)v);
+		p = end;
+	}
+
+	if (peaks.empty())
+		return false;
+	nch = (int)peaks.size();
+	return true;
+}
+

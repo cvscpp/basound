@@ -16,9 +16,13 @@
  *   rate            RO   current sample rate (Hz)
  *   external_rate   RO   detected external clock rate (Hz)
  *   external_detect RO   1 = external clock present
+ *   tx_peaks        RO   playback output peaks per channel, formatted as
+ *                        "N p0 p1 ... pN-1" (24-bit scale, peak-and-clear)
  *
- * All interaction happens via sysctl(3).  VU metering uses the standard
- * FreeBSD sound(4) /dev/dspN interface.
+ * Capture (input) level metering reads the decoded multichannel stream
+ * from /dev/dspN directly; playback (output) level metering reads the
+ * tx_peaks sysctl (the TX data lives in the player's DMA buffer and is
+ * not visible to userspace).
  */
 class Digi00xDevice {
 public:
@@ -57,6 +61,18 @@ public:
 	/* External clock present? */
 	bool get_external_detect();
 
+	/* ---- Channel geometry ---- */
+
+	/* Full channel complement the device carries on the bus at the
+	 * current rate: 18 at 44.1/48 kHz, 10 at 88.2/96 kHz. */
+	int  get_device_channels();
+
+	/* Channel count the OSS capture stream can negotiate: 18 at
+	 * 44.1/48 kHz, 8 at 88.2/96 kHz (the driver fmtlist has no
+	 * 10-channel entry; the 8 analog channels cover the DAW path
+	 * at high rates). */
+	int  get_capture_channels();
+
 	/* ---- Device info ---- */
 
 	const char *pcm_path() const { return pcm_path_.c_str(); }
@@ -64,11 +80,16 @@ public:
 	int         pcm_unit() const { return pcm_unit_; }
 	int         digi00x_unit() const { return dg00x_unit_; }
 
-	/* ---- VU polling via /dev/dspN ---- */
+	/* ---- Level polling ---- */
 
-	/* Poll capture levels by reading a short sample block from /dev/dspN.
-	 * Returns peak 16-bit sample values for left/right channels. */
-	bool poll_capture_levels(uint16_t &peak_l, uint16_t &peak_r);
+	/* Poll capture (input) levels by reading the decoded multichannel
+	 * stream from /dev/dspN.  Returns per-channel peaks (24-bit scale,
+	 * 0..0x7fffff) in channel order; true if fresh data was read. */
+	bool poll_capture_levels(std::vector<uint32_t> &peaks);
+
+	/* Read the driver's playback (output) peak sysctl.  Fills
+	 * per-channel 24-bit peaks and the channel count; true on success. */
+	bool get_playback_levels(std::vector<uint32_t> &peaks, int &nch);
 
 	/* ---- Device discovery ---- */
 
@@ -82,7 +103,9 @@ private:
 	int     dg00x_unit_;
 	std::string name_;
 	std::string pcm_path_;
-	int     vu_fd_;  /* cached fd for VU polling, or -1 */
+	int     vu_fd_;  /* cached capture fd for VU polling, or -1 */
+	int     vu_nch_; /* channel count the capture fd was opened with */
+	int     vu_rate_;/* sample rate the capture fd was opened with */
 
 	/* Helpers */
 	std::string sysctl_path(const char *leaf) const;

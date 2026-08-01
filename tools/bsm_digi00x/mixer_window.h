@@ -18,23 +18,32 @@
  *
  *   [Menu Bar]  File > Quit   Device > /dev/dspN ...
  *
- *   ┌─── "Clock Configuration" ───────────────────────┐
- *   │   Clock Source:      Optical Port:              │
- *   │   ○ Internal          ○ ADAT                   │
- *   │   ○ S/PDIF            ○ S/PDIF                 │
- *   │   ○ ADAT                                        │
- *   │   ○ Word Clock                                  │
- *   │                                                 │
- *   │   Rate:  48000 Hz   External: Word, 96000 Hz    │
- *   └─────────────────────────────────────────────────┘
+ *   ┌─── "Clock Configuration" ─────────────────────────────┐
+ *   │   Clock Source:      Optical Port:                    │
+ *   │   ○ Internal          ○ ADAT                         │
+ *   │   ○ S/PDIF            ○ S/PDIF                       │
+ *   │   ○ ADAT                                             │
+ *   │   ○ Word Clock                                       │
+ *   │   Rate:  48000 Hz   External: Word, 96000 Hz          │
+ *   └───────────────────────────────────────────────────────┘
  *
- *   ┌─── "Input Level" ───────────────────────────────┐
- *   │   L: [██████░░░░░░░░]  -12 dB                   │
- *   │   R: [████████░░░░░░]   -9 dB                   │
- *   └──────────────────────────────────────────────────┘
+ *   ┌─── "Input Levels (18 ch)"  peak: -3.2 dB ────────────┐
+ *   │   ▐▐▐▐▐▐▐▐▐▐▐▐▐▐▐▐▐▐  per-channel capture meters     │
+ *   │   1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18       │
+ *   └───────────────────────────────────────────────────────┘
+ *
+ *   ┌─── "Output Levels (18 ch)"  peak: -6.0 dB ───────────┐
+ *   │   per-channel playback (TX) meters                    │
+ *   └───────────────────────────────────────────────────────┘
  *
  *   [Status Bar] Connected to /dev/dsp13 — Digi 003 Rack
+ *
+ * Input metering decodes the multichannel capture stream via /dev/dspN;
+ * output metering reads the driver's tx_peaks sysctl (what is actually
+ * being sent to the device per output channel).
  */
+
+#define DG00X_TOOL_MAX_CH 18
 
 class MixerWindow : public Fl_Double_Window {
 public:
@@ -63,12 +72,15 @@ private:
 	Fl_Box         *rate_label_;
 	Fl_Box         *ext_label_;
 
-	/* Input level section */
-	Fl_Group   *level_group_;
-	VuMeter    *vu_l_;
-	VuMeter    *vu_r_;
-	Fl_Box     *db_l_;
-	Fl_Box     *db_r_;
+	/* Level sections */
+	Fl_Group  *in_group_;
+	Fl_Group  *out_group_;
+	Fl_Box    *in_peak_label_;
+	Fl_Box    *out_peak_label_;
+	VuMeter   *in_meter_[DG00X_TOOL_MAX_CH];
+	VuMeter   *out_meter_[DG00X_TOOL_MAX_CH];
+	int        in_meter_count_;
+	int        out_meter_count_;
 
 	/* Status bar */
 	Fl_Box     *status_bar_;
@@ -76,6 +88,9 @@ private:
 	/* Build/destroy UI */
 	void build_ui();
 	void clear_ui();
+
+	/* Show/hide meters to match the current channel geometry. */
+	void apply_meter_counts(int in_n, int out_n);
 
 	/* Timer callback (25 Hz meter updates + polling) */
 	static void timer_cb(void *userdata);
