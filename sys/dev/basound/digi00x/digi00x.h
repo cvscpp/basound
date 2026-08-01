@@ -70,6 +70,8 @@ struct dg00x_pcm_stream {
 	unsigned int    pcm_channels;  /* negotiated channel count */
 	unsigned int    rate;          /* sample rate */
 	unsigned int    tx_dbc;        /* TX data block counter for CIP header */
+	unsigned int    fdf;           /* CIP FDF field = sampling-frequency
+					  code (1,2,3,4 for 44.1/48/88.2/96k) */
 	bool            active;        /* stream is active */
 	struct dot_state dot;          /* DOT encoder/decoder state */
 	int             direction;     /* SNDRV_PCM_STREAM_PLAYBACK or CAPTURE */

@@ -39,6 +39,23 @@
 
 #define DG00X_REFILL_TICKS	1	/* 1 ms at hz=1000 */
 
+/*
+ * CIP sampling-frequency code, used in the CIP FDF field.
+ * Matches the Linux amdtp-stream.c convention:
+ *   fdf = AMDTP_FDF_AM824 | sfc  where sfc is the CIP_SFC_ code.
+ */
+static unsigned int
+dg00x_rate_to_fdf(unsigned int rate)
+{
+	switch (rate) {
+	case 44100:	return (1);	/* CIP_SFC_44100 */
+	case 48000:	return (2);	/* CIP_SFC_48000 */
+	case 88200:	return (3);	/* CIP_SFC_88200 */
+	case 96000:	return (4);	/* CIP_SFC_96000 */
+	default:	return (2);
+	}
+}
+
 void
 dg00x_pcm_update_position(struct dg00x_pcm_stream *ps, unsigned int bytes)
 {
@@ -113,6 +130,7 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	ps->direction = direction;
 	ps->pcm_channels = channels;
 	ps->rate = ch->speed > 0 ? ch->speed : 48000;
+	ps->fdf = dg00x_rate_to_fdf(ps->rate);
 	ps->period_bytes = ch->blocksize;
 	/*
 	 * Use runtime->dma_bytes for buffer bounds, not ch->buffer->bufsize.
@@ -272,6 +290,8 @@ pcm_prepare(struct snd_pcm_substream *substream)
 		dg00x->pcm_playback.period_accum = 0;
 		dg00x->pcm_playback.tx_dbc = 0;
 		dg00x->pcm_playback.rate = ch->speed > 0 ? ch->speed : 48000;
+		dg00x->pcm_playback.fdf =
+		    dg00x_rate_to_fdf(dg00x->pcm_playback.rate);
 		dg00x->pcm_playback.frames_per_packet =
 		    dg00x->pcm_playback.rate / 8000;
 		dg00x->pcm_playback.frame_remainder =
@@ -281,6 +301,8 @@ pcm_prepare(struct snd_pcm_substream *substream)
 		dg00x->pcm_capture.hwptr = 0;
 		dg00x->pcm_capture.period_accum = 0;
 		dg00x->pcm_capture.rate = ch->speed > 0 ? ch->speed : 48000;
+		dg00x->pcm_capture.fdf =
+		    dg00x_rate_to_fdf(dg00x->pcm_capture.rate);
 		dg00x->pcm_capture.frames_per_packet =
 		    dg00x->pcm_capture.rate / 8000;
 		dg00x->pcm_capture.frame_remainder =

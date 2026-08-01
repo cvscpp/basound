@@ -74,17 +74,26 @@ dg00x_build_cip_header(uint32_t *hdr, unsigned int node_id,
 		       unsigned int dbs, unsigned int dbc,
 		       unsigned int fmt, unsigned int fdf, unsigned int syt)
 {
-	hdr[0] = (node_id & 0x3f) << 26 |	/* SID */
-		 (dbs & 0xff) << 18 |		/* DBS */
-		 0 << 16 |			/* FN=0 */
-		 0 << 13 |			/* QPC=0 */
-		 0 << 12 |			/* SPH=0 */
-		 0 << 10 |			/* reserved */
-		 (dbc & 0xff);			/* DBC */
-	hdr[1] = (1 << 31) |			/* EOH */
-		 (fmt & 0x3f) << 24 |		/* FMT */
-		 ((fdf & 0xff) << 16) |		/* FDF */
-		 (syt & 0xffff);		/* SYT */
+	/*
+	 * CIP header layout used by the Digi 002/003 (matches the Linux
+	 * amdtp-stream.c generate_cip_header(), which works with real
+	 * hardware):
+	 *   quadlet 0: SID bits 24-29, DBS bits 16-23, DBC bits 0-7
+	 *   quadlet 1: EOH bit 31, FMT bits 24-29, FDF bits 16-23,
+	 *              SYT bits 0-15
+	 *
+	 * These quadlets are part of the packet PAYLOAD: the OHCI
+	 * controller DMA's them to the bus in memory order without any
+	 * byte conversion, so they must be byte-swapped to big-endian
+	 * (htobe32) to appear correctly on the wire.
+	 */
+	hdr[0] = htobe32(((node_id & 0x3f) << 24) |	/* SID */
+			 ((dbs & 0xff) << 16) |		/* DBS */
+			 (dbc & 0xff));			/* DBC */
+	hdr[1] = htobe32((1u << 31) |			/* EOH */
+			 ((fmt & 0x3f) << 24) |		/* FMT */
+			 ((fdf & 0xff) << 16) |		/* FDF */
+			 (syt & 0xffff));		/* SYT */
 }
 
 /* ------------------------------------------------------------------ */
@@ -294,7 +303,8 @@ dg00x_frames_this_packet(struct dg00x_pcm_stream *ps)
  *   [4..7]:   CIP header quadlet 0 (SID, DBS, FN, QPC, SPH, DBC)
  *   [8..11]:  CIP header quadlet 1 (EOH, FMT, FDF, SYT)
  *   [12..]:   Data blocks: [MIDI] [PCM×nch] [MIDI] [PCM×nch] …
- *             where MIDI = 0x80000000 (placeholder — no MIDI data)
+ *             where MIDI = 0x00000080 (memory order → 0x80 on the wire,
+ *             the "no MIDI data" marker used by the Linux driver)
  *
  * - Calls dg00x_frames_this_packet() to determine how many audio frames
  *   this packet carries (rate/8000, with fractional distribution).
@@ -333,20 +343,24 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	/*
 	 * Set the isochronous header quadlet.
 	 *
-	 * fw_pkt.stream layout in the uint32_t (LE bit numbering):
-	 *   bits [0:15]  = len
-	 *   bits [16:23] = chtag
-	 *   bits [24:27] = tcode (0xa = isochronous data block)
-	 *   bits [28:31] = sy
+	 * fw_pkt.stream layout as consumed by fwohci (see fw_pkt in
+	 * <dev/firewire/firewire.h> and fwohci_txbufdb()):
+	 *   bits [16:31] = len   (payload bytes after the iso header)
+	 *   bits [8:15]  = chtag (overridden by fwohci to the channel)
+	 *   bits [4:7]   = tcode (overridden by fwohci to 0xa)
+	 *   bits [0:3]   = sy
 	 *
-	 * The OHCI DMA engine reads this quadlet from host memory in
-	 * byte-address order.  On little-endian x86 (the only platform
-	 * this driver currently runs on), the uint32_t's LSB is at the
-	 * lowest memory address, matching the bit layout above directly.
+	 * fwohci_txbufdb() copies fp->mode.stream.len (bits 16-31) into
+	 * both the OHCI isochronous transmit header and the DMA descriptor
+	 * count (db[2].cmd), so it MUST contain the real payload length.
 	 *
-	 * On a hypothetical big-endian host, byteswap would be needed.
+	 * Writing pkt_len to bits [0:15] (the IEEE-1394 wire layout)
+	 * instead made bits 16-31 read back 0x0a00 = 2560.  The controller
+	 * then transmitted 2560 bytes per packet — more than the 2048-byte
+	 * DMA segment — overrunning the buffer, aborting the IT context and
+	 * freezing playback after the first few milliseconds.
 	 */
-	fp->mode.ld[0] = pkt_len | (0xa << 24);
+	fp->mode.stream.len = pkt_len;
 
 	/*
 	 * Payload starts at fp->mode.stream.payload (offset 4 in segment).
@@ -357,12 +371,20 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	dg00x_build_cip_header(&payload[0],
 	    dg00x->fwdev->fc->nodeid,
 	    dbs, dbc,
-	    CIP_FMT_AM, AMDTP_FDF_AM824, 0xffff);
+	    CIP_FMT_AM, ps->fdf, 0xffff);
 
-	/* Zero the MIDI quadlet at the start of every data block.
-	 * Data blocks start at payload[2] (after 2-quadlet CIP header). */
+	/*
+	 * MIDI marker quadlet at the start of every data block.
+	 * Data blocks start at payload[2] (after the 2-quadlet CIP header).
+	 *
+	 * The value must put 0x80 in the FIRST byte on the wire (as in the
+	 * Linux driver's write_midi_messages(): b[0] = 0x80).  Payload is
+	 * DMA'd in memory order, so on a little-endian host the native
+	 * value is 0x00000080 (memory bytes 80 00 00 00).  Writing
+	 * 0x80000000 instead produced wire bytes 00 00 00 80 — reversed.
+	 */
 	for (i = 0; i < frames; i++)
-		payload[CIP_HEADER_QUADLETS + i * dbs] = 0x80000000;
+		payload[CIP_HEADER_QUADLETS + i * dbs] = 0x00000080;
 
 	/* DOT-encode PCM data.  PCM starts at payload[3] (after CIP[2] + MIDI[1]).
 	 * dbs is the stride between consecutive data blocks (MIDI + PCM). */
@@ -391,7 +413,9 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 	struct snd_dg00x *dg00x;
 	struct dg00x_pcm_stream *ps;
 	struct firewire_comm *fc;
+	struct fw_bulkxfer *bx;
 	unsigned int frames, dbs, bytes;
+	int recycled = 0;
 
 	if (xferq == NULL || xferq->sc == NULL)
 		return;
@@ -404,46 +428,71 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 	ps = &dg00x->pcm_capture;
 	fc = ISO_FC(ch);
 
-	if (ps->active && ps->substream != NULL &&
-	    ps->substream->runtime != NULL &&
-	    ps->substream->runtime->dma_area != NULL &&
-	    xferq->stproc != NULL) {
-		struct fw_bulkxfer *bx = xferq->stproc;
-		uint32_t *payload = mtod(bx->mbuf, uint32_t *);
+	/*
+	 * fwohci_rbuf_update() moves each completed chunk from stdma to
+	 * stvalid before calling ir->hand(), so the received packets are
+	 * waiting in the stvalid queue.  The data lands in the EXTBUF DMA
+	 * segments (fwdma_v_addr(xferq->buf, bx->poffset)), NOT in the
+	 * mbuf — the mbuf is never populated in EXTBUF mode.
+	 *
+	 * The first descriptor quadlet of each RX chunk is a dummy that
+	 * absorbs the isochronous packet header, so the segment starts at
+	 * the CIP header: [CIP q0] [CIP q1] [MIDI] [PCM×nch] ...
+	 *
+	 * This handler runs with FW_GLOCK held (fwohci calls hand()
+	 * while holding it), so the queue manipulation below is safe.
+	 */
+	while ((bx = STAILQ_FIRST(&xferq->stvalid)) != NULL) {
+		STAILQ_REMOVE_HEAD(&xferq->stvalid, link);
 
-		/*
-		 * The device sends the same number of frames per
-		 * ISO packet as we expect for TX (rate/8000 average).
-		 * Use the same fractional framing logic.
-		 */
-		frames = dg00x_frames_this_packet(ps);
-		dbs = ps->pcm_channels + 1;
+		if (ps->active && ps->substream != NULL &&
+		    ps->substream->runtime != NULL &&
+		    ps->substream->runtime->dma_area != NULL &&
+		    xferq->buf != NULL) {
+			uint32_t *payload;
 
-		dot_read_pcm(&ps->dot,
-			     (int32_t *)ps->substream->runtime->dma_area +
-			     (ps->hwptr / 4),
-			     payload + CIP_HEADER_QUADLETS + 1,
-			     ps->pcm_channels, frames, dbs);
+			payload = (uint32_t *)fwdma_v_addr(xferq->buf,
+							   bx->poffset);
 
-		bytes = frames * ps->pcm_channels * 4;
-		ps->hwptr += bytes;
-		if (ps->hwptr >= ps->buffer_bytes)
-			ps->hwptr = 0;
+			/*
+			 * The device sends the same number of frames per
+			 * ISO packet as we expect for TX (rate/8000
+			 * average).  Use the same fractional framing.
+			 */
+			frames = dg00x_frames_this_packet(ps);
+			dbs = ps->pcm_channels + 1;
 
-		dg00x_pcm_update_position(ps, bytes);
-	}
+			dot_read_pcm(&ps->dot,
+			    (int32_t *)ps->substream->runtime->dma_area +
+			    (ps->hwptr / 4),
+			    payload + CIP_HEADER_QUADLETS + 1,
+			    ps->pcm_channels, frames, dbs);
 
-	/* Recycle chunk */
-	if (xferq->stproc != NULL) {
-		struct fw_bulkxfer *bx = xferq->stproc;
-		STAILQ_REMOVE(&xferq->stdma, bx, fw_bulkxfer, link);
+			bytes = frames * ps->pcm_channels * 4;
+			ps->hwptr += bytes;
+			if (ps->hwptr >= ps->buffer_bytes)
+				ps->hwptr = 0;
+
+			dg00x_pcm_update_position(ps, bytes);
+		}
+
+		/* Recycle the chunk for the next receive */
 		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
-		xferq->stproc = NULL;
+		recycled++;
 	}
 
-	/* Re-enable DMA if idle and chunks available */
-	if (!STAILQ_EMPTY(&xferq->stfree) &&
-	    (xferq->flag & FWXFERQ_RUNNING) == 0)
+	/*
+	 * Re-arm the RX context whenever chunks were recycled.
+	 *
+	 * fwohci only clears FWXFERQ_RUNNING in fwohci_irx_disable();
+	 * it stays set when the receive chain runs to its end and the
+	 * context goes idle.  Gating on the flag (as before) meant the
+	 * context was never restarted and capture stalled after the
+	 * first ring pass.  irx_enable() re-chains stfree chunks onto
+	 * the context and restarts it if it stopped; with an empty
+	 * stfree it is a no-op.
+	 */
+	if (recycled > 0)
 		fc->irx_enable(fc, ch->dmach);
 }
 
@@ -586,12 +635,26 @@ int
 dg00x_streaming_start_rx(struct snd_dg00x *dg00x)
 {
 	struct dg00x_iso_channel *ch = &dg00x->iso_rx;
+	struct firewire_comm *fc;
+	int err;
 
 	if (ch->dmach < 0)
 		return (-ENODEV);
 
 	dot_reset_state(&dg00x->pcm_capture.dot);
-	return ISO_FC(ch)->irx_enable(ISO_FC(ch), ch->dmach);
+	fc = ISO_FC(ch);
+
+	/*
+	 * With FWXFERQ_HANDLER set, fwohci_irx_enable() skips its
+	 * internal FW_GLOCK (the handler is expected to run under it),
+	 * so we must hold it here to protect the stfree/stdma queue
+	 * manipulation against the taskqueue RX path.
+	 */
+	FW_GLOCK(fc);
+	err = fc->irx_enable(fc, ch->dmach);
+	FW_GUNLOCK(fc);
+
+	return (err);
 }
 
 void
