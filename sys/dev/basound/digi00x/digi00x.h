@@ -92,18 +92,23 @@ struct dg00x_pcm_stream {
 	 * AMDTP fractional framing: FireWire runs at 8000 ISO cycles/sec.
 	 * Each packet must carry rate/8000 frames on average.
 	 *
+	 * For 44.1 kHz-based rates (44100/88200) frame_cycle is the phase
+	 * counter of the IEC 61883-6 "ideal nonblocking" sequence that
+	 * mirrors the Linux amdtp-stream.c pool_ideal_nonblocking_data_blocks()
+	 * (round-ups as early as possible; the device's media clock recovery
+	 * is sensitive to this exact sequence).  The phase advances once per
+	 * packet and wraps at the pattern period (80 for 44100, 40 for 88200).
+	 *
 	 *   frames_per_packet = rate / 8000        (integer base)
-	 *   frame_remainder   = rate % 8000         (fractional part)
-	 *   frame_cycle       = accumulated remainder
+	 *   frame_remainder   = rate % 8000        (fractional part; unused by
+	 *                                           the ideal sequence, kept
+	 *                                           for reference)
 	 *
-	 * Each packet: frame_cycle += frame_remainder.
-	 * When frame_cycle >= 8000, send an extra frame and subtract 8000.
-	 *
-	 * Examples:
-	 *   44100 → base=5, rem=4100  (5 or 6 frames/packet)
-	 *   48000 → base=6, rem=0     (always 6 frames/packet)
-	 *   88200 → base=11, rem=200  (11 or 12 frames/packet)
-	 *   96000 → base=12, rem=0    (always 12 frames/packet)
+	 * Examples (data blocks per packet):
+	 *   44100 → 6 6 5 6 5 6 5 ...   (80-packet period)
+	 *   48000 → 6 6 6 ...
+	 *   88200 → 12 11 11 11 ...     (40-packet period)
+	 *   96000 → 12 12 12 ...
 	 */
 	unsigned int    frames_per_packet;
 	unsigned int    frame_cycle;

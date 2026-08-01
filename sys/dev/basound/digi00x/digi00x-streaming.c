@@ -55,6 +55,15 @@ MALLOC_DEFINE(M_DG00X_ISO, "dg00x_iso", "digi00x ISO DMA buffers");
 #define CIP_FMT_AM		0x10
 #define AMDTP_FDF_AM824		0x00
 
+/*
+ * IEC 61883-6 (AMDTP/CIP) isochronous streams use TAG=1 in the
+ * isochronous packet header ("data with CIP header").  In the fwohci
+ * xferq flag's low byte (FWXFERQ_CHTAGMASK), bits 6-7 carry the tag,
+ * bits 0-5 the channel — same layout as FreeBSD's fwdev.c ISO API
+ * (it->flag |= (tag << 6)).
+ */
+#define DG00X_ISO_TAG_CIP	(1 << 6)
+
 /* Max payload per ISO packet */
 #define DG00X_ISO_PACKET_SIZE	2048
 
@@ -269,22 +278,48 @@ dg00x_iso_close(struct dg00x_iso_channel *ch)
 /*
  * FireWire runs at 8000 ISO cycles/sec.  To achieve the configured
  * sample rate, each ISO packet must carry rate/8000 frames on average.
- * The fractional remainder is distributed using a modulo accumulator so
- * that the long-term frame rate matches exactly.
  *
- * Called once per ISO packet; advances the cycle state.
+ * This mirrors the Linux amdtp-stream.c pool_ideal_nonblocking_data_blocks()
+ * exactly: for 44.1 kHz-based rates the fractional remainder is distributed
+ * so that packets with a rounded-up block count occur as EARLY as possible
+ * in the sequence.  The Digi 002/003 recovers its media clock from this
+ * exact sequence ("The sequence of the number of data blocks per packet is
+ * important for media clock recovery"), so a plain modulo accumulator
+ * (which starts 5,6,5,6,... instead of 6,6,5,6,...) may prevent lock.
+ *
+ *   44100: 6 6 5 6 5 6 5 ...  (80-packet period)
+ *   48000: 6 6 6 ...
+ *   88200: 12 11 11 11 ...    (40-packet period)
+ *   96000: 12 12 12 ...
+ *
+ * ps->frame_cycle is reused as the pattern phase counter.
+ *
+ * Called once per ISO packet; advances the phase state.
  */
 static unsigned int
 dg00x_frames_this_packet(struct dg00x_pcm_stream *ps)
 {
-	unsigned int frames = ps->frames_per_packet;
+	unsigned int phase;
 
-	ps->frame_cycle += ps->frame_remainder;
-	if (ps->frame_cycle >= 8000) {
-		ps->frame_cycle -= 8000;
-		frames++;
+	switch (ps->rate) {
+	case 44100:
+		phase = ps->frame_cycle;
+		/* 5 + ((phase & 1) ^ (phase == 0 || phase >= 40)) */
+		ps->frame_cycle = phase + 1;
+		if (ps->frame_cycle >= 80)
+			ps->frame_cycle = 0;
+		return (5 + ((phase & 1) ^
+		    ((phase == 0 || phase >= 40) ? 1 : 0)));
+	case 88200:
+		phase = ps->frame_cycle;
+		ps->frame_cycle = phase + 1;
+		if (ps->frame_cycle >= 40)
+			ps->frame_cycle = 0;
+		return (11 + ((phase == 0) ? 1 : 0));
+	default:
+		/* 48000/96000: rate/8000 is an integer. */
+		return (ps->frames_per_packet);
 	}
-	return (frames);
 }
 
 /* ------------------------------------------------------------------ */
@@ -592,26 +627,38 @@ dg00x_streaming_init(struct snd_dg00x *dg00x)
 	ISO_XFERQ(&dg00x->iso_rx)->hand = dg00x_rx_handler;
 
 	/*
-	 * Program the isochronous channel numbers into the xferq flags.
+	 * Program the isochronous channel numbers AND the CIP tag into
+	 * the xferq flags.
 	 *
-	 * dg00x_iso_open() clears FWXFERQ_CHTAGMASK but does not set the
-	 * channel.  fwohci reads the channel from the flag bits:
+	 * FWXFERQ_CHTAGMASK (0xff) covers the 8-bit chtag field that
+	 * fwohci puts in the isochronous packet header: bits 6-7 carry
+	 * the 2-bit TAG, bits 0-5 the channel (same layout as the
+	 * FreeBSD fwdev.c ISO API: it->flag |= (tag << 6)).
+	 *
+	 * IEC 61883-6 (AMDTP/CIP) streams MUST use TAG=1 — the Linux
+	 * reference driver transmits with TAG_CIP and receives with
+	 * FW_ISO_CONTEXT_MATCH_TAG1, and the Digi 002/003's isochronous
+	 * receiver filters on it.  With tag left at 0 (as this driver
+	 * did before), the device silently drops every packet we send:
+	 * the host fill path advances and the tx_peaks meter moves, but
+	 * nothing ever reaches the DACs (and the device never starts
+	 * transmitting, since it only does so after receiving host
+	 * packets).
+	 *
 	 *   - TX: fwohci_txbufdb() uses  chtag = xferq->flag & 0xff   to
-	 *     transmit on that channel (overriding the chtag field in
-	 *     the packet header).
-	 *   - RX: fwohci_irx_enable() uses ich = xferq->flag & 0x3f for
-	 *     the OHCI context channel match.
-	 * With the flags left at zero, TX went out on channel 0 (which
-	 * happens to match the hardcoded tx_resources.channel=0) but RX
-	 * matched channel 0 while the device transmits on channel 1 —
-	 * capture could never receive anything.
+	 *     build the transmitted iso header (tag+channel).
+	 *   - RX: fwohci_irx_enable() uses tag = (flag >> 6) & 3 and
+	 *     ich = flag & 0x3f for the OHCI IRMATCH register (tagbit[1]
+	 *     = bit 29, identical to Linux's (TAG1 << 28)).
 	 */
 	ISO_XFERQ(&dg00x->iso_tx)->flag =
 	    (ISO_XFERQ(&dg00x->iso_tx)->flag & ~FWXFERQ_CHTAGMASK) |
-	    (dg00x->tx_resources.channel & FWXFERQ_CHTAGMASK);
+	    (DG00X_ISO_TAG_CIP |
+	     (dg00x->tx_resources.channel & 0x3f));
 	ISO_XFERQ(&dg00x->iso_rx)->flag =
 	    (ISO_XFERQ(&dg00x->iso_rx)->flag & ~FWXFERQ_CHTAGMASK) |
-	    (dg00x->rx_resources.channel & FWXFERQ_CHTAGMASK);
+	    (DG00X_ISO_TAG_CIP |
+	     (dg00x->rx_resources.channel & 0x3f));
 
 	return (0);
 }

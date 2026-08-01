@@ -318,11 +318,20 @@ dg00x_begin_session(struct snd_dg00x *dg00x, int tx_ch, int rx_ch)
 	if (curr == 0)
 		curr = 2;
 
-	/* Countdown from curr-1 down to 0.  The Digi hardware expects
-	 * a sequence of writes in decreasing order ending at 0 to
-	 * start the streaming session. */
+	/*
+	 * Decrement first, then write while > 0.  The Digi hardware counts
+	 * the streaming session down from the value written to STREAMING_SET;
+	 * the last write must be 1 — writing 0 puts the device back to the
+	 * idle state and cancels the session before it ever starts (which
+	 * is why the previous loop, that wrote 1 followed by 0, left the
+	 * device silent even though the host kept filling TX chunks).
+	 *
+	 * This mirrors the Linux digi00x begin_session() exactly:
+	 *   curr = state; if (curr == 0) curr = 2; curr--;
+	 *   while (curr > 0) { write curr; msleep(20); curr--; }
+	 */
+	curr--;
 	while (curr > 0) {
-		curr--;
 		err = dg00x_write_quad(dg00x->fwdev,
 				       DG00X_ADDR_BASE + DG00X_OFFSET_STREAMING_SET,
 				       htobe32(curr));
@@ -337,6 +346,7 @@ dg00x_begin_session(struct snd_dg00x *dg00x, int tx_ch, int rx_ch)
 		 * calling us), so sleeping is safe.
 		 */
 		pause("dg00xbs", hz / 50);	/* ~20 ms */
+		curr--;
 	}
 
 	return (err);
