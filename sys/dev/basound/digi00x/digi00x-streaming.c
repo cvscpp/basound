@@ -480,6 +480,28 @@ dg00x_streaming_init(struct snd_dg00x *dg00x)
 	dg00x->iso_rx.direction = SNDRV_PCM_STREAM_CAPTURE;
 	ISO_XFERQ(&dg00x->iso_rx)->hand = dg00x_rx_handler;
 
+	/*
+	 * Program the isochronous channel numbers into the xferq flags.
+	 *
+	 * dg00x_iso_open() clears FWXFERQ_CHTAGMASK but does not set the
+	 * channel.  fwohci reads the channel from the flag bits:
+	 *   - TX: fwohci_txbufdb() uses  chtag = xferq->flag & 0xff   to
+	 *     transmit on that channel (overriding the chtag field in
+	 *     the packet header).
+	 *   - RX: fwohci_irx_enable() uses ich = xferq->flag & 0x3f for
+	 *     the OHCI context channel match.
+	 * With the flags left at zero, TX went out on channel 0 (which
+	 * happens to match the hardcoded tx_resources.channel=0) but RX
+	 * matched channel 0 while the device transmits on channel 1 —
+	 * capture could never receive anything.
+	 */
+	ISO_XFERQ(&dg00x->iso_tx)->flag =
+	    (ISO_XFERQ(&dg00x->iso_tx)->flag & ~FWXFERQ_CHTAGMASK) |
+	    (dg00x->tx_resources.channel & FWXFERQ_CHTAGMASK);
+	ISO_XFERQ(&dg00x->iso_rx)->flag =
+	    (ISO_XFERQ(&dg00x->iso_rx)->flag & ~FWXFERQ_CHTAGMASK) |
+	    (dg00x->rx_resources.channel & FWXFERQ_CHTAGMASK);
+
 	return (0);
 }
 
@@ -701,10 +723,35 @@ dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
 
 	FW_GUNLOCK(fc);
 
-	/* Restart DMA if stalled.  dg00x->lock is still held,
-	 * preventing the stop path from concurrently calling
-	 * itx_disable — so there is no race on xferq->buf. */
-	if (refilled > 0 && (xferq->flag & FWXFERQ_RUNNING) == 0)
+	/*
+	 * Feed the TX DMA context on EVERY refill that moved chunks to
+	 * stvalid, not just when FWXFERQ_RUNNING is clear.
+	 *
+	 * fwohci only clears FWXFERQ_RUNNING in fwohci_itx_disable().
+	 * It does NOT clear it when the isochronous transmit chain runs
+	 * to its end and the context goes idle.  Gating on the flag
+	 * therefore meant: after the initial 32 chunks were transmitted,
+	 * the callout kept refilling stfree → stvalid but never called
+	 * itx_enable again, the DMA context was never restarted, no new
+	 * packets were sent, hwptr stopped advancing, and playback
+	 * froze after a few milliseconds.
+	 *
+	 * fwohci_itxbuf_enable() is designed to be called repeatedly
+	 * (see fwdev.c fw_write(), which calls it on every completed
+	 * packet batch).  It takes splfw() + FW_GLOCK internally, moves
+	 * stvalid → stdma, chains the new descriptors onto the running
+	 * context, and if the context has stopped it kicks it (start
+	 * with a CYCLE_DELAY match when all chunks are buffered, or
+	 * writes DMA_WAKE on underrun).  Calling it when there is
+	 * nothing to submit is a no-op, so the refilled > 0 check is
+	 * sufficient.
+	 *
+	 * dg00x->lock is still held here, preventing the stop path from
+	 * concurrently calling itx_disable — so there is no race on
+	 * xferq->buf and no possibility of re-enabling a freed
+	 * descriptor buffer.
+	 */
+	if (refilled > 0)
 		fc->itx_enable(fc, ch->dmach);
 
 out_unlock:
