@@ -397,7 +397,38 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		payload[CIP_HEADER_QUADLETS + i * dbs] = 0x00000080;
 
 	/*
-	 * DOT-encode PCM data.  PCM starts at payload[3] (after CIP[2] +
+	 * Update the per-channel output (TX) peak meter, 24-bit scale.
+	 * The source samples are 32-bit with 24-bit audio in the top
+	 * bits (S32_LE), matching the DOT encoder's >> 8.  Channels
+	 * beyond the app's count are padded silence → peak 0, so this
+	 * shows exactly which output channels carry audio.
+	 *
+	 * Written without dg00x->lock (start_tx fills under FW_GLOCK
+	 * only); the tx_peaks sysctl reads the array atomically.
+	 */
+	{
+		const int32_t *s = (const int32_t *)
+		    ps->substream->runtime->dma_area + (ps->hwptr / 4);
+		unsigned int c, f;
+
+		for (c = 0; c < ps->device_channels; c++) {
+			uint32_t pk = 0;
+
+			if (c < nch) {
+				for (f = 0; f < frames; f++) {
+					int32_t v = s[f * nch + c] >> 8;
+					uint32_t a = (v < 0) ? (uint32_t)(-v) :
+					    (uint32_t)v;
+					if (a > pk)
+						pk = a;
+				}
+			}
+			if (pk > atomic_load_acq_32(&ps->tx_peak[c]))
+				atomic_store_rel_32(&ps->tx_peak[c], pk);
+		}
+	}
+
+	/* DOT-encode PCM data.  PCM starts at payload[3] (after CIP[2] +
 	 * MIDI[1]).  dbs is the stride between consecutive data blocks
 	 * (MIDI + PCM).
 	 *

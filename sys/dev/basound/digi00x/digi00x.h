@@ -62,6 +62,11 @@ struct dg00x_stream {
  * A shared callout periodically fires snd_pcm_period_elapsed from
  * a safe context (NOT from the fwohci interrupt), letting the PCM
  * layer consult the DMA-driven hwptr to detect period boundaries. */
+
+/* Maximum channel complement the Digi 002/003 ever carries per data
+ * block (18 at 44.1/48 kHz). */
+#define DG00X_MAX_PCM_CHANNELS	18
+
 struct dg00x_pcm_stream {
 	unsigned long   hwptr;         /* current buffer position (bytes) */
 	unsigned long   period_accum;  /* bytes accumulated since last period_elapsed */
@@ -103,6 +108,16 @@ struct dg00x_pcm_stream {
 	unsigned int    frames_per_packet;
 	unsigned int    frame_cycle;
 	unsigned int    frame_remainder;
+
+	/*
+	 * Rolling per-channel peak of the stream data, in 24-bit scale
+	 * (0 .. 0x7fffff, abs of the audio sample).  Only the playback
+	 * (TX) stream fills this — the output-level monitor sysctl reads
+	 * and clears it (peak-and-clear).  Padded channels that carry
+	 * silence stay at 0, so this shows exactly what is being sent to
+	 * the device per output channel.
+	 */
+	uint32_t        tx_peak[DG00X_MAX_PCM_CHANNELS];
 };
 
 /* Called from ISO DMA handlers to track transfer progress.

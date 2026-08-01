@@ -342,6 +342,41 @@ sysctl_dg00x_external_detect(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * sysctl_dg00x_tx_peaks - RD: per-channel playback (TX) peak levels.
+ *
+ * Returns a string "N p0 p1 ... pN-1" where N is the number of device
+ * channels and pX is the peak (24-bit scale, 0..0x7fffff) of the data
+ * currently being sent to the device on that channel, computed in the
+ * TX fill path.  Padded channels that carry silence read 0.
+ *
+ * Peak-and-clear: each read returns the maximum level since the
+ * previous read and resets the meter, so a slow UI can track true
+ * peaks.  All zeros when no playback stream is active.
+ */
+static int
+sysctl_dg00x_tx_peaks(SYSCTL_HANDLER_ARGS)
+{
+	struct snd_dg00x *dg00x = arg1;
+	char buf[160];
+	unsigned int n, i;
+	int len;
+
+	mtx_lock(&dg00x->lock);
+	n = dg00x->pcm_playback.device_channels;
+	if (n == 0 || n > DG00X_MAX_PCM_CHANNELS)
+		n = 2;
+	len = snprintf(buf, sizeof(buf), "%u", n);
+	for (i = 0; i < n && len < (int)sizeof(buf) - 10; i++) {
+		uint32_t pk = atomic_load_acq_32(&dg00x->pcm_playback.tx_peak[i]);
+		atomic_store_rel_32(&dg00x->pcm_playback.tx_peak[i], 0);
+		len += snprintf(buf + len, sizeof(buf) - len, " %u", pk);
+	}
+	mtx_unlock(&dg00x->lock);
+
+	return (sysctl_handle_string(oidp, buf, len + 1, req));
+}
+
+/*
  * Initialize the ALSA card after discovering a Digidesign device.
  */
 static int
@@ -427,6 +462,13 @@ dg00x_init_card(struct digi00x_softc *sc)
 		    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    dg00x, 0, sysctl_dg00x_external_detect, "I",
 		    "External clock present (0=no, 1=yes)");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "tx_peaks",
+		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    dg00x, 0, sysctl_dg00x_tx_peaks, "A",
+		    "Playback output peaks per channel "
+		    "(N p0 p1 ... pN-1, 24-bit scale, peak-and-clear)");
 	}
 
 	err = dg00x_create_pcm(dg00x);
