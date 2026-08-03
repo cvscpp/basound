@@ -84,25 +84,23 @@ dg00x_build_cip_header(uint32_t *hdr, unsigned int node_id,
 		       unsigned int fmt, unsigned int fdf, unsigned int syt)
 {
 	/*
-	 * CIP header layout used by the Digi 002/003 (matches the Linux
-	 * amdtp-stream.c generate_cip_header(), which works with real
-	 * hardware):
-	 *   quadlet 0: SID bits 24-29, DBS bits 16-23, DBC bits 0-7
-	 *   quadlet 1: EOH bit 31, FMT bits 24-29, FDF bits 16-23,
-	 *              SYT bits 0-15
-	 *
-	 * These quadlets are part of the packet PAYLOAD: the OHCI
-	 * controller DMA's them to the bus in memory order without any
-	 * byte conversion, so they must be byte-swapped to big-endian
-	 * (htobe32) to appear correctly on the wire.
+	 * CIP header matching Linux generate_cip_header() exactly.
+	 * Linux native word bit positions (converted to wire via cpu_to_be32):
+	 *   q0: SPH=0x40000000 (bit 30), SID=(node_id<<24) (bits 29-24),
+	 *       DBS=(dbs<<16) (bits 23-16), DBC (bits 7-0)
+	 *   q1: EOH=0x80000000 (bit 31), FMT=(fmt<<25) (bits 30-25),
+	 *       FDF=(fdf<<16) (bits 23-16), SYT (bits 15-0)
 	 */
-	hdr[0] = htobe32(((node_id & 0x3f) << 24) |	/* SID */
-			 ((dbs & 0xff) << 16) |		/* DBS */
-			 (dbc & 0xff));			/* DBC */
-	hdr[1] = htobe32((1u << 31) |			/* EOH */
-			 ((fmt & 0x3f) << 24) |		/* FMT */
-			 ((fdf & 0xff) << 16) |		/* FDF */
-			 (syt & 0xffff));		/* SYT */
+	hdr[0] = htobe32(
+	    0x40000000u |			/* SPH */
+	    ((node_id & 0x3f) << 24) |		/* SID */
+	    ((dbs & 0xff) << 16) |		/* DBS */
+	    (dbc & 0xff));			/* DBC */
+	hdr[1] = htobe32(
+	    (1u << 31) |			/* EOH */
+	    (((unsigned int)fmt & 0x3f) << 25) |	/* FMT */
+	    ((fdf & 0xff) << 16) |		/* FDF */
+	    (syt & 0xffff));			/* SYT */
 }
 
 /* ------------------------------------------------------------------ */
@@ -376,9 +374,13 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 
 	/*
 	 * Total payload after the 8-byte isochronous header:
-	 *   8 (CIP header) + frames * dbs * 4 (data blocks)
+	 *   CIP header (8) + SPH timestamp (4) + frames * dbs * 4
+	 * When SPH=1 (non-blocking AMDTP), an extra source packet
+	 * header quadlet is required after the CIP header and before
+	 * the first data block.  Without it, all data is shifted by
+	 * one quadlet and the device's DOT decoder produces silence.
 	 */
-	pkt_len = 8 + frames * dbs * 4;
+	pkt_len = 12 + frames * dbs * 4;
 
 	/* Get pointer to the DMA buffer segment for this chunk */
 	fp = (struct fw_pkt *)fwdma_v_addr(xferq->buf, bx->poffset);
@@ -409,9 +411,19 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 
 	/*
 	 * Payload starts at fp->mode.stream.payload (offset 4 in segment).
-	 * Layout: [CIP hdr q0] [CIP hdr q1] [MIDIq] [PCM×nch] [MIDIq] …
+	 * Layout: [CIP q0] [CIP q1] [SPH] [MIDI] [PCM×nch] [MIDI] …
+	 *
+	 * CIP_HEADER_QUADLETS = 2 (the two CIP header quadlets).
+	 * When SPH=1, the SPH timestamp occupies payload[2], so MIDI
+	 * markers and PCM data start at payload[3] (= CIP_HEADER_QUADLETS + 1).
 	 */
 	payload = (uint32_t *)fp->mode.stream.payload;
+
+	/*
+	 * SPH timestamp quadlet: required when SPH=1 in non-blocking
+	 * AMDTP mode. Linux writes 0; the device ignores the value.
+	 */
+	payload[CIP_HEADER_QUADLETS] = 0x00000000;
 
 	dg00x_build_cip_header(&payload[0],
 	    dg00x->fwdev->fc->nodeid,
@@ -420,7 +432,8 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 
 	/*
 	 * MIDI marker quadlet at the start of every data block.
-	 * Data blocks start at payload[2] (after the 2-quadlet CIP header).
+	 * Data blocks start at payload[CIP_HEADER_QUADLETS + 1]
+	 * (offset 3: CIP[2] + SPH[1]).
 	 *
 	 * The value must put 0x80 in the FIRST byte on the wire (as in the
 	 * Linux driver's write_midi_messages(): b[0] = 0x80).  Payload is
@@ -429,7 +442,7 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	 * 0x80000000 instead produced wire bytes 00 00 00 80 — reversed.
 	 */
 	for (i = 0; i < frames; i++)
-		payload[CIP_HEADER_QUADLETS + i * dbs] = 0x00000080;
+		payload[CIP_HEADER_QUADLETS + 1 + i * dbs] = 0x00000080;
 
 	/*
 	 * Update the per-channel output (TX) peak meter, 24-bit scale.
@@ -463,9 +476,9 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		}
 	}
 
-	/* DOT-encode PCM data.  PCM starts at payload[3] (after CIP[2] +
-	 * MIDI[1]).  dbs is the stride between consecutive data blocks
-	 * (MIDI + PCM).
+	/* DOT-encode PCM data.  PCM starts at payload[CIP+2] (after CIP[2] +
+	 * SPH[1] + MIDI[1]).  dbs is the stride between consecutive data
+	 * blocks (MIDI + PCM).
 	 *
 	 * The Digi 002/003 always carries its full channel complement per
 	 * data block (18 at 44.1/48 kHz, 10 at 88.2/96 kHz), so encode
@@ -475,11 +488,20 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	 * transmitting only the app channel count makes the device's DOT
 	 * decoder lose sync and produces silence on all outputs.
 	 */
-	dot_write_pcm_padded(&ps->dot,
-	    &payload[CIP_HEADER_QUADLETS + 1],
-	    (const int32_t *)ps->substream->runtime->dma_area +
-	    (ps->hwptr / 4),
-	    nch, ps->device_channels, frames, dbs);
+	{
+		const int32_t *sp = (const int32_t *)ps->substream->runtime->dma_area +
+		    (ps->hwptr / 4);
+		static int dbg_dump = 0;
+		if (dbg_dump < 5) {
+			printf("digi00x: fill_chunk hwptr=%lu raw samples[0..3] = %d %d %d %d\n",
+			    (unsigned long)ps->hwptr,
+			    sp[0], sp[1], sp[2], sp[3]);
+			dbg_dump++;
+		}
+		dot_write_pcm_padded(&ps->dot,
+		    &payload[CIP_HEADER_QUADLETS + 2],
+		    sp, nch, ps->device_channels, frames, dbs);
+	}
 
 	/* Bytes consumed from the interleaved app buffer */
 	bytes = frames * nch * 4;
@@ -525,7 +547,7 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 	 *
 	 * The first descriptor quadlet of each RX chunk is a dummy that
 	 * absorbs the isochronous packet header, so the segment starts at
-	 * the CIP header: [CIP q0] [CIP q1] [MIDI] [PCM×nch] ...
+	 * the CIP header: [CIP q0] [CIP q1] [SPH] [MIDI] [PCM×nch] ...
 	 *
 	 * This handler runs with FW_GLOCK held (fwohci calls hand()
 	 * while holding it), so the queue manipulation below is safe.
@@ -552,6 +574,9 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 			 * per data block (18 at 44.1/48 kHz, 10 at 88.2/96
 			 * kHz), so stride by device_channels + 1 and copy
 			 * only the first nch channels into the app buffer.
+			 *
+			 * Skip CIP[2] + SPH[1] = payload[3]; PCM starts
+			 * at payload[4] (= CIP_HEADER_QUADLETS + 2).
 			 */
 			frames = dg00x_frames_this_packet(ps);
 			dbs = ps->device_channels + 1;
@@ -562,7 +587,7 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 			dot_read_pcm(&ps->dot,
 			    (int32_t *)ps->substream->runtime->dma_area +
 			    (ps->hwptr / 4),
-			    payload + CIP_HEADER_QUADLETS + 1,
+			    payload + CIP_HEADER_QUADLETS + 2,
 			    nch, frames, dbs);
 
 			bytes = frames * nch * 4;
@@ -629,36 +654,24 @@ dg00x_streaming_init(struct snd_dg00x *dg00x)
 	/*
 	 * Program the isochronous channel numbers AND the CIP tag into
 	 * the xferq flags.
-	 *
-	 * FWXFERQ_CHTAGMASK (0xff) covers the 8-bit chtag field that
-	 * fwohci puts in the isochronous packet header: bits 6-7 carry
-	 * the 2-bit TAG, bits 0-5 the channel (same layout as the
-	 * FreeBSD fwdev.c ISO API: it->flag |= (tag << 6)).
-	 *
-	 * IEC 61883-6 (AMDTP/CIP) streams MUST use TAG=1 — the Linux
-	 * reference driver transmits with TAG_CIP and receives with
-	 * FW_ISO_CONTEXT_MATCH_TAG1, and the Digi 002/003's isochronous
-	 * receiver filters on it.  With tag left at 0 (as this driver
-	 * did before), the device silently drops every packet we send:
-	 * the host fill path advances and the tx_peaks meter moves, but
-	 * nothing ever reaches the DACs (and the device never starts
-	 * transmitting, since it only does so after receiving host
-	 * packets).
-	 *
-	 *   - TX: fwohci_txbufdb() uses  chtag = xferq->flag & 0xff   to
-	 *     build the transmitted iso header (tag+channel).
-	 *   - RX: fwohci_irx_enable() uses tag = (flag >> 6) & 3 and
-	 *     ich = flag & 0x3f for the OHCI IRMATCH register (tagbit[1]
-	 *     = bit 29, identical to Linux's (TAG1 << 28)).
 	 */
-	ISO_XFERQ(&dg00x->iso_tx)->flag =
-	    (ISO_XFERQ(&dg00x->iso_tx)->flag & ~FWXFERQ_CHTAGMASK) |
-	    (DG00X_ISO_TAG_CIP |
-	     (dg00x->tx_resources.channel & 0x3f));
-	ISO_XFERQ(&dg00x->iso_rx)->flag =
-	    (ISO_XFERQ(&dg00x->iso_rx)->flag & ~FWXFERQ_CHTAGMASK) |
-	    (DG00X_ISO_TAG_CIP |
-	     (dg00x->rx_resources.channel & 0x3f));
+	{
+		uint32_t tx_flag = (DG00X_ISO_TAG_CIP |
+		    (dg00x->tx_resources.channel & 0x3f));
+		uint32_t rx_flag = (DG00X_ISO_TAG_CIP |
+		    (dg00x->rx_resources.channel & 0x3f));
+
+		printf("digi00x: streaming_init — TX flag=0x%02x (tag=%d ch=%d), "
+		    "RX flag=0x%02x (tag=%d ch=%d), node_id=%d\n",
+		    tx_flag, (tx_flag >> 6) & 3, tx_flag & 0x3f,
+		    rx_flag, (rx_flag >> 6) & 3, rx_flag & 0x3f,
+		    dg00x->fwdev->fc->nodeid);
+
+		ISO_XFERQ(&dg00x->iso_tx)->flag =
+		    (ISO_XFERQ(&dg00x->iso_tx)->flag & ~FWXFERQ_CHTAGMASK) | tx_flag;
+		ISO_XFERQ(&dg00x->iso_rx)->flag =
+		    (ISO_XFERQ(&dg00x->iso_rx)->flag & ~FWXFERQ_CHTAGMASK) | rx_flag;
+	}
 
 	return (0);
 }
@@ -724,6 +737,11 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stvalid);
 	dot_reset_state(&ps->dot);
 
+	printf("digi00x: start_tx — rate=%u, pcm_ch=%u, dev_ch=%u, "
+	    "dbs=%u, dmach=%d, filling %d chunks\n",
+	    ps->rate, ps->pcm_channels, ps->device_channels,
+	    ps->device_channels + 1, ch->dmach, DG00X_ISO_NCHUNKS);
+
 	for (i = 0; i < DG00X_ISO_NCHUNKS; i++) {
 		bx = STAILQ_FIRST(&xferq->stfree);
 		if (bx == NULL)
@@ -732,12 +750,30 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 
 		dg00x_fill_tx_chunk(dg00x, xferq, bx);
 
+		/* Dump first packet's full payload for verification */
+		if (i == 0) {
+			uint32_t *pl = (uint32_t *)
+			    ((struct fw_pkt *)fwdma_v_addr(xferq->buf,
+				bx->poffset))->mode.stream.payload;
+			printf("digi00x: start_tx CIP q0=0x%08x q1=0x%08x\n",
+			    be32toh(pl[0]), be32toh(pl[1]));
+			printf("digi00x: start_tx SPH[2]=0x%08x MIDI[3]=0x%08x "
+			    "PCM[4]=0x%08x [5]=0x%08x [6]=0x%08x\n",
+			    be32toh(pl[2]), be32toh(pl[3]),
+			    be32toh(pl[4]), be32toh(pl[5]), be32toh(pl[6]));
+		}
+
 		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
 	}
 	FW_GUNLOCK(fc);
 
 	/* Single itx_enable: allocates descriptors + starts DMA */
-	return (fc->itx_enable(fc, ch->dmach));
+	{
+		int ret = fc->itx_enable(fc, ch->dmach);
+		printf("digi00x: start_tx — itx_enable returned %d, "
+		    "xferq flag=0x%08x\n", ret, xferq->flag);
+		return (ret);
+	}
 }
 
 int
@@ -747,21 +783,22 @@ dg00x_streaming_start_rx(struct snd_dg00x *dg00x)
 	struct firewire_comm *fc;
 	int err;
 
-	if (ch->dmach < 0)
+	if (ch->dmach < 0) {
+		printf("digi00x: start_rx — dmach < 0, bailing\n");
 		return (-ENODEV);
+	}
 
 	dot_reset_state(&dg00x->pcm_capture.dot);
 	fc = ISO_FC(ch);
 
-	/*
-	 * With FWXFERQ_HANDLER set, fwohci_irx_enable() skips its
-	 * internal FW_GLOCK (the handler is expected to run under it),
-	 * so we must hold it here to protect the stfree/stdma queue
-	 * manipulation against the taskqueue RX path.
-	 */
 	FW_GLOCK(fc);
 	err = fc->irx_enable(fc, ch->dmach);
 	FW_GUNLOCK(fc);
+
+	printf("digi00x: start_rx — irx_enable(dmach=%d) returned %d, "
+	    "cap.rate=%u cap.dev_ch=%u\n",
+	    ch->dmach, err,
+	    dg00x->pcm_capture.rate, dg00x->pcm_capture.device_channels);
 
 	return (err);
 }
@@ -884,6 +921,14 @@ dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
 	 * chunks from stdma → stfree. */
 	FW_GLOCK(fc);
 
+	/* Debug: count stfree BEFORE dequeue */
+	{
+		static int total_calls = 0;
+		int nfree_before = 0;
+		struct fw_bulkxfer *tmp;
+		total_calls++;
+		STAILQ_FOREACH(tmp, &xferq->stfree, link) nfree_before++;
+
 	while ((bx = STAILQ_FIRST(&xferq->stfree)) != NULL) {
 		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
 
@@ -891,6 +936,16 @@ dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
 
 		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
 		refilled++;
+	}
+
+		if (total_calls <= 10 || (total_calls <= 2000 && (total_calls % 100) == 0)) {
+			printf("digi00x: refill #%d — stfree_before=%d refilled=%d "
+			    "hwptr=%lu dma_area[0]=%d\n",
+			    total_calls, nfree_before, refilled,
+			    (unsigned long)ps->hwptr,
+			    ps->substream && ps->substream->runtime ?
+			    ((int32_t *)ps->substream->runtime->dma_area)[0] : -1);
+		}
 	}
 
 	FW_GUNLOCK(fc);

@@ -171,6 +171,19 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	ps->tx_dbc = 0;
 	ps->active = true;
 
+	/*
+	 * Sync runtime->dma_area from ch->buffer->buf.  The OSS layer
+	 * may have reallocated the buffer via chn_resizebuf() after
+	 * the ALSA runtime was first set up, making the old dma_area
+	 * pointer stale.  Without this sync, the driver reads from the
+	 * old (zero-filled) buffer while the OSS app writes audio to
+	 * the new buffer — resulting in DOT-encoded silence on the wire.
+	 */
+	substream->runtime->dma_area = ch->buffer->buf;
+	substream->runtime->dma_addr = ch->buffer->buf_addr;
+	substream->runtime->dma_bytes = ch->buffer->bufsize;
+	ps->buffer_bytes = ch->buffer->bufsize;
+
 	/* AMDTP fractional framing: FireWire runs at 8000 ISO cycles/sec.
 	 * Each packet must carry rate/8000 frames on average.  The
 	 * remainder is distributed via a modulo accumulator so that
@@ -183,6 +196,34 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	dot_reset_state(&ps->dot);
 
 	dg00x->active_streams++;
+
+	printf("digi00x: stream_start — dir=%s rate=%u pcm_ch=%u dev_ch=%u "
+	    "period_bytes=%u buffer_bytes=%u\n",
+	    direction == SNDRV_PCM_STREAM_PLAYBACK ? "PB" : "CAP",
+	    ps->rate, ps->pcm_channels, ps->device_channels,
+	    ps->period_bytes, ps->buffer_bytes);
+	printf("digi00x: stream_start — dma_area=%p dma_bytes=%zu "
+	    "ch->buffer->buf=%p ch->buffer->bufsize=%u\n",
+	    substream->runtime->dma_area, substream->runtime->dma_bytes,
+	    ch->buffer->buf, ch->buffer->bufsize);
+
+	/*
+	 * When playback starts, clone its rate and channel geometry
+	 * into the capture stream so the RX DMA handler (which we
+	 * start alongside TX for the bidirectional session the Digi
+	 * 002/003 requires) has valid framing parameters even when
+	 * no capture app is running.  The handler won't write to the
+	 * capture DMA buffer unless capture is independently active.
+	 */
+	if (direction == SNDRV_PCM_STREAM_PLAYBACK) {
+		struct dg00x_pcm_stream *cap = &dg00x->pcm_capture;
+		cap->rate = ps->rate;
+		cap->fdf = ps->fdf;
+		cap->device_channels = ps->device_channels;
+		cap->frames_per_packet = ps->frames_per_packet;
+		cap->frame_remainder = ps->frame_remainder;
+		cap->frame_cycle = 0;
+	}
 
 	return (0);
 }
@@ -361,6 +402,16 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		{
+			enum snd_dg00x_clock clk;
+			unsigned int rate;
+			dg00x_get_clock(dg00x, &clk);
+			dg00x_get_local_rate(dg00x, &rate);
+			printf("digi00x: pcm_trigger START — stream=%s "
+			    "clock=%d rate=%u\n",
+			    substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
+			    "PLAYBACK" : "CAPTURE", (int)clk, rate);
+		}
 		was_idle = (dg00x->active_streams == 0);
 
 		/* Allocate isochronous resources if not already done */
@@ -405,17 +456,29 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		}
 
 		/*
-		 * Start the ISO DMA.  The callout is NOT running yet,
-		 * so there is no risk of the callout racing with
-		 * dg00x_streaming_start_tx's queue manipulation.
+		 * Start the ISO DMA.  The Digi 002/003 requires a
+		 * bidirectional isochronous session — its audio
+		 * pipeline (DAC routing) only activates when the
+		 * device can both receive packets from the host AND
+		 * have its own transmitter active.  The Linux driver
+		 * always starts both RX and TX streams together via
+		 * amdtp_domain_start(), and the device has a
+		 * documented quirk: "No packets are transmitted
+		 * without receiving packets".
 		 *
-		 * Handlers won't fire until itx/irx_enable is called
-		 * below, so it's safe that ps->active is already set.
+		 * When playback starts, we start TX for audio output
+		 * AND RX to satisfy the device's bidirectional
+		 * requirement (the RX DMA context runs but its
+		 * handler is a no-op when ps->active is false).
+		 * When capture starts, we only start RX.
 		 */
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			err = dg00x_streaming_start_tx(dg00x);
-		else
+			if (err == 0)
+				err = dg00x_streaming_start_rx(dg00x);
+		} else {
 			err = dg00x_streaming_start_rx(dg00x);
+		}
 		if (err < 0) {
 			if (was_idle)
 				dg00x_finish_session(dg00x);
@@ -453,10 +516,19 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		dg00x_pcm_stream_stop(dg00x, substream->stream);
 
 		/* Now stop ISO DMA safely — the callout has bailed out */
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			dg00x_streaming_stop_tx(dg00x);
-		else
+			/*
+			 * If the capture stream is not independently
+			 * active, stop the RX DMA context that was
+			 * started alongside TX for bidirectional
+			 * operation.
+			 */
+			if (!dg00x->pcm_capture.active)
+				dg00x_streaming_stop_rx(dg00x);
+		} else {
 			dg00x_streaming_stop_rx(dg00x);
+		}
 
 		/*
 		 * Only finish the hardware session when ALL streams have

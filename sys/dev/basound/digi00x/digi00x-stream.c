@@ -278,6 +278,8 @@ dg00x_finish_session(struct snd_dg00x *dg00x)
 	if (dg00x->fwdev == NULL)
 		return;
 
+	printf("digi00x: finish_session — stopping streaming\n");
+
 	/* Write 0x00000003 to streaming set (stop) */
 	dg00x_write_quad(dg00x->fwdev,
 			 DG00X_ADDR_BASE + DG00X_OFFSET_STREAMING_SET,
@@ -290,6 +292,8 @@ dg00x_finish_session(struct snd_dg00x *dg00x)
 	/* Allow hardware to quiesce after session end.
 	 * pause() sleeps rather than busy-spinning. */
 	pause("dg00xfe", hz / 20);	/* ~50 ms */
+
+	printf("digi00x: finish_session — done\n");
 }
 
 int
@@ -304,32 +308,24 @@ dg00x_begin_session(struct snd_dg00x *dg00x, int tx_ch, int rx_ch)
 	err = dg00x_write_quad(dg00x->fwdev,
 			       DG00X_ADDR_BASE + DG00X_OFFSET_ISOC_CHANNELS,
 			       reg);
-	if (err != 0)
+	if (err != 0) {
+		printf("digi00x: begin_session ISOC_CHANS failed: %d\n", err);
 		return (err);
+	}
 
 	/* Read current streaming state */
 	err = dg00x_read_quad(dg00x->fwdev,
 			      DG00X_ADDR_BASE + DG00X_OFFSET_STREAMING_STATE,
 			      &reg);
-	if (err != 0)
+	if (err != 0) {
+		printf("digi00x: begin_session STATE read failed: %d\n", err);
 		return (err);
+	}
 
 	curr = be32toh(reg);
 	if (curr == 0)
 		curr = 2;
 
-	/*
-	 * Decrement first, then write while > 0.  The Digi hardware counts
-	 * the streaming session down from the value written to STREAMING_SET;
-	 * the last write must be 1 — writing 0 puts the device back to the
-	 * idle state and cancels the session before it ever starts (which
-	 * is why the previous loop, that wrote 1 followed by 0, left the
-	 * device silent even though the host kept filling TX chunks).
-	 *
-	 * This mirrors the Linux digi00x begin_session() exactly:
-	 *   curr = state; if (curr == 0) curr = 2; curr--;
-	 *   while (curr > 0) { write curr; msleep(20); curr--; }
-	 */
 	curr--;
 	while (curr > 0) {
 		err = dg00x_write_quad(dg00x->fwdev,
@@ -337,17 +333,15 @@ dg00x_begin_session(struct snd_dg00x *dg00x, int tx_ch, int rx_ch)
 				       htobe32(curr));
 		if (err != 0)
 			break;
-
-		/*
-		 * The hardware needs time between successive countdown
-		 * writes.  Use pause() (which sleeps via tsleep) instead
-		 * of DELAY() (which busy-spins the CPU).  CHN_LOCK is not
-		 * held here (basound_chan_trigger releases it before
-		 * calling us), so sleeping is safe.
-		 */
 		pause("dg00xbs", hz / 50);	/* ~20 ms */
 		curr--;
 	}
+
+	if (err == 0)
+		printf("digi00x: begin_session OK (tx=%d rx=%d state=0x%08x)\n",
+		    tx_ch, rx_ch, be32toh(reg));
+	else
+		printf("digi00x: begin_session failed: %d\n", err);
 
 	return (err);
 }
@@ -360,12 +354,13 @@ int
 dg00x_alloc_isoc_resources(struct snd_dg00x *dg00x)
 {
 	/*
-	 * TODO: Use FreeBSD's fw_iso_resource_alloc or equivalent
-	 * to allocate isochronous channels and bandwidth.
-	 * For now, we hardcode channel numbers.
+	 * Hardcode isochronous channel numbers.
+	 * Channel 0 is often reserved; use 2 and 3 to avoid
+	 * potential bus conflicts.  The Digi 002/003 stores
+	 * these via ISOC_CHANNELS register during begin_session.
 	 */
-	dg00x->tx_resources.channel = 0;
-	dg00x->rx_resources.channel = 1;
+	dg00x->tx_resources.channel = 2;
+	dg00x->rx_resources.channel = 3;
 	dg00x->tx_resources.generation = 0;
 	dg00x->rx_resources.generation = 0;
 	return (0);
