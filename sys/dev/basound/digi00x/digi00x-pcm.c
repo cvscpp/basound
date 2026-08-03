@@ -98,7 +98,13 @@ dg00x_pcm_stream_cb(void *arg)
 	 * layer will check hwptr via pcm_pointer. */
 	if (ps_pb->active && ps_pb->substream != NULL &&
 	    ps_pb->period_accum >= ps_pb->period_bytes) {
+		static int pel_count = 0;
 		ps_pb->period_accum -= ps_pb->period_bytes;
+		if (++pel_count <= 5)
+			printf("digi00x: callout — period_elapsed PLAYBACK "
+			    "(period=%u hwptr=%lu count=%d)\n",
+			    ps_pb->period_bytes, (unsigned long)ps_pb->hwptr,
+			    pel_count);
 		snd_pcm_period_elapsed(ps_pb->substream);
 	}
 	if (ps_cap->active && ps_cap->substream != NULL &&
@@ -177,7 +183,7 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	 * the ALSA runtime was first set up, making the old dma_area
 	 * pointer stale.  Without this sync, the driver reads from the
 	 * old (zero-filled) buffer while the OSS app writes audio to
-	 * the new buffer — resulting in DOT-encoded silence on the wire.
+	 * the new buffer.
 	 */
 	substream->runtime->dma_area = ch->buffer->buf;
 	substream->runtime->dma_addr = ch->buffer->buf_addr;

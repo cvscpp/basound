@@ -491,13 +491,6 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	{
 		const int32_t *sp = (const int32_t *)ps->substream->runtime->dma_area +
 		    (ps->hwptr / 4);
-		static int dbg_dump = 0;
-		if (dbg_dump < 5) {
-			printf("digi00x: fill_chunk hwptr=%lu raw samples[0..3] = %d %d %d %d\n",
-			    (unsigned long)ps->hwptr,
-			    sp[0], sp[1], sp[2], sp[3]);
-			dbg_dump++;
-		}
 		dot_write_pcm_padded(&ps->dot,
 		    &payload[CIP_HEADER_QUADLETS + 2],
 		    sp, nch, ps->device_channels, frames, dbs);
@@ -921,14 +914,6 @@ dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
 	 * chunks from stdma → stfree. */
 	FW_GLOCK(fc);
 
-	/* Debug: count stfree BEFORE dequeue */
-	{
-		static int total_calls = 0;
-		int nfree_before = 0;
-		struct fw_bulkxfer *tmp;
-		total_calls++;
-		STAILQ_FOREACH(tmp, &xferq->stfree, link) nfree_before++;
-
 	while ((bx = STAILQ_FIRST(&xferq->stfree)) != NULL) {
 		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
 
@@ -936,16 +921,6 @@ dg00x_streaming_refill_tx(struct snd_dg00x *dg00x)
 
 		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
 		refilled++;
-	}
-
-		if (total_calls <= 10 || (total_calls <= 2000 && (total_calls % 100) == 0)) {
-			printf("digi00x: refill #%d — stfree_before=%d refilled=%d "
-			    "hwptr=%lu dma_area[0]=%d\n",
-			    total_calls, nfree_before, refilled,
-			    (unsigned long)ps->hwptr,
-			    ps->substream && ps->substream->runtime ?
-			    ((int32_t *)ps->substream->runtime->dma_area)[0] : -1);
-		}
 	}
 
 	FW_GUNLOCK(fc);
