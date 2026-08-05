@@ -98,13 +98,7 @@ dg00x_pcm_stream_cb(void *arg)
 	 * layer will check hwptr via pcm_pointer. */
 	if (ps_pb->active && ps_pb->substream != NULL &&
 	    ps_pb->period_accum >= ps_pb->period_bytes) {
-		static int pel_count = 0;
 		ps_pb->period_accum -= ps_pb->period_bytes;
-		if (++pel_count <= 5)
-			printf("digi00x: callout — period_elapsed PLAYBACK "
-			    "(period=%u hwptr=%lu count=%d)\n",
-			    ps_pb->period_bytes, (unsigned long)ps_pb->hwptr,
-			    pel_count);
 		snd_pcm_period_elapsed(ps_pb->substream);
 	}
 	if (ps_cap->active && ps_cap->substream != NULL &&
@@ -190,6 +184,17 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	substream->runtime->dma_bytes = ch->buffer->bufsize;
 	ps->buffer_bytes = ch->buffer->bufsize;
 
+	/*
+	 * Clear CHN_F_MMAP on the OSS channel.  When set (e.g.
+	 * by OSS mmap syscall), chn_wrfeed calls sndbuf_acquire
+	 * on bufsoft — marking all of it "ready" with zeros —
+	 * then feeds those zeros into bufhard, destroying audio.
+	 * Our fill_chunk reads from bufhard directly via sndbuf
+	 * API, and the OSS write path (bufsoft→feeder→bufhard)
+	 * handles the data flow.  CHN_F_MMAP is destructive here.
+	 */
+	ch->channel->flags &= ~CHN_F_MMAP;
+
 	/* AMDTP fractional framing: FireWire runs at 8000 ISO cycles/sec.
 	 * Each packet must carry rate/8000 frames on average.  The
 	 * remainder is distributed via a modulo accumulator so that
@@ -204,10 +209,11 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	dg00x->active_streams++;
 
 	printf("digi00x: stream_start — dir=%s rate=%u pcm_ch=%u dev_ch=%u "
-	    "period_bytes=%u buffer_bytes=%u\n",
+	    "period_bytes=%u buffer_bytes=%u format=0x%08x bps=%u ready=%d\n",
 	    direction == SNDRV_PCM_STREAM_PLAYBACK ? "PB" : "CAP",
 	    ps->rate, ps->pcm_channels, ps->device_channels,
-	    ps->period_bytes, ps->buffer_bytes);
+	    ps->period_bytes, ps->buffer_bytes, ch->format,
+	    AFMT_BPS(ch->format), ch->buffer ? sndbuf_getready(ch->buffer) : -1);
 	printf("digi00x: stream_start — dma_area=%p dma_bytes=%zu "
 	    "ch->buffer->buf=%p ch->buffer->bufsize=%u\n",
 	    substream->runtime->dma_area, substream->runtime->dma_bytes,
@@ -341,14 +347,14 @@ pcm_hw_params(struct snd_pcm_substream *substream,
 	/* Set sample rate on device */
 	dg00x_set_local_rate(dg00x, rate);
 
-	return snd_pcm_lib_malloc_pages(substream,
-					params_buffer_bytes(hw_params));
+	return 0;
 }
 
 static int
 pcm_hw_free(struct snd_pcm_substream *substream)
 {
-	return snd_pcm_lib_free_pages(substream);
+	/* Buffer is managed by basound_chan_init — nothing to free. */
+	return 0;
 }
 
 static int
@@ -451,9 +457,29 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		 * state that triggers a bus reset or panic.
 		 */
 		if (was_idle) {
+			/*
+			 * dg00x_begin_session()'s (tx_ch, rx_ch) arguments
+			 * follow the Linux driver's DEVICE-centric naming:
+			 * tx_ch is the channel the DEVICE transmits on (i.e.
+			 * the channel our host must receive/capture on), and
+			 * rx_ch is the channel the DEVICE receives on (i.e.
+			 * the channel our host must transmit/playback on).
+			 *
+			 * Our own dg00x->tx_resources / iso_tx are HOST-
+			 * centric (tx = host transmits = playback), which is
+			 * the opposite convention.  Passing them in that
+			 * order swaps the two channel numbers in the
+			 * DG00X_OFFSET_ISOC_CHANNELS register, telling the
+			 * device to listen for playback on the channel our
+			 * host actually uses for capture (and vice versa) —
+			 * so the device never receives the playback stream
+			 * it is being sent, producing silence even though
+			 * well-formed audio is on the wire.  Swap here to
+			 * match the register's expected field order.
+			 */
 			err = dg00x_begin_session(dg00x,
-			    dg00x->tx_resources.channel,
-			    dg00x->rx_resources.channel);
+			    dg00x->rx_resources.channel,
+			    dg00x->tx_resources.channel);
 			if (err < 0) {
 				dg00x_pcm_stream_stop(dg00x,
 				    substream->stream);
@@ -479,13 +505,19 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		 * When capture starts, we only start RX.
 		 */
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-			err = dg00x_streaming_start_tx(dg00x);
+			err = dg00x_streaming_start_rx(dg00x);
 			if (err == 0)
-				err = dg00x_streaming_start_rx(dg00x);
+				err = dg00x_streaming_start_tx(dg00x);
 		} else {
 			err = dg00x_streaming_start_rx(dg00x);
 		}
 		if (err < 0) {
+			if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+				dg00x_streaming_stop_tx(dg00x);
+				dg00x_streaming_stop_rx(dg00x);
+			} else {
+				dg00x_streaming_stop_rx(dg00x);
+			}
 			if (was_idle)
 				dg00x_finish_session(dg00x);
 			dg00x_pcm_stream_stop(dg00x,
@@ -559,7 +591,6 @@ pcm_pointer(struct snd_pcm_substream *substream)
 
 	ps = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) ?
 	     &dg00x->pcm_playback : &dg00x->pcm_capture;
-
 	return ps->hwptr;
 }
 

@@ -7,8 +7,8 @@
  *
  * DOT encoding: each 32-bit PCM sample has byte 2 XOR-scrambled using
  * a stateful table-driven transformation discovered by Robin Gareus
- * and Damien Zammit in 2012.  Each data block has an extra quadlet at
- * the start for MIDI messages, followed by pcm_channels quadlets of
+ * and Damien Zammit in 2012.  Each data block starts with one MIDI
+ * quadlet, followed by pcm_channels quadlets of
  * DOT-encoded audio data.
  *
  * TX (playback) queue flow:
@@ -36,10 +36,14 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 
+#include <dev/sound/pcm/sound.h>
+
 #include <sound/core.h>
 #include <sound/pcm.h>
 
 #include "digi00x.h"
+#include "alsa_pcm_bsd.h"
+#include "basound_debug.h"
 
 MALLOC_DECLARE(M_ALSA);
 MALLOC_DEFINE(M_DG00X_ISO, "dg00x_iso", "digi00x ISO DMA buffers");
@@ -84,21 +88,24 @@ dg00x_build_cip_header(uint32_t *hdr, unsigned int node_id,
 		       unsigned int fmt, unsigned int fdf, unsigned int syt)
 {
 	/*
-	 * CIP header matching Linux generate_cip_header() exactly.
-	 * Linux native word bit positions (converted to wire via cpu_to_be32):
-	 *   q0: SPH=0x40000000 (bit 30), SID=(node_id<<24) (bits 29-24),
-	 *       DBS=(dbs<<16) (bits 23-16), DBC (bits 7-0)
-	 *   q1: EOH=0x80000000 (bit 31), FMT=(fmt<<25) (bits 30-25),
-	 *       FDF=(fdf<<16) (bits 23-16), SYT (bits 15-0)
+	 * Match Linux generate_cip_header() exactly for Digi 00x.
+	 *
+	 * The Digi 002/003 uses SPH=0, so there is no extra source packet
+	 * header quadlet between the CIP header and the data blocks.
+	 *
+	 *   q0: SID=(node_id<<24) (bits 29-24),
+	 *       DBS=(dbs<<16)     (bits 23-16), DBC (bits 7-0)
+	 *   q1: EOH=0x80000000    (bit 31),
+	 *       FMT=(fmt<<24)     (bits 29-24),
+	 *       FDF=(fdf<<16)     (bits 23-16), SYT (bits 15-0)
 	 */
 	hdr[0] = htobe32(
-	    0x40000000u |			/* SPH */
 	    ((node_id & 0x3f) << 24) |		/* SID */
 	    ((dbs & 0xff) << 16) |		/* DBS */
 	    (dbc & 0xff));			/* DBC */
 	hdr[1] = htobe32(
 	    (1u << 31) |			/* EOH */
-	    (((unsigned int)fmt & 0x3f) << 25) |	/* FMT */
+	    (((unsigned int)fmt & 0x3f) << 24) |	/* FMT */
 	    ((fdf & 0xff) << 16) |		/* FDF */
 	    (syt & 0xffff));			/* SYT */
 }
@@ -333,7 +340,7 @@ dg00x_frames_this_packet(struct dg00x_pcm_stream *ps)
  *
  * Segment layout (as expected by fwohci_txbufdb):
  *   [0..3]:   fw_isohdr quadlet (sy, len) — fwohci reads len for DMA count
- *   [4..7]:   CIP header quadlet 0 (SID, DBS, FN, QPC, SPH, DBC)
+ *   [4..7]:   CIP header quadlet 0 (SID, DBS, DBC)
  *   [8..11]:  CIP header quadlet 1 (EOH, FMT, FDF, SYT)
  *   [12..]:   Data blocks: [MIDI] [PCM×nch] [MIDI] [PCM×nch] …
  *             where MIDI = 0x00000080 (memory order → 0x80 on the wire,
@@ -353,8 +360,11 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		    struct fw_bulkxfer *bx)
 {
 	struct dg00x_pcm_stream *ps = &dg00x->pcm_playback;
+	struct basound_chan *txch = ps->substream != NULL ?
+	    ps->substream->private_data : NULL;
 	unsigned int dbs = ps->device_channels + 1;
 	unsigned int nch, frames, dbc;
+	unsigned int sample_bytes;
 	unsigned int bytes, pkt_len;
 	struct fw_pkt *fp;
 	uint32_t *payload;
@@ -372,136 +382,162 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	dbc = ps->tx_dbc;
 	ps->tx_dbc = (dbc + frames) & 0xff;
 
+	sample_bytes = (txch != NULL) ? AFMT_BPS(txch->format) : 4;
+	if (sample_bytes != 2 && sample_bytes != 4)
+		sample_bytes = 4;
+
+	bytes = frames * nch * sample_bytes;
+
 	/*
 	 * Total payload after the 8-byte isochronous header:
-	 *   CIP header (8) + SPH timestamp (4) + frames * dbs * 4
-	 * When SPH=1 (non-blocking AMDTP), an extra source packet
-	 * header quadlet is required after the CIP header and before
-	 * the first data block.  Without it, all data is shifted by
-	 * one quadlet and the device's DOT decoder produces silence.
+	 *   CIP header (8) + frames * dbs * 4
 	 */
-	pkt_len = 12 + frames * dbs * 4;
+	pkt_len = 8 + frames * dbs * 4;
 
 	/* Get pointer to the DMA buffer segment for this chunk */
 	fp = (struct fw_pkt *)fwdma_v_addr(xferq->buf, bx->poffset);
 	if (fp == NULL)
 		return;
 
-	/*
-	 * Set the isochronous header quadlet.
-	 *
-	 * fw_pkt.stream layout as consumed by fwohci (see fw_pkt in
-	 * <dev/firewire/firewire.h> and fwohci_txbufdb()):
-	 *   bits [16:31] = len   (payload bytes after the iso header)
-	 *   bits [8:15]  = chtag (overridden by fwohci to the channel)
-	 *   bits [4:7]   = tcode (overridden by fwohci to 0xa)
-	 *   bits [0:3]   = sy
-	 *
-	 * fwohci_txbufdb() copies fp->mode.stream.len (bits 16-31) into
-	 * both the OHCI isochronous transmit header and the DMA descriptor
-	 * count (db[2].cmd), so it MUST contain the real payload length.
-	 *
-	 * Writing pkt_len to bits [0:15] (the IEEE-1394 wire layout)
-	 * instead made bits 16-31 read back 0x0a00 = 2560.  The controller
-	 * then transmitted 2560 bytes per packet — more than the 2048-byte
-	 * DMA segment — overrunning the buffer, aborting the IT context and
-	 * freezing playback after the first few milliseconds.
-	 */
 	fp->mode.stream.len = pkt_len;
-
-	/*
-	 * Payload starts at fp->mode.stream.payload (offset 4 in segment).
-	 * Layout: [CIP q0] [CIP q1] [SPH] [MIDI] [PCM×nch] [MIDI] …
-	 *
-	 * CIP_HEADER_QUADLETS = 2 (the two CIP header quadlets).
-	 * When SPH=1, the SPH timestamp occupies payload[2], so MIDI
-	 * markers and PCM data start at payload[3] (= CIP_HEADER_QUADLETS + 1).
-	 */
 	payload = (uint32_t *)fp->mode.stream.payload;
-
-	/*
-	 * SPH timestamp quadlet: required when SPH=1 in non-blocking
-	 * AMDTP mode. Linux writes 0; the device ignores the value.
-	 */
-	payload[CIP_HEADER_QUADLETS] = 0x00000000;
 
 	dg00x_build_cip_header(&payload[0],
 	    dg00x->fwdev->fc->nodeid,
 	    dbs, dbc,
 	    CIP_FMT_AM, ps->fdf, 0xffff);
 
-	/*
-	 * MIDI marker quadlet at the start of every data block.
-	 * Data blocks start at payload[CIP_HEADER_QUADLETS + 1]
-	 * (offset 3: CIP[2] + SPH[1]).
-	 *
-	 * The value must put 0x80 in the FIRST byte on the wire (as in the
-	 * Linux driver's write_midi_messages(): b[0] = 0x80).  Payload is
-	 * DMA'd in memory order, so on a little-endian host the native
-	 * value is 0x00000080 (memory bytes 80 00 00 00).  Writing
-	 * 0x80000000 instead produced wire bytes 00 00 00 80 — reversed.
-	 */
 	for (i = 0; i < frames; i++)
-		payload[CIP_HEADER_QUADLETS + 1 + i * dbs] = 0x00000080;
+		payload[CIP_HEADER_QUADLETS + i * dbs] = 0x00000080;
 
 	/*
-	 * Update the per-channel output (TX) peak meter, 24-bit scale.
-	 * The source samples are 32-bit with 24-bit audio in the top
-	 * bits (S32_LE), matching the DOT encoder's >> 8.  Channels
-	 * beyond the app's count are padded silence → peak 0, so this
-	 * shows exactly which output channels carry audio.
-	 *
-	 * Written without dg00x->lock (start_tx fills under FW_GLOCK
-	 * only); the tx_peaks sysctl reads the array atomically.
+	 * Read PCM data from the DMA ring at ps->hwptr, but do not call
+	 * sndbuf_dispose() here.  The FreeBSD PCM layer consumes bufhard
+	 * in chn_dmaupdate() after pcm_pointer() reports hwptr progress.
+	 * Disposing here would consume the same bytes twice.
 	 */
 	{
-		const int32_t *s = (const int32_t *)
-		    ps->substream->runtime->dma_area + (ps->hwptr / 4);
-		unsigned int c, f;
+		struct snd_dbuf *sb = txch ? txch->buffer : NULL;
+		uint8_t srcbuf[18 * 12 * 4];
+		int32_t tmpbuf[18 * 12];
+		const int32_t *sp;
+		unsigned int source_off = ps->hwptr;
+		unsigned int ready_bytes = 0;
+		unsigned int pending_bytes = 0;
+		bool zero_fill = false;
+		static int zero_dbg;
+		static int data_dbg;
 
-		for (c = 0; c < ps->device_channels; c++) {
-			uint32_t pk = 0;
+		if (sb != NULL) {
+			unsigned int rp = sndbuf_getreadyptr(sb);
 
-			if (c < nch) {
-				for (f = 0; f < frames; f++) {
-					int32_t v = s[f * nch + c] >> 8;
-					uint32_t a = (v < 0) ? (uint32_t)(-v) :
-					    (uint32_t)v;
-					if (a > pk)
-						pk = a;
-				}
-			}
-			if (pk > atomic_load_acq_32(&ps->tx_peak[c]))
-				atomic_store_rel_32(&ps->tx_peak[c], pk);
+			ready_bytes = sndbuf_getready(sb);
+			if (source_off >= rp)
+				pending_bytes = source_off - rp;
+			else
+				pending_bytes = ps->buffer_bytes - rp + source_off;
+
+			if (pending_bytes > ready_bytes ||
+			    ready_bytes - pending_bytes < bytes)
+				zero_fill = true;
+		} else {
+			zero_fill = true;
 		}
-	}
 
-	/* DOT-encode PCM data.  PCM starts at payload[CIP+2] (after CIP[2] +
-	 * SPH[1] + MIDI[1]).  dbs is the stride between consecutive data
-	 * blocks (MIDI + PCM).
-	 *
-	 * The Digi 002/003 always carries its full channel complement per
-	 * data block (18 at 44.1/48 kHz, 10 at 88.2/96 kHz), so encode
-	 * device_channels quadlets per frame: the app's nch channels are
-	 * mapped to the first channels and the remainder are dot-encoded
-	 * silence.  This keeps the encoder/decoder DOT state in sync —
-	 * transmitting only the app channel count makes the device's DOT
-	 * decoder lose sync and produces silence on all outputs.
-	 */
-	{
-		const int32_t *sp = (const int32_t *)ps->substream->runtime->dma_area +
-		    (ps->hwptr / 4);
+		/*
+		 * Debug test tone: synthesize audio directly instead of
+		 * reading the DMA ring, so wire-level output can be
+		 * verified independently of whatever data (or silence,
+		 * e.g. `dd if=/dev/zero`) userspace happens to be writing.
+		 * See hw.basound.debug.test_tone sysctl.
+		 */
+		if (basound_debug_tone_enabled()) {
+			basound_debug_tone_fill_s32le(tmpbuf, frames, nch,
+			    ps->rate);
+			sp = tmpbuf;
+			zero_fill = false;
+		} else if (zero_fill) {
+			if (zero_dbg < 8) {
+				printf("digi00x: tx zero_fill fmt=0x%08x bps=%u "
+				    "ready=%u pending=%u source_off=%u bytes=%u\n",
+				    txch ? txch->format : 0, sample_bytes,
+				    ready_bytes, pending_bytes, source_off, bytes);
+				zero_dbg++;
+			}
+			memset(tmpbuf, 0, sizeof(tmpbuf));
+			sp = tmpbuf;
+		} else if (sample_bytes == 4 && source_off + bytes <= ps->buffer_bytes) {
+			sp = (const int32_t *)((const uint8_t *)
+			    ps->substream->runtime->dma_area + source_off);
+		} else {
+			unsigned int samples = frames * nch;
+
+			if (source_off + bytes <= ps->buffer_bytes) {
+				memcpy(srcbuf,
+				    (const uint8_t *)ps->substream->runtime->dma_area +
+				    source_off, bytes);
+			} else {
+				unsigned int first = ps->buffer_bytes - source_off;
+				unsigned int second = bytes - first;
+
+				memcpy(srcbuf,
+				    (const uint8_t *)ps->substream->runtime->dma_area +
+				    source_off, first);
+				memcpy(srcbuf + first,
+				    ps->substream->runtime->dma_area, second);
+			}
+
+			if (sample_bytes == 4) {
+				sp = (const int32_t *)srcbuf;
+			} else {
+				const int16_t *src16 = (const int16_t *)srcbuf;
+
+				for (i = 0; i < samples; i++)
+					tmpbuf[i] = ((int32_t)src16[i]) << 8;
+				sp = tmpbuf;
+			}
+		}
+
+		if (!zero_fill && data_dbg < 8) {
+			printf("digi00x: tx source fmt=0x%08x bps=%u ready=%u "
+			    "pending=%u s0=0x%08x s1=0x%08x s2=0x%08x s3=0x%08x\n",
+			    txch ? txch->format : 0, sample_bytes,
+			    ready_bytes, pending_bytes,
+			    (unsigned int)sp[0],
+			    (unsigned int)((frames * nch) > 1 ? sp[1] : 0),
+			    (unsigned int)((frames * nch) > 2 ? sp[2] : 0),
+			    (unsigned int)((frames * nch) > 3 ? sp[3] : 0));
+			data_dbg++;
+		}
+
+		/* Update peak meter from the source data */
+		{
+			unsigned int c, f;
+			for (c = 0; c < ps->device_channels; c++) {
+				uint32_t pk = 0;
+				if (c < nch) {
+					for (f = 0; f < frames; f++) {
+						int32_t v = sp[f * nch + c] >> 8;
+						uint32_t a = (v < 0) ?
+						    (uint32_t)(-v) : (uint32_t)v;
+						if (a > pk) pk = a;
+					}
+				}
+				if (pk > atomic_load_acq_32(&ps->tx_peak[c]))
+					atomic_store_rel_32(&ps->tx_peak[c], pk);
+			}
+		}
+
+		/* DOT-encode into the FireWire DMA segment */
 		dot_write_pcm_padded(&ps->dot,
-		    &payload[CIP_HEADER_QUADLETS + 2],
+		    &payload[CIP_HEADER_QUADLETS + 1],
 		    sp, nch, ps->device_channels, frames, dbs);
 	}
 
-	/* Bytes consumed from the interleaved app buffer */
-	bytes = frames * nch * 4;
+	/* hwptr tracks total bytes consumed for period_elapsed accounting */
 	ps->hwptr += bytes;
 	if (ps->hwptr >= ps->buffer_bytes)
 		ps->hwptr = 0;
-
 	dg00x_pcm_update_position(ps, bytes);
 }
 
@@ -540,7 +576,7 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 	 *
 	 * The first descriptor quadlet of each RX chunk is a dummy that
 	 * absorbs the isochronous packet header, so the segment starts at
-	 * the CIP header: [CIP q0] [CIP q1] [SPH] [MIDI] [PCM×nch] ...
+	 * the CIP header: [CIP q0] [CIP q1] [MIDI] [PCM×nch] ...
 	 *
 	 * This handler runs with FW_GLOCK held (fwohci calls hand()
 	 * while holding it), so the queue manipulation below is safe.
@@ -568,8 +604,8 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 			 * kHz), so stride by device_channels + 1 and copy
 			 * only the first nch channels into the app buffer.
 			 *
-			 * Skip CIP[2] + SPH[1] = payload[3]; PCM starts
-			 * at payload[4] (= CIP_HEADER_QUADLETS + 2).
+			 * Skip CIP[2] + MIDI[1] = payload[2]; PCM starts
+			 * at payload[3] (= CIP_HEADER_QUADLETS + 1).
 			 */
 			frames = dg00x_frames_this_packet(ps);
 			dbs = ps->device_channels + 1;
@@ -580,7 +616,7 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 			dot_read_pcm(&ps->dot,
 			    (int32_t *)ps->substream->runtime->dma_area +
 			    (ps->hwptr / 4),
-			    payload + CIP_HEADER_QUADLETS + 2,
+			    payload + CIP_HEADER_QUADLETS + 1,
 			    nch, frames, dbs);
 
 			bytes = frames * nch * 4;
@@ -672,6 +708,9 @@ dg00x_streaming_init(struct snd_dg00x *dg00x)
 void
 dg00x_streaming_fini(struct snd_dg00x *dg00x)
 {
+	dg00x->tx_use_count = 0;
+	dg00x->rx_use_count = 0;
+
 	if (dg00x->iso_tx.dmach >= 0) {
 		ISO_FC(&dg00x->iso_tx)->itx_disable(
 		    ISO_FC(&dg00x->iso_tx), dg00x->iso_tx.dmach);
@@ -708,6 +747,13 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 
 	if (fc == NULL || xferq == NULL)
 		return (-ENODEV);
+
+	mtx_lock(&dg00x->lock);
+	if (dg00x->tx_use_count++ > 0) {
+		mtx_unlock(&dg00x->lock);
+		return (0);
+	}
+	mtx_unlock(&dg00x->lock);
 
 	/*
 	 * Drain all chunks back to stfree, fill them with audio data,
@@ -750,10 +796,10 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 				bx->poffset))->mode.stream.payload;
 			printf("digi00x: start_tx CIP q0=0x%08x q1=0x%08x\n",
 			    be32toh(pl[0]), be32toh(pl[1]));
-			printf("digi00x: start_tx SPH[2]=0x%08x MIDI[3]=0x%08x "
-			    "PCM[4]=0x%08x [5]=0x%08x [6]=0x%08x\n",
+			printf("digi00x: start_tx MIDI[2]=0x%08x PCM[3]=0x%08x "
+			    "[4]=0x%08x [5]=0x%08x\n",
 			    be32toh(pl[2]), be32toh(pl[3]),
-			    be32toh(pl[4]), be32toh(pl[5]), be32toh(pl[6]));
+			    be32toh(pl[4]), be32toh(pl[5]));
 		}
 
 		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
@@ -765,6 +811,11 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 		int ret = fc->itx_enable(fc, ch->dmach);
 		printf("digi00x: start_tx — itx_enable returned %d, "
 		    "xferq flag=0x%08x\n", ret, xferq->flag);
+		if (ret != 0) {
+			mtx_lock(&dg00x->lock);
+			dg00x->tx_use_count = 0;
+			mtx_unlock(&dg00x->lock);
+		}
 		return (ret);
 	}
 }
@@ -773,7 +824,9 @@ int
 dg00x_streaming_start_rx(struct snd_dg00x *dg00x)
 {
 	struct dg00x_iso_channel *ch = &dg00x->iso_rx;
+	struct fw_xferq *xferq;
 	struct firewire_comm *fc;
+	struct fw_bulkxfer *bx;
 	int err;
 
 	if (ch->dmach < 0) {
@@ -783,8 +836,24 @@ dg00x_streaming_start_rx(struct snd_dg00x *dg00x)
 
 	dot_reset_state(&dg00x->pcm_capture.dot);
 	fc = ISO_FC(ch);
+	xferq = ISO_XFERQ(ch);
+
+	mtx_lock(&dg00x->lock);
+	if (dg00x->rx_use_count++ > 0) {
+		mtx_unlock(&dg00x->lock);
+		return (0);
+	}
+	mtx_unlock(&dg00x->lock);
 
 	FW_GLOCK(fc);
+	while ((bx = STAILQ_FIRST(&xferq->stdma)) != NULL) {
+		STAILQ_REMOVE_HEAD(&xferq->stdma, link);
+		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
+	}
+	while ((bx = STAILQ_FIRST(&xferq->stvalid)) != NULL) {
+		STAILQ_REMOVE_HEAD(&xferq->stvalid, link);
+		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
+	}
 	err = fc->irx_enable(fc, ch->dmach);
 	FW_GUNLOCK(fc);
 
@@ -792,6 +861,12 @@ dg00x_streaming_start_rx(struct snd_dg00x *dg00x)
 	    "cap.rate=%u cap.dev_ch=%u\n",
 	    ch->dmach, err,
 	    dg00x->pcm_capture.rate, dg00x->pcm_capture.device_channels);
+
+	if (err != 0) {
+		mtx_lock(&dg00x->lock);
+		dg00x->rx_use_count = 0;
+		mtx_unlock(&dg00x->lock);
+	}
 
 	return (err);
 }
@@ -820,6 +895,14 @@ dg00x_streaming_stop_tx(struct snd_dg00x *dg00x)
 	 * while stop calls itx_disable.
 	 */
 	mtx_lock(&dg00x->lock);
+	if (dg00x->tx_use_count == 0) {
+		mtx_unlock(&dg00x->lock);
+		return;
+	}
+	if (--dg00x->tx_use_count > 0) {
+		mtx_unlock(&dg00x->lock);
+		return;
+	}
 
 	/* Disable DMA first.  After itx_disable returns, the OHCI
 	 * context is quiesced — no new TX completion interrupts. */
@@ -850,9 +933,40 @@ dg00x_streaming_stop_tx(struct snd_dg00x *dg00x)
 void
 dg00x_streaming_stop_rx(struct snd_dg00x *dg00x)
 {
-	if (dg00x->iso_rx.dmach >= 0)
-		ISO_FC(&dg00x->iso_rx)->irx_disable(
-		    ISO_FC(&dg00x->iso_rx), dg00x->iso_rx.dmach);
+	struct dg00x_iso_channel *ch = &dg00x->iso_rx;
+	struct fw_xferq *xferq;
+	struct firewire_comm *fc;
+	struct fw_bulkxfer *bx;
+
+	if (dg00x->iso_rx.dmach < 0)
+		return;
+
+	mtx_lock(&dg00x->lock);
+	if (dg00x->rx_use_count == 0) {
+		mtx_unlock(&dg00x->lock);
+		return;
+	}
+	if (--dg00x->rx_use_count > 0) {
+		mtx_unlock(&dg00x->lock);
+		return;
+	}
+	mtx_unlock(&dg00x->lock);
+
+	xferq = ISO_XFERQ(ch);
+	fc = ISO_FC(ch);
+
+	fc->irx_disable(fc, ch->dmach);
+
+	FW_GLOCK(fc);
+	while ((bx = STAILQ_FIRST(&xferq->stdma)) != NULL) {
+		STAILQ_REMOVE_HEAD(&xferq->stdma, link);
+		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
+	}
+	while ((bx = STAILQ_FIRST(&xferq->stvalid)) != NULL) {
+		STAILQ_REMOVE_HEAD(&xferq->stvalid, link);
+		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
+	}
+	FW_GUNLOCK(fc);
 }
 
 /*

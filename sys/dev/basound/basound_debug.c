@@ -76,6 +76,86 @@ basound_debug_tone_enabled(void)
 	return (basound_debug_test_tone != 0);
 }
 
+/*
+ * Fill a buffer of interleaved int32_t samples with a square-wave test
+ * tone, using the "S32_LE with 24 significant bits in the upper 24
+ * bits" convention used elsewhere in basound (e.g. digi00x's AM824/DOT
+ * encoding expects raw_sample >> 8 to yield the 24-bit sample).  Shares
+ * the same phase/enable state as basound_debug_tone_fill_s16le so a
+ * single set of sysctls drives the tone regardless of which driver
+ * (USB 16-bit or FireWire 32-bit) is under test.
+ */
+int
+basound_debug_tone_fill_s32le(int32_t *buf, unsigned int frames,
+    unsigned int channels, unsigned int sample_rate)
+{
+	uint32_t freq_hz, max_frames = 0;
+	uint32_t half_period_frames;
+	int32_t amp = 0x300000;	/* ~37% of 24-bit full scale */
+	int length_ms;
+	int active;
+	unsigned int i, c;
+
+	if (buf == NULL || frames == 0 || channels == 0 || sample_rate == 0)
+		return (0);
+
+	if (!basound_debug_test_tone)
+		return (0);
+
+	mtx_lock(&basound_debug_lock);
+	active = (basound_debug_test_tone != 0);
+	if (!active) {
+		mtx_unlock(&basound_debug_lock);
+		return (0);
+	}
+
+	freq_hz = (uint32_t)basound_debug_test_tone_freq_hz;
+	if (freq_hz < 20)
+		freq_hz = 20;
+	if (freq_hz >= sample_rate / 2)
+		freq_hz = (sample_rate > 2) ? (sample_rate / 2 - 1) : 1;
+	if (freq_hz == 0)
+		freq_hz = 1;
+
+	half_period_frames = sample_rate / (freq_hz * 2);
+	if (half_period_frames == 0)
+		half_period_frames = 1;
+
+	length_ms = basound_debug_test_tone_length_ms;
+	if (length_ms > 0) {
+		uint64_t tmp = (uint64_t)sample_rate * (uint64_t)length_ms;
+		tmp /= 1000;
+		if (tmp > UINT32_MAX)
+			tmp = UINT32_MAX;
+		max_frames = (uint32_t)tmp;
+	}
+
+	for (i = 0; i < frames; i++) {
+		int32_t sample = 0;
+		int emit = 1;
+
+		if (max_frames != 0 &&
+		    basound_debug_tone_frames_emitted >= max_frames) {
+			emit = 0;
+			basound_debug_test_tone = 0;
+		}
+
+		if (emit) {
+			sample = ((basound_debug_tone_phase %
+			    (half_period_frames * 2)) < half_period_frames) ?
+			    (amp << 8) : (-amp << 8);
+			basound_debug_tone_phase++;
+			basound_debug_tone_frames_emitted++;
+		}
+
+		for (c = 0; c < channels; c++)
+			*buf++ = sample;
+	}
+	mtx_unlock(&basound_debug_lock);
+
+	return (1);
+}
+
 int
 basound_debug_tone_fill_s16le(void *buf, size_t len, unsigned int channels,
     unsigned int sample_rate)

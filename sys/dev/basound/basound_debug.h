@@ -13,5 +13,7 @@
 int basound_debug_tone_enabled(void);
 int basound_debug_tone_fill_s16le(void *buf, size_t len, unsigned int channels,
     unsigned int sample_rate);
+int basound_debug_tone_fill_s32le(int32_t *buf, unsigned int frames,
+    unsigned int channels, unsigned int sample_rate);
 
 #endif /* _BASOUND_DEBUG_H_ */

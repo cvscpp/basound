@@ -168,6 +168,8 @@ struct snd_dg00x {
 	/* ISO DMA channel state for real streaming */
 	struct dg00x_iso_channel iso_tx;
 	struct dg00x_iso_channel iso_rx;
+	unsigned int tx_use_count;
+	unsigned int rx_use_count;
 
 	unsigned int substreams_counter;
 

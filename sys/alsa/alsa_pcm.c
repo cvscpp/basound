@@ -13,9 +13,8 @@ snd_pcm_period_elapsed(struct snd_pcm_substream *substream)
 {
 	struct basound_chan *ch = substream->private_data;
 
-	if (ch && ch->channel) {
+	if (ch && ch->channel)
 		chn_intr(ch->channel);
-	}
 }
 
 static int
