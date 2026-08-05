@@ -1,6 +1,32 @@
 # Digi 002/003 Driver Debugging Memo — 2026-08-02
 
-## Current Status: FireWire DMA working, PCM buffer empty
+## RESOLVED — 2026-08-05: Playback confirmed working on Digi 002 Rack
+## (tag: digi002rack-playback-working, commit 84706e5)
+##
+## Root cause: dg00x_begin_session() writes the ISOC_CHANNELS register as
+## (tx_ch<<16)|rx_ch, copying Linux's formula literally. Linux's
+## tx_resources/rx_resources are DEVICE-centric (tx = channel the device
+## transmits on = our capture; rx = channel device receives on = our
+## playback). Ours are HOST-centric (tx = we transmit = playback; rx = we
+## receive = capture) — the opposite convention. The pcm_trigger call site
+## passed them in our own (host-centric) order, silently swapping the two
+## channel numbers in the register: the device listened for playback on
+## the channel we actually used for capture, and vice versa. The TX DMA
+## was transmitting perfectly valid, correctly DOT-encoded, non-silent
+## audio the whole time (confirmed with a debug test-tone injector added
+## for digi00x, hw.basound.debug.test_tone) with zero FireWire/ISO errors
+## — the device just never received it on the channel it was listening
+## to. Fixed by swapping the two channel arguments at the single call
+## site in digi00x-pcm.c (pcm_trigger). See commit 84706e5 for details.
+##
+## The debugging below (2026-08-02) remains for historical reference; the
+## "PCM buffer is all zeros" observation in that session was a *separate*
+## test-methodology artifact (test.tone's `dd if=/dev/zero` legitimately
+## writes silence) rather than a driver bug — the dma_area sync fix in
+## commit 49c46fe was still a real and correct fix, just not the cause of
+## the reported silence.
+
+## Current Status (historical, 2026-08-02): FireWire DMA working, PCM buffer empty
 
 The driver initializes, starts a bidirectional isochronous session, transmits
 correctly-formatted CIP packets at 8000/sec, but the PCM DMA buffer contains
