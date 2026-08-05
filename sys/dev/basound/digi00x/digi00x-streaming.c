@@ -733,14 +733,18 @@ dg00x_streaming_start_tx(struct snd_dg00x *dg00x)
 	struct fw_bulkxfer *bx;
 	int i;
 
-	if (ch->dmach < 0 || !ps->active)
+	if (ch->dmach < 0)
 		return (0);
 
-	/* Safety: don't start if the PCM DMA buffer isn't yet mapped */
-	if (ps->substream == NULL ||
-	    ps->substream->runtime == NULL ||
-	    ps->substream->runtime->dma_area == NULL)
-		return (-EINVAL);
+	/*
+	 * TX must run even when no playback app has opened the
+	 * substream: the Digi 002/003 will not transmit its capture
+	 * audio unless the host is simultaneously transmitting to it
+	 * (silence is fine).  dg00x_fill_tx_chunk() already handles
+	 * ps->substream->runtime being NULL (or ps->active being
+	 * false) by generating silent, correctly framed packets, so
+	 * we must not gate starting TX on either condition here.
+	 */
 
 	xferq = ISO_XFERQ(ch);
 	fc = ISO_FC(ch);

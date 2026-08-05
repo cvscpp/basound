@@ -235,6 +235,23 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 		cap->frames_per_packet = ps->frames_per_packet;
 		cap->frame_remainder = ps->frame_remainder;
 		cap->frame_cycle = 0;
+	} else {
+		/*
+		 * Mirror image of the above: when capture starts on its
+		 * own (no playback app running), clone the geometry into
+		 * the playback stream so dg00x_fill_tx_chunk() can build
+		 * correctly shaped (silent) TX packets.  The device will
+		 * not transmit its capture audio unless the host is also
+		 * transmitting to it, so TX must run with valid framing
+		 * even though nothing has opened the playback substream.
+		 */
+		struct dg00x_pcm_stream *pb = &dg00x->pcm_playback;
+		pb->rate = ps->rate;
+		pb->fdf = ps->fdf;
+		pb->device_channels = ps->device_channels;
+		pb->frames_per_packet = ps->frames_per_packet;
+		pb->frame_remainder = ps->frame_remainder;
+		pb->frame_cycle = 0;
 	}
 
 	return (0);
@@ -498,26 +515,20 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		 * documented quirk: "No packets are transmitted
 		 * without receiving packets".
 		 *
-		 * When playback starts, we start TX for audio output
-		 * AND RX to satisfy the device's bidirectional
-		 * requirement (the RX DMA context runs but its
-		 * handler is a no-op when ps->active is false).
-		 * When capture starts, we only start RX.
+		 * Regardless of which direction triggered this start,
+		 * always start both RX and TX together: TX runs in
+		 * silent/no-op mode when playback isn't active, and RX's
+		 * handler is a no-op when capture isn't active.  Both
+		 * dg00x_streaming_start_tx()/start_rx() are reference
+		 * counted (tx_use_count/rx_use_count), so calling them
+		 * from either direction's trigger is safe and idempotent.
 		 */
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-			err = dg00x_streaming_start_rx(dg00x);
-			if (err == 0)
-				err = dg00x_streaming_start_tx(dg00x);
-		} else {
-			err = dg00x_streaming_start_rx(dg00x);
-		}
+		err = dg00x_streaming_start_rx(dg00x);
+		if (err == 0)
+			err = dg00x_streaming_start_tx(dg00x);
 		if (err < 0) {
-			if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-				dg00x_streaming_stop_tx(dg00x);
-				dg00x_streaming_stop_rx(dg00x);
-			} else {
-				dg00x_streaming_stop_rx(dg00x);
-			}
+			dg00x_streaming_stop_tx(dg00x);
+			dg00x_streaming_stop_rx(dg00x);
 			if (was_idle)
 				dg00x_finish_session(dg00x);
 			dg00x_pcm_stream_stop(dg00x,
@@ -553,20 +564,15 @@ pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		 */
 		dg00x_pcm_stream_stop(dg00x, substream->stream);
 
-		/* Now stop ISO DMA safely — the callout has bailed out */
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-			dg00x_streaming_stop_tx(dg00x);
-			/*
-			 * If the capture stream is not independently
-			 * active, stop the RX DMA context that was
-			 * started alongside TX for bidirectional
-			 * operation.
-			 */
-			if (!dg00x->pcm_capture.active)
-				dg00x_streaming_stop_rx(dg00x);
-		} else {
-			dg00x_streaming_stop_rx(dg00x);
-		}
+		/*
+		 * Now stop ISO DMA safely — the callout has bailed out.
+		 * Always stop both TX and RX; each is reference counted
+		 * (tx_use_count/rx_use_count) so the DMA context for the
+		 * direction still in use keeps running, and the one
+		 * whose last user just stopped is properly torn down.
+		 */
+		dg00x_streaming_stop_tx(dg00x);
+		dg00x_streaming_stop_rx(dg00x);
 
 		/*
 		 * Only finish the hardware session when ALL streams have

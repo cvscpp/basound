@@ -1,23 +1,25 @@
-# Build output
-*.o
-*.ko
-.depend.*
-export_syms
 
+# Build output
 # FreeBSD kernel build system generated interface headers
+# Machine-type symlinks created by bsd.kmod.mk
+*.ko
+*.o
+.depend.*
+.nanocoder/
+bsm_digi00x.core
 bus_if.h
 channel_if.h
 device_if.h
+export_syms
 feeder_if.h
+i386
+machine
 mixer_if.h
+opt_global.h
 pci_if.h
+tools/bsm_digi00x/bsm_digi00x
+tools/bsm_hdsp/bsm_hdsp
 vnode_if.h
 vnode_if_newproto.h
 vnode_if_typedef.h
-opt_global.h
-
-# Machine-type symlinks created by bsd.kmod.mk
-i386
-machine
 x86
-tools/bsm_hdsp/bsm_hdsp
