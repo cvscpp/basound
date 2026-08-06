@@ -7,6 +7,7 @@
 #include <FL/Fl_Value_Output.H>
 #include <FL/Fl_Group.H>
 #include <FL/Fl_Round_Button.H>
+#include <FL/Fl_Choice.H>
 #include <memory>
 #include "digi00x_device.h"
 #include "vu_meter.h"
@@ -18,14 +19,14 @@
  *
  *   [Menu Bar]  File > Quit   Device > /dev/dspN ...
  *
- *   ┌─── "Clock Configuration" ─────────────────────────────┐
- *   │   Clock Source:      Optical Port:                    │
- *   │   ○ Internal          ○ ADAT                         │
- *   │   ○ S/PDIF            ○ S/PDIF                       │
- *   │   ○ ADAT                                             │
- *   │   ○ Word Clock                                       │
- *   │   Rate:  48000 Hz   External: Word, 96000 Hz          │
- *   └───────────────────────────────────────────────────────┘
+ *   ┌─── "Clock Configuration" ───────────────────────────────────────┐
+ *   │   Clock Source:      Optical Port:      Sample Rate:            │
+ *   │   ○ Internal          ○ ADAT             [ 44100 Hz ▾ ]         │
+ *   │   ○ S/PDIF            ○ S/PDIF                                  │
+ *   │   ○ ADAT                                                       │
+ *   │   ○ Word Clock                                                 │
+ *   │   External: not detected                                        │
+ *   └─────────────────────────────────────────────────────────────────┘
  *
  *   ┌─── "Input Levels (18 ch)"  peak: -3.2 dB ────────────┐
  *   │   ▐▐▐▐▐▐▐▐▐▐▐▐▐▐▐▐▐▐  per-channel capture meters     │
@@ -69,8 +70,9 @@ private:
 	Fl_Group       *clock_group_;
 	Fl_Round_Button *clock_src_btn_[4];
 	Fl_Round_Button *opt_mode_btn_[2];
-	Fl_Box         *rate_label_;
+	Fl_Choice      *rate_choice_;
 	Fl_Box         *ext_label_;
+	bool            polling_;
 
 	/* Level sections */
 	Fl_Group  *in_group_;
@@ -105,6 +107,8 @@ private:
 	void        on_clock_source_changed(int src);
 	static void opt_mode_cb(Fl_Widget *w, void *data);
 	void        on_optical_mode_changed(int mode);
+	static void rate_cb(Fl_Widget *w, void *data);
+	void        on_rate_changed();
 
 	/* Status line */
 	void set_status(const char *msg);

@@ -289,7 +289,7 @@ sysctl_dg00x_optical_mode(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * sysctl_dg00x_rate - RO: current sample rate
+ * sysctl_dg00x_rate - RW: current sample rate
  */
 static int
 sysctl_dg00x_rate(SYSCTL_HANDLER_ARGS)
@@ -302,7 +302,15 @@ sysctl_dg00x_rate(SYSCTL_HANDLER_ARGS)
 	if (err != 0)
 		return (err);
 
-	return (sysctl_handle_int(oidp, &rate, 0, req));
+	err = sysctl_handle_int(oidp, &rate, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+
+	err = dg00x_set_local_rate(dg00x, rate);
+	if (err != 0)
+		return (err);
+
+	return (0);
 }
 
 /*
@@ -447,9 +455,9 @@ dg00x_init_card(struct digi00x_softc *sc)
 
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rate",
-		    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    dg00x, 0, sysctl_dg00x_rate, "IU",
-		    "Current sample rate");
+		    "Sample rate: 44100, 48000, 88200, or 96000");
 
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "external_rate",

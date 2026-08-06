@@ -206,6 +206,11 @@ int Digi00xDevice::get_rate() {
 	return sysctl_int(sysctl_path("rate").c_str(), 0);
 }
 
+bool Digi00xDevice::set_rate(int rate) {
+	if (!opened_ || dg00x_unit_ < 0) return false;
+	return sysctl_set_int(sysctl_path("rate").c_str(), rate);
+}
+
 int Digi00xDevice::get_external_rate() {
 	if (!opened_ || dg00x_unit_ < 0) return 0;
 	return sysctl_int(sysctl_path("external_rate").c_str(), 0);

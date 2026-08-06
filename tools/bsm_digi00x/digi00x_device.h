@@ -13,7 +13,7 @@
  *
  *   clock_source    RW   0=internal, 1=SPDIF, 2=ADAT, 3=Word
  *   optical_mode    RW   0=ADAT, 1=SPDIF
- *   rate            RO   current sample rate (Hz)
+ *   rate            RW   current sample rate (Hz)
  *   external_rate   RO   detected external clock rate (Hz)
  *   external_detect RO   1 = external clock present
  *   tx_peaks        RO   playback output peaks per channel, formatted as
@@ -50,10 +50,11 @@ public:
 	static const char *clock_source_name(int src);
 	static const char *optical_mode_name(int mode);
 
-	/* ---- Status (read-only) ---- */
+	/* ---- Status ---- */
 
 	/* Current sample rate in Hz, or 0 on error. */
 	int  get_rate();
+	bool set_rate(int rate);
 
 	/* Detected external clock rate in Hz, or 0 on error. */
 	int  get_external_rate();

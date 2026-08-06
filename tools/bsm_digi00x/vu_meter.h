@@ -2,6 +2,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <string>
 #include <FL/Fl_Widget.H>
 
 /*
@@ -38,6 +39,7 @@ private:
 	float level_db_;       /* current level in dBFS */
 	float peak_hold_db_;   /* peak-hold level in dBFS */
 	int   peak_hold_ttl_;  /* frames until peak starts decaying */
+	std::string label_;    /* owned copy of channel label */
 
 	static constexpr float kFloor = -60.0f;
 	static constexpr int   kHoldFrames = 50; /* 2 s @ 25 Hz */

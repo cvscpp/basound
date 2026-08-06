@@ -4,6 +4,7 @@
 #include <FL/Fl.H>
 #include <FL/fl_ask.H>
 #include <FL/Fl_Button.H>
+#include <FL/Fl_Choice.H>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -20,7 +21,7 @@ static constexpr int kSecGap   = 2;
 static constexpr double kTimerInterval = 0.04; /* 25 Hz */
 
 /* Clock section */
-static constexpr int kClockSecH = 150;
+static constexpr int kClockSecH = 170;
 static constexpr int kBtnW     = 150;
 static constexpr int kBtnH     = 22;
 
@@ -45,8 +46,9 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
       connected_(false),
       menu_(nullptr),
       clock_group_(nullptr),
-      rate_label_(nullptr),
+      rate_choice_(nullptr),
       ext_label_(nullptr),
+      polling_(false),
       in_group_(nullptr),
       out_group_(nullptr),
       in_peak_label_(nullptr),
@@ -73,7 +75,7 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 	    "  Clock Configuration  ");
 	clock_group_->box(FL_FLAT_BOX);
 	clock_group_->color(fl_rgb_color(40, 40, 42));
-	clock_group_->labelcolor(fl_rgb_color(160, 200, 160));
+	clock_group_->labelcolor(fl_rgb_color(180, 220, 180));
 	clock_group_->labelfont(FL_HELVETICA_BOLD);
 	clock_group_->labelsize(12);
 	clock_group_->align(FL_ALIGN_TOP_LEFT);
@@ -84,7 +86,7 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 
 		/* ---- Clock Source column ---- */
 		Fl_Box *clk_lbl = new Fl_Box(gx, gy, 120, 16, "Clock Source:");
-		clk_lbl->labelcolor(fl_rgb_color(180, 180, 180));
+		clk_lbl->labelcolor(fl_rgb_color(200, 210, 210));
 		clk_lbl->labelsize(11);
 		clk_lbl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 
@@ -108,7 +110,7 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 		/* ---- Optical Port column ---- */
 		int ox = gx + kBtnW + 40;
 		Fl_Box *opt_lbl = new Fl_Box(ox, gy, 120, 16, "Optical Port:");
-		opt_lbl->labelcolor(fl_rgb_color(180, 180, 180));
+		opt_lbl->labelcolor(fl_rgb_color(200, 210, 210));
 		opt_lbl->labelsize(11);
 		opt_lbl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 
@@ -127,15 +129,27 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 			oy += kBtnH + 2;
 		}
 
-		/* ---- Status info row ---- */
-		int sy = clock_group_->y() + clock_group_->h() - 42;
-		rate_label_ = new Fl_Box(gx, sy, 250, 16, "Rate: --- Hz");
-		rate_label_->labelcolor(fl_rgb_color(140, 200, 140));
-		rate_label_->labelsize(11);
-		rate_label_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+		/* ---- Sample Rate column ---- */
+		int sx = ox + kBtnW + 40;
+		Fl_Box *rate_lbl = new Fl_Box(sx, gy, 120, 16, "Sample Rate:");
+		rate_lbl->labelcolor(fl_rgb_color(200, 210, 210));
+		rate_lbl->labelsize(11);
+		rate_lbl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 
-		ext_label_ = new Fl_Box(gx, sy + 18, 350, 16, "External: ---");
-		ext_label_->labelcolor(fl_rgb_color(140, 140, 200));
+		rate_choice_ = new Fl_Choice(sx, gy + 18, 130, 22);
+		rate_choice_->color(fl_rgb_color(50, 50, 50));
+		rate_choice_->textcolor(FL_WHITE);
+		rate_choice_->labelsize(11);
+		rate_choice_->add("44100 Hz");
+		rate_choice_->add("48000 Hz");
+		rate_choice_->add("88200 Hz");
+		rate_choice_->add("96000 Hz");
+		rate_choice_->callback(rate_cb, this);
+
+		/* ---- External clock status ---- */
+		int sy = clock_group_->y() + clock_group_->h() - 42;
+		ext_label_ = new Fl_Box(gx, sy, 500, 18, "External: ---");
+		ext_label_->labelcolor(fl_rgb_color(180, 180, 255));
 		ext_label_->labelsize(11);
 		ext_label_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 	}
@@ -147,7 +161,7 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 		group = new Fl_Group(kMargin, y, win_w - 2 * kMargin, kLevelSecH, title);
 		group->box(FL_FLAT_BOX);
 		group->color(fl_rgb_color(40, 40, 42));
-		group->labelcolor(fl_rgb_color(160, 160, 200));
+		group->labelcolor(fl_rgb_color(200, 210, 255));
 		group->labelfont(FL_HELVETICA_BOLD);
 		group->labelsize(12);
 		group->align(FL_ALIGN_TOP_LEFT);
@@ -182,7 +196,7 @@ MixerWindow::MixerWindow(int win_w, int win_h, const char *title)
 	    "Not connected");
 	status_bar_->box(FL_FLAT_BOX);
 	status_bar_->color(fl_rgb_color(25, 25, 25));
-	status_bar_->labelcolor(fl_rgb_color(160, 160, 160));
+	status_bar_->labelcolor(fl_rgb_color(200, 200, 200));
 	status_bar_->labelsize(10);
 	status_bar_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 
@@ -285,11 +299,15 @@ void MixerWindow::build_ui() {
 	/* Rate */
 	int rate = dev_.get_rate();
 	if (rate > 0) {
-		char buf[32];
-		snprintf(buf, sizeof(buf), "Rate: %d Hz", rate);
-		rate_label_->copy_label(buf);
+		switch (rate) {
+		case 44100: rate_choice_->value(0); break;
+		case 48000: rate_choice_->value(1); break;
+		case 88200: rate_choice_->value(2); break;
+		case 96000: rate_choice_->value(3); break;
+		default:    rate_choice_->value(-1); break;
+		}
 	} else {
-		rate_label_->copy_label("Rate: (unavailable)");
+		rate_choice_->value(-1);
 	}
 
 	/* External status */
@@ -322,7 +340,7 @@ void MixerWindow::clear_ui() {
 	for (auto &b : opt_mode_btn_) {
 		if (b) b->clear();
 	}
-	rate_label_->copy_label("Rate: --- Hz");
+	rate_choice_->value(-1);
 	ext_label_->copy_label("External: ---");
 
 	for (int i = 0; i < DG00X_TOOL_MAX_CH; i++) {
@@ -385,6 +403,8 @@ peak_to_db(uint32_t peak)
 void MixerWindow::update_meters() {
 	if (!connected_) return;
 
+	polling_ = true;
+
 	/* ---- Track rate and channel geometry ---- */
 	int rate = dev_.get_rate();
 	int in_n = dev_.get_capture_channels();
@@ -435,9 +455,13 @@ void MixerWindow::update_meters() {
 
 	/* ---- Poll status info (in case another app changed it) ---- */
 	if (rate > 0) {
-		char buf[32];
-		snprintf(buf, sizeof(buf), "Rate: %d Hz", rate);
-		rate_label_->copy_label(buf);
+		switch (rate) {
+		case 44100: rate_choice_->value(0); break;
+		case 48000: rate_choice_->value(1); break;
+		case 88200: rate_choice_->value(2); break;
+		case 96000: rate_choice_->value(3); break;
+		default:    break;
+		}
 	}
 
 	bool ext_detect = dev_.get_external_detect();
@@ -459,16 +483,26 @@ void MixerWindow::update_meters() {
 	}
 
 	redraw();
+	polling_ = false;
 }
 
 /* ------------------------------------------------------------------ */
-/* Clock source callback                                                 */
+/* Callback demultiplexer — FL_RADIO_BUTTON type widgets in a          */
+/* Fl_Group pass their argument() as the callback data, not the        */
+/* MixerWindow pointer we passed to callback().  Walk the widget       */
+/* hierarchy to reach the top-level window.                            */
 /* ------------------------------------------------------------------ */
 
-void MixerWindow::clock_src_cb(Fl_Widget *w, void *data) {
-	intptr_t src = (intptr_t)data;
-	static_cast<MixerWindow *>(w->parent()->parent()->user_data())
-	    ->on_clock_source_changed((int)src);
+static MixerWindow *get_mw(Fl_Widget *w) {
+	Fl_Widget *grp = w ? w->parent() : nullptr;
+	Fl_Widget *win = grp ? grp->parent() : nullptr;
+	return win ? static_cast<MixerWindow *>(win) : nullptr;
+}
+
+void MixerWindow::clock_src_cb(Fl_Widget *w, void *) {
+	MixerWindow *mw = get_mw(w);
+	if (mw)
+		mw->on_clock_source_changed((int)(intptr_t)w->argument());
 }
 
 void MixerWindow::on_clock_source_changed(int src) {
@@ -487,10 +521,10 @@ void MixerWindow::on_clock_source_changed(int src) {
 /* Optical mode callback                                                 */
 /* ------------------------------------------------------------------ */
 
-void MixerWindow::opt_mode_cb(Fl_Widget *w, void *data) {
-	intptr_t mode = (intptr_t)data;
-	static_cast<MixerWindow *>(w->parent()->parent()->user_data())
-	    ->on_optical_mode_changed((int)mode);
+void MixerWindow::opt_mode_cb(Fl_Widget *w, void *) {
+	MixerWindow *mw = get_mw(w);
+	if (mw)
+		mw->on_optical_mode_changed((int)(intptr_t)w->argument());
 }
 
 void MixerWindow::on_optical_mode_changed(int mode) {
@@ -502,6 +536,30 @@ void MixerWindow::on_optical_mode_changed(int mode) {
 		set_status(buf);
 	} else {
 		set_status("Failed to set optical mode");
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Sample rate callback                                                  */
+/* ------------------------------------------------------------------ */
+
+void MixerWindow::rate_cb(Fl_Widget *w, void *data) {
+	(void)w;
+	static_cast<MixerWindow *>(data)->on_rate_changed();
+}
+
+void MixerWindow::on_rate_changed() {
+	if (!connected_ || polling_) return;
+	static const int rates[] = { 44100, 48000, 88200, 96000 };
+	int idx = rate_choice_->value();
+	if (idx < 0 || idx >= 4) return;
+	int rate = rates[idx];
+	if (dev_.set_rate(rate)) {
+		char buf[64];
+		snprintf(buf, sizeof(buf), "Sample rate set to %d Hz", rate);
+		set_status(buf);
+	} else {
+		set_status("Failed to set sample rate");
 	}
 }
 

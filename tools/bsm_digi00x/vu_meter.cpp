@@ -6,10 +6,11 @@
 #include <algorithm>
 
 VuMeter::VuMeter(int x, int y, int w, int h, const char *label)
-    : Fl_Widget(x, y, w, h, label),
+    : Fl_Widget(x, y, w, h),
       level_db_(kFloor),
       peak_hold_db_(kFloor),
-      peak_hold_ttl_(0)
+      peak_hold_ttl_(0),
+      label_(label ? label : "")
 {
 }
 
@@ -61,7 +62,7 @@ void VuMeter::draw() {
 	const int bx = x(), by = y(), bw = w(), bh = h();
 
 	/* Reserve label area at bottom */
-	const int lh = label() ? 13 : 0;
+	const int lh = label_.empty() ? 0 : 16;
 	const int meter_h = bh - lh;
 
 	if (meter_h < 4 || bw < 4) {
@@ -140,11 +141,19 @@ void VuMeter::draw() {
 
 	/* ---- channel label ---- */
 	if (lh > 0) {
-		fl_color(fl_rgb_color(50, 50, 50));
-		fl_rectf(bx, by + meter_h, bw, lh);
-		fl_color(FL_WHITE);
-		fl_font(FL_HELVETICA, 9);
-		fl_draw(label(), bx, by + meter_h, bw, lh,
-		        FL_ALIGN_CENTER | FL_ALIGN_CLIP);
+		/* Separator line between bar and label */
+		int sep_y = by + meter_h;
+		fl_color(fl_rgb_color(80, 80, 90));
+		fl_line(bx, sep_y, bx + bw - 1, sep_y);
+
+		/* Label background */
+		fl_color(fl_rgb_color(60, 60, 68));
+		fl_rectf(bx, sep_y + 1, bw, lh - 1);
+
+		/* Label text — bold, larger, bottom-aligned to fit in tight space */
+		fl_color(fl_rgb_color(220, 220, 230));
+		fl_font(FL_HELVETICA_BOLD, 10);
+		fl_draw(label_.c_str(), bx, by + meter_h + 1, bw, lh - 1,
+		        FL_ALIGN_CENTER | FL_ALIGN_BOTTOM | FL_ALIGN_CLIP);
 	}
 }
