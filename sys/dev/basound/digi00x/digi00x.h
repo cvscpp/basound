@@ -173,6 +173,20 @@ struct snd_dg00x {
 
 	unsigned int substreams_counter;
 
+	/*
+	 * Cache of the rate last programmed into DG00X_OFFSET_LOCAL_RATE,
+	 * so pcm_prepare()/dg00x_pcm_stream_start() can skip the FireWire
+	 * register write (a blocking transaction with up to a 5-second
+	 * timeout) when the rate hasn't actually changed.  Without this,
+	 * every trigger START/prepare — which JACK issues frequently under
+	 * CHN_LOCK — re-does the round trip and can stall the realtime
+	 * audio thread for hundreds of ms, causing xruns/timeouts even
+	 * though playback-only apps with relaxed buffering (e.g. Audacious)
+	 * don't notice.
+	 */
+	unsigned int hw_rate_cached;
+	bool hw_rate_valid;
+
 	/* for uapi */
 	int dev_lock_count;
 	bool dev_lock_changed;
@@ -231,6 +245,7 @@ extern const unsigned int snd_dg00x_stream_pcm_channels[SND_DG00X_RATE_COUNT];
 
 int dg00x_get_local_rate(struct snd_dg00x *dg00x, unsigned int *rate);
 int dg00x_set_local_rate(struct snd_dg00x *dg00x, unsigned int rate);
+int dg00x_ensure_local_rate(struct snd_dg00x *dg00x, unsigned int rate);
 int dg00x_get_clock(struct snd_dg00x *dg00x, enum snd_dg00x_clock *clock);
 int dg00x_check_external(struct snd_dg00x *dg00x, bool *detect);
 int dg00x_get_external_rate(struct snd_dg00x *dg00x, unsigned int *rate);

@@ -588,8 +588,14 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 		    ps->substream->runtime != NULL &&
 		    ps->substream->runtime->dma_area != NULL &&
 		    xferq->buf != NULL) {
+			struct basound_chan *rxch = ps->substream->private_data;
+			unsigned int sample_bytes = (rxch != NULL) ?
+			    AFMT_BPS(rxch->format) : 4;
 			uint32_t *payload;
 			unsigned int nch;
+
+			if (sample_bytes != 2 && sample_bytes != 4)
+				sample_bytes = 4;
 
 			payload = (uint32_t *)fwdma_v_addr(xferq->buf,
 							   bx->poffset);
@@ -613,13 +619,52 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 			if (nch > ps->device_channels)
 				nch = ps->device_channels;
 
-			dot_read_pcm(&ps->dot,
-			    (int32_t *)ps->substream->runtime->dma_area +
-			    (ps->hwptr / 4),
-			    payload + CIP_HEADER_QUADLETS + 1,
-			    nch, frames, dbs);
+			bytes = frames * nch * sample_bytes;
 
-			bytes = frames * nch * 4;
+			if (sample_bytes == 4 && ps->hwptr + bytes <= ps->buffer_bytes) {
+				dot_read_pcm(&ps->dot,
+				    (int32_t *)((uint8_t *)
+					ps->substream->runtime->dma_area + ps->hwptr),
+				    payload + CIP_HEADER_QUADLETS + 1,
+				    nch, frames, dbs);
+			} else {
+				int32_t tmpbuf[18 * 12];
+				unsigned int total_samples = frames * nch;
+				unsigned int s;
+
+				dot_read_pcm(&ps->dot, tmpbuf,
+				    payload + CIP_HEADER_QUADLETS + 1,
+				    nch, frames, dbs);
+
+				if (sample_bytes == 4) {
+					uint8_t *dst = (uint8_t *)ps->substream->runtime->dma_area + ps->hwptr;
+					unsigned int first_bytes = ps->buffer_bytes - ps->hwptr;
+					if (first_bytes >= bytes) {
+						memcpy(dst, tmpbuf, bytes);
+					} else {
+						memcpy(dst, tmpbuf, first_bytes);
+						memcpy(ps->substream->runtime->dma_area,
+						    (uint8_t *)tmpbuf + first_bytes,
+						    bytes - first_bytes);
+					}
+				} else {
+					int16_t tmp16[18 * 12];
+					for (s = 0; s < total_samples; s++)
+						tmp16[s] = (int16_t)(tmpbuf[s] >> 8);
+
+					uint8_t *dst = (uint8_t *)ps->substream->runtime->dma_area + ps->hwptr;
+					unsigned int first_bytes = ps->buffer_bytes - ps->hwptr;
+					if (first_bytes >= bytes) {
+						memcpy(dst, tmp16, bytes);
+					} else {
+						memcpy(dst, tmp16, first_bytes);
+						memcpy(ps->substream->runtime->dma_area,
+						    (uint8_t *)tmp16 + first_bytes,
+						    bytes - first_bytes);
+					}
+				}
+			}
+
 			ps->hwptr += bytes;
 			if (ps->hwptr >= ps->buffer_bytes)
 				ps->hwptr = 0;

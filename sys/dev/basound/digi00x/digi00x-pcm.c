@@ -148,6 +148,10 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	ps->pcm_channels = channels;
 	ps->rate = ch->speed > 0 ? ch->speed : 48000;
 	ps->fdf = dg00x_rate_to_fdf(ps->rate);
+
+	/* Set sample rate on device before starting stream (no-op if
+	 * already programmed to this rate — see dg00x_ensure_local_rate). */
+	dg00x_ensure_local_rate(dg00x, ps->rate);
 	/*
 	 * The device always carries its full channel complement per data
 	 * block (18 at 44.1/48 kHz, 10 at 88.2/96 kHz), independent of
@@ -361,8 +365,8 @@ pcm_hw_params(struct snd_pcm_substream *substream,
 	if (!rate_ok)
 		return (-EINVAL);
 
-	/* Set sample rate on device */
-	dg00x_set_local_rate(dg00x, rate);
+	/* Set sample rate on device (no-op if already at this rate) */
+	dg00x_ensure_local_rate(dg00x, rate);
 
 	return 0;
 }
@@ -379,13 +383,19 @@ pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_dg00x *dg00x = (struct snd_dg00x *)substream->pcm->private_data;
 	struct basound_chan *ch = (struct basound_chan *)substream->private_data;
+	unsigned int rate;
+
+	if (ch == NULL)
+		return (-EINVAL);
+
+	rate = ch->speed > 0 ? ch->speed : 48000;
 
 	/* Reset position for the stream direction */
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		dg00x->pcm_playback.hwptr = 0;
 		dg00x->pcm_playback.period_accum = 0;
 		dg00x->pcm_playback.tx_dbc = 0;
-		dg00x->pcm_playback.rate = ch->speed > 0 ? ch->speed : 48000;
+		dg00x->pcm_playback.rate = rate;
 		dg00x->pcm_playback.fdf =
 		    dg00x_rate_to_fdf(dg00x->pcm_playback.rate);
 		dg00x->pcm_playback.device_channels =
@@ -399,7 +409,7 @@ pcm_prepare(struct snd_pcm_substream *substream)
 	} else {
 		dg00x->pcm_capture.hwptr = 0;
 		dg00x->pcm_capture.period_accum = 0;
-		dg00x->pcm_capture.rate = ch->speed > 0 ? ch->speed : 48000;
+		dg00x->pcm_capture.rate = rate;
 		dg00x->pcm_capture.fdf =
 		    dg00x_rate_to_fdf(dg00x->pcm_capture.rate);
 		dg00x->pcm_capture.device_channels =
@@ -411,6 +421,19 @@ pcm_prepare(struct snd_pcm_substream *substream)
 		    dg00x->pcm_capture.rate % 8000;
 		dg00x->pcm_capture.frame_cycle = 0;
 	}
+
+	/*
+	 * Program sample rate into Digi 00x hardware register — but only
+	 * if it actually changed.  pcm_prepare() runs under CHN_LOCK (see
+	 * basound_chan_trigger()/basound_chan_setspeed()), and the
+	 * FireWire register write can tsleep for up to 5 seconds on a
+	 * slow/unresponsive bus.  JACK calls prepare on every trigger
+	 * START; unconditionally writing here reintroduces a CHN_LOCK-held
+	 * stall on every such call, which starves realtime playback and
+	 * capture and can miss periods (observed as JACK read timeouts),
+	 * even though relaxed playback-only apps don't notice.
+	 */
+	dg00x_ensure_local_rate(dg00x, rate);
 
 	return (0);
 }

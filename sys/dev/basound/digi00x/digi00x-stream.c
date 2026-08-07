@@ -200,6 +200,7 @@ int
 dg00x_set_local_rate(struct snd_dg00x *dg00x, unsigned int rate)
 {
 	unsigned int i;
+	int err;
 
 	for (i = 0; i < SND_DG00X_RATE_COUNT; i++) {
 		if (rate == snd_dg00x_stream_rates[i])
@@ -208,9 +209,39 @@ dg00x_set_local_rate(struct snd_dg00x *dg00x, unsigned int rate)
 	if (i == SND_DG00X_RATE_COUNT)
 		return (EINVAL);
 
-	return dg00x_write_quad(dg00x->fwdev,
+	err = dg00x_write_quad(dg00x->fwdev,
 				DG00X_ADDR_BASE + DG00X_OFFSET_LOCAL_RATE,
 				htobe32(i));
+	if (err == 0) {
+		dg00x->hw_rate_cached = rate;
+		dg00x->hw_rate_valid = true;
+	}
+	return (err);
+}
+
+/*
+ * dg00x_ensure_local_rate - like dg00x_set_local_rate(), but skips the
+ * FireWire register write (a blocking transaction that can tsleep for
+ * up to 5 seconds on an unresponsive bus) when the requested rate
+ * matches the last rate this driver programmed.
+ *
+ * pcm_prepare() and dg00x_pcm_stream_start() are called with CHN_LOCK
+ * held (see basound_chan_trigger()/basound_chan_setspeed() in
+ * alsa_pcm_bsd.c, which only release CHN_LOCK around ops->trigger(),
+ * not ops->prepare()).  JACK re-triggers prepare/start frequently
+ * under its realtime audio thread; unconditionally writing the rate
+ * register on every call reintroduces exactly the kind of
+ * lock-held-across-firewire-sleep stall that ops->trigger() was
+ * changed to avoid, causing xruns/timeouts under tight periods even
+ * though relaxed playback-only apps (e.g. Audacious) don't notice.
+ */
+int
+dg00x_ensure_local_rate(struct snd_dg00x *dg00x, unsigned int rate)
+{
+	if (dg00x->hw_rate_valid && dg00x->hw_rate_cached == rate)
+		return (0);
+
+	return dg00x_set_local_rate(dg00x, rate);
 }
 
 int
