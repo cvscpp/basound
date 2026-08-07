@@ -140,6 +140,16 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	if (ch == NULL || ch->buffer == NULL)
 		return (-EINVAL);
 
+	/*
+	 * Read the negotiated channel count from the OSS channel's
+	 * format field, which is always up to date.  ch->format is
+	 * our local copy that may lag behind when the OSS framework
+	 * reconstructs the format without calling chn_setformat
+	 * (e.g. during SNDCTL_DSP_CHANNELS ioctl processing).
+	 */
+	if (ch->channel != NULL && ch->channel->format != 0)
+		ch->format = ch->channel->format;
+
 	channels = AFMT_CHANNEL(ch->format);
 	if (channels == 0)
 		channels = 2;
