@@ -81,7 +81,7 @@ dot_write_pcm(struct dot_state *state, uint32_t *dest,
 
 	for (i = 0; i < frames; i++) {
 		for (c = 0; c < channels; c++) {
-			uint32_t sample = ((uint32_t)src[c] >> 8) | 0x40000000;
+			uint32_t sample = ((uint32_t)(src[c] >> 8)) | 0x40000000;
 			dest[c] = htobe32(sample);
 			dot_encode_step(state, &dest[c]);
 		}
@@ -116,7 +116,7 @@ dot_write_pcm_padded(struct dot_state *state, uint32_t *dest,
 			uint32_t sample = 0x40000000;
 
 			if (c < src_channels)
-				sample |= ((uint32_t)src[c] >> 8);
+				sample |= ((uint32_t)(src[c] >> 8));
 			dest[c] = htobe32(sample);
 			dot_encode_step(state, &dest[c]);
 		}
