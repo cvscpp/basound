@@ -264,8 +264,14 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 
 	/* 2. Round up to nearest supported latency.
 	 * HDSP hardware strictly requires power-of-two (64 to 8192).
-	 * For other devices (USB), we allow the requested size to improve sync. */
-	if (substream->pcm->private_data != NULL) {
+	 * digi00x, DICE and other FireWire devices have no such
+	 * constraint — forcing p2 fragments creates misalignment
+	 * between JACK's period and the actual DMA fragment size,
+	 * producing chronic xruns and buffer-balancing oscillation.
+	 * USB devices (no private_data) also benefit from bypassing
+	 * the p2 rounding. */
+	if (substream->pcm->private_data != NULL &&
+	    strcmp(substream->pcm->card->driver, "hdsp") == 0) {
 		if (frames < 64) frames = 64;
 		if (frames > 8192) frames = 8192;
 		
@@ -273,7 +279,7 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 		while (p2frames < frames) p2frames <<= 1;
 		frames = p2frames;
 	} else {
-		/* Keep USB period above tiny defaults that add jitter/distortion. */
+		/* Keep period above tiny defaults that add jitter/distortion. */
 		if (frames < 64)
 			frames = 64;
 	}
