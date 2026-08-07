@@ -133,7 +133,22 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 		if (ch->runtime->hw.rate_min > 0) {
 			ch->caps.minspeed = ch->runtime->hw.rate_min;
 			ch->caps.maxspeed = ch->runtime->hw.rate_max;
-			ch->speed = ch->caps.minspeed;
+			/*
+			 * Only clamp ch->speed into the driver's supported
+			 * range; don't unconditionally force it down to
+			 * minspeed.  Doing so silently dropped the sane
+			 * 48000 Hz default (set above) to 44100 Hz on
+			 * devices like the Digi 002/003 whose minspeed is
+			 * 44100 — causing the hardware to stream at a rate
+			 * that didn't match what JACK (or any app assuming
+			 * its requested rate was honored without querying
+			 * back) believed it was using, leading to clock
+			 * drift, xruns, and audible glitching.
+			 */
+			if (ch->speed < ch->caps.minspeed)
+				ch->speed = ch->caps.minspeed;
+			else if (ch->speed > ch->caps.maxspeed)
+				ch->speed = ch->caps.maxspeed;
 		}
 	}
 
@@ -207,8 +222,28 @@ basound_chan_setspeed(kobj_t obj, void *data, uint32_t speed)
 
 	ch->speed = actual;
 	if (substream->runtime != NULL) {
-		if (ops && ops->prepare)
-			ops->prepare(substream);
+		if (ops && ops->prepare) {
+			/*
+			 * Release CHN_LOCK before calling into the ALSA
+			 * prepare op.  digi00x's pcm_prepare() may need to
+			 * write the sample-rate register over FireWire — a
+			 * transaction that can tsleep for up to 5 seconds on
+			 * an unresponsive bus.  Holding CHN_LOCK across that
+			 * blocks chn_intr() (called from the DMA callout via
+			 * snd_pcm_period_elapsed), starving the realtime
+			 * audio thread.  See the identical rationale in
+			 * basound_chan_trigger() for ops->trigger().
+			 */
+			struct pcm_channel *pc = ch->channel;
+
+			if (pc != NULL) {
+				CHN_UNLOCK(pc);
+				ops->prepare(substream);
+				CHN_LOCK(pc);
+			} else {
+				ops->prepare(substream);
+			}
+		}
 	}
 	return actual;
 }
@@ -405,8 +440,6 @@ basound_chan_trigger(kobj_t obj, void *data, int go)
 
 	switch (go) {
 	case PCMTRIG_START:
-		if (ops && ops->prepare)
-			ops->prepare(substream);
 		alsa_cmd = SNDRV_PCM_TRIGGER_START;
 		break;
 	case PCMTRIG_STOP:
@@ -417,19 +450,26 @@ basound_chan_trigger(kobj_t obj, void *data, int go)
 		return 0;
 	}
 
-	if (ops && ops->trigger) {
+	if (ops && (ops->trigger || (go == PCMTRIG_START && ops->prepare))) {
 		/*
-		 * Release CHN_LOCK before calling the ALSA trigger ops.
+		 * Release CHN_LOCK before calling the ALSA prepare/trigger
+		 * ops.
 		 *
 		 * digi00x's trigger does FireWire transactions (tsleep with
-		 * 5-second timeout) and itx_disable (pause 1s).  Holding
-		 * CHN_LOCK across those sleeps blocks chn_intr (called from
-		 * the DMA callout via snd_pcm_period_elapsed), creating a
-		 * deadlock during STOP: the callout blocks on CHN_LOCK in
-		 * chn_intr while the trigger sleeps in pause(), and the
-		 * callout is then in the middle of refill when the trigger
-		 * continues with itx_disable + db_free + queue drain —
-		 * a corrupted DMA queue causes a panic/reboot.
+		 * 5-second timeout) and itx_disable (pause 1s).  Its
+		 * prepare() can likewise write the sample-rate register
+		 * over FireWire (tsleep, 5-second timeout) when the rate
+		 * actually changes.  Holding CHN_LOCK across those sleeps
+		 * blocks chn_intr (called from the DMA callout via
+		 * snd_pcm_period_elapsed), creating a deadlock during STOP:
+		 * the callout blocks on CHN_LOCK in chn_intr while the
+		 * trigger sleeps in pause(), and the callout is then in the
+		 * middle of refill when the trigger continues with
+		 * itx_disable + db_free + queue drain — a corrupted DMA
+		 * queue causes a panic/reboot.  For START, calling prepare()
+		 * under CHN_LOCK similarly stalls the realtime audio thread
+		 * (observed as JACK read/write timeouts) even though relaxed
+		 * playback-only apps don't notice.
 		 *
 		 * chn_trigger() calls us with CHN_LOCK held and drops it
 		 * after we return on success.  On error it returns with
@@ -437,10 +477,13 @@ basound_chan_trigger(kobj_t obj, void *data, int go)
 		 * failure so the caller's invariants stay intact.
 		 */
 		struct pcm_channel *pc = ch->channel;
-		int err;
+		int err = 0;
 
 		CHN_UNLOCK(pc);
-		err = ops->trigger(substream, alsa_cmd);
+		if (go == PCMTRIG_START && ops->prepare)
+			ops->prepare(substream);
+		if (ops->trigger)
+			err = ops->trigger(substream, alsa_cmd);
 		CHN_LOCK(pc);
 
 		/* ALSA ops return Linux-style negative errno; FreeBSD
