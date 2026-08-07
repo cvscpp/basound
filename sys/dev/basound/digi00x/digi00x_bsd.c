@@ -48,6 +48,7 @@ struct digi00x_softc {
 	struct snd_dg00x *dg00x;
 	int unit;
 	bool attached;
+	int discover_retries;
 	struct callout discover_callout;
 };
 
@@ -187,6 +188,7 @@ dg00x_attach(device_t dev)
 		return (dg00x_init_card(sc));
 	}
 
+	sc->discover_retries = 0;
 	device_printf(dev, "Digidesign device not found yet, "
 		      "scheduling deferred discovery\n");
 	callout_reset(&sc->discover_callout, hz, dg00x_discover, sc);
@@ -210,14 +212,28 @@ dg00x_discover(void *arg)
 
 	fwdev = NULL;
 	STAILQ_FOREACH(fwdev, &sc->fc->devices, link) {
-		if (fwdev->status != FWDEVATTACHED)
+		/*
+		 * Accept both FWDEVATTACHED (normal) and FWDEVINIT
+		 * (bus reset in progress).  crom_load(), which populates
+		 * csrrom, runs before the device transitions to
+		 * FWDEVATTACHED — so FWDEVINIT devices may already have
+		 * valid config ROM data to read.
+		 */
+		if (fwdev->status != FWDEVATTACHED &&
+		    fwdev->status != FWDEVINIT)
 			continue;
 		if (match_digidesign(fwdev) == 0)
 			break;
 	}
 
 	if (fwdev == NULL) {
-		/* Not found yet - retry in 1 second */
+		sc->discover_retries++;
+		if (sc->discover_retries == 5)
+			device_printf(sc->dev,
+			    "still waiting for Digidesign device "
+			    "(retry %d)\n", sc->discover_retries);
+		/* Retry indefinitely — the device will appear after a
+		 * bus reset completes. */
 		callout_reset(&sc->discover_callout, hz, dg00x_discover, sc);
 		return;
 	}
