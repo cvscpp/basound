@@ -81,6 +81,11 @@ struct dg00x_pcm_stream {
 					   app channel count */
 	unsigned int    rate;          /* sample rate */
 	unsigned int    tx_dbc;        /* TX data block counter for CIP header */
+	unsigned long   tx_underruns;  /* TX packets zero-filled: app data ran dry */
+	unsigned long   tx_shortfalls; /* TX packets zero-padded at the tail: app
+					   wrote slightly less than one packet */
+	unsigned int    tx_dbg_budget; /* remaining one-time dmesg debug prints
+					   (reset to a small budget at stream start) */
 	unsigned int    fdf;           /* CIP FDF field = sampling-frequency
 					  code (1,2,3,4 for 44.1/48/88.2/96k) */
 	bool            active;        /* stream is active */

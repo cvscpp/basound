@@ -309,7 +309,10 @@ dg00x_finish_session(struct snd_dg00x *dg00x)
 	if (dg00x->fwdev == NULL)
 		return;
 
-	printf("digi00x: finish_session — stopping streaming\n");
+	printf("digi00x: finish_session — stopping streaming, "
+	    "PB tx_underruns=%lu tx_shortfalls=%lu\n",
+	    dg00x->pcm_playback.tx_underruns,
+	    dg00x->pcm_playback.tx_shortfalls);
 
 	/* Write 0x00000003 to streaming set (stop) */
 	dg00x_write_quad(dg00x->fwdev,

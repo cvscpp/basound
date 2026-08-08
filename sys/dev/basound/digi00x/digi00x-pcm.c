@@ -26,8 +26,14 @@
  * period_accum.  A shared callout fires at 1 ms intervals to:        *
  *   1. Refill TX ISO chunks from stfree → stvalid (keeping the       *
  *      FireWire ISO pipeline fed)                                     *
- *   2. Signal snd_pcm_period_elapsed when a full period of bytes     *
- *      has been accumulated                                           *
+ *   2. Drive chn_intr on every tick (via snd_pcm_period_elapsed),    *
+ *      so the OSS layer feeds bufsoft ↔ bufhard and wakes pollers    *
+ *      at a fine cadence.  This keeps SNDCTL_DSP_CURRENT_*PTR        *
+ *      fifo_samples (bufsoft staging fill) low and stable — JACK's   *
+ *      OSS driver uses that value to decide buffer balancing, and    *
+ *      period-cadence-only feeding let a full JACK period of noise   *
+ *      (≈512 frames) exceed the balancing threshold at 18ch →        *
+ *      skip/insert balancing → clicks.                               *
  *                                                                     *
  * This avoids calling chn_intr (which acquires CHN_LOCK) from the     *
  * fwohci interrupt context, preventing a lock-ordering conflict       *
@@ -93,19 +99,40 @@ dg00x_pcm_stream_cb(void *arg)
 	 * be driven externally. */
 	dg00x_streaming_refill_tx(dg00x);
 
-	/* Signal period_elapsed for active streams that have
-	 * accumulated at least one full period of data.  The PCM
-	 * layer will check hwptr via pcm_pointer. */
-	if (ps_pb->active && ps_pb->substream != NULL &&
-	    ps_pb->period_accum >= ps_pb->period_bytes) {
-		ps_pb->period_accum -= ps_pb->period_bytes;
+	/*
+	 * Drive the OSS layer's interrupt handling (chn_intr →
+	 * chn_dmaupdate + chn_wrfeed/chn_rdfeed + selwakeup) on EVERY
+	 * 1 ms tick, not just at period boundaries.
+	 *
+	 * WHY: JACK's OSS driver samples the staging-buffer fill
+	 * (SNDCTL_DSP_CURRENT_OPTR.fifo_samples = bufsoft ready) each
+	 * process cycle and decides from it whether to "balance" its
+	 * output by DROPPING or INSERTING frames (audible clicks).  When
+	 * chn_intr only fires at the period cadence (455 frames = 10.3 ms
+	 * at 18ch/44.1k), the staging buffer accumulates up to a full
+	 * JACK period (~512 frames) between feeds; that ±512-frame noise
+	 * exceeds JACK's balancing threshold (mean write block ≈ 455
+	 * frames at 18ch) and trips skip/insert balancing — the clicks
+	 * the user hears when the buffer starts to balance.  At ≤8ch the
+	 * mean block (≥1023 frames) covers the same noise, which is why
+	 * low channel counts were clean.
+	 *
+	 * Feeding every 1 ms drops the staging noise to ~44 frames —
+	 * below the balancing threshold at any channel count.  chn_intr
+	 * is cheap (pure memory accounting; our PCMTRIG_EMLDMAWR/EMLDMARD
+	 * handlers are no-ops) and is designed to be called from a
+	 * periodic source — a normal hardware driver fires it every
+	 * period.
+	 *
+	 * snd_pcm_period_elapsed() == chn_intr() in our glue; the OSS
+	 * layer also counts block progress from these calls, so the
+	 * finer cadence simply makes block accounting more granular
+	 * (harmless for apps, which pace themselves on buffer space).
+	 */
+	if (ps_pb->active && ps_pb->substream != NULL)
 		snd_pcm_period_elapsed(ps_pb->substream);
-	}
-	if (ps_cap->active && ps_cap->substream != NULL &&
-	    ps_cap->period_accum >= ps_cap->period_bytes) {
-		ps_cap->period_accum -= ps_cap->period_bytes;
+	if (ps_cap->active && ps_cap->substream != NULL)
 		snd_pcm_period_elapsed(ps_cap->substream);
-	}
 
 	/* Stop callout if neither stream is active */
 	if (!ps_pb->active && !ps_cap->active)
@@ -183,6 +210,10 @@ dg00x_pcm_stream_start(struct snd_dg00x *dg00x, int direction,
 	ps->hwptr = 0;
 	ps->period_accum = 0;
 	ps->tx_dbc = 0;
+	/* Per-session TX diagnostics (counters + one-time dmesg budget). */
+	ps->tx_underruns = 0;
+	ps->tx_shortfalls = 0;
+	ps->tx_dbg_budget = 32;
 	ps->active = true;
 
 	/*

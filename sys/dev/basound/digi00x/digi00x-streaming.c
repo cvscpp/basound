@@ -473,8 +473,6 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		unsigned int read_bytes = 0;
 		bool underrun = false;
 		bool shortfall = false;
-		static int zero_dbg;
-		static int data_dbg;
 
 		if (sb != NULL) {
 			unsigned int rp = sndbuf_getreadyptr(sb);
@@ -491,6 +489,7 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 				 * play — silence the whole packet. */
 				underrun = true;
 				read_bytes = 0;
+				ps->tx_underruns++;
 			} else {
 				/* Data ahead of hwptr.  If it is less than a
 				 * full packet (the app wrote slightly late),
@@ -501,11 +500,14 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 				read_bytes = ready_bytes - pending_bytes;
 				if (read_bytes > bytes)
 					read_bytes = bytes;
-				if (read_bytes < bytes)
+				if (read_bytes < bytes) {
 					shortfall = true;
+					ps->tx_shortfalls++;
+				}
 			}
 		} else {
 			underrun = true;
+			ps->tx_underruns++;
 		}
 		/* Round to whole samples so the conversion loops below never
 		 * see a partial sample. */
@@ -524,12 +526,12 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 			    ps->rate);
 			sp = tmpbuf;
 		} else if (underrun) {
-			if (zero_dbg < 8) {
+			if (ps->tx_dbg_budget > 0) {
 				printf("digi00x: tx underrun fmt=0x%08x bps=%u "
 				    "ready=%u pending=%u source_off=%u bytes=%u\n",
 				    txch ? txch->format : 0, sample_bytes,
 				    ready_bytes, pending_bytes, source_off, bytes);
-				zero_dbg++;
+				ps->tx_dbg_budget--;
 			}
 			memset(tmpbuf, 0, sizeof(tmpbuf));
 			sp = tmpbuf;
@@ -541,12 +543,12 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		} else {
 			unsigned int samples = frames * nch;
 
-			if (shortfall && zero_dbg < 8) {
+			if (shortfall && ps->tx_dbg_budget > 0) {
 				printf("digi00x: tx shortfall ready=%u pending=%u "
 				    "source_off=%u bytes=%u read=%u\n",
 				    ready_bytes, pending_bytes,
 				    source_off, bytes, read_bytes);
-				zero_dbg++;
+				ps->tx_dbg_budget--;
 			}
 
 			/*
@@ -623,7 +625,7 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 			}
 		}
 
-		if (!underrun && data_dbg < 8) {
+		if (!underrun && ps->tx_dbg_budget > 0) {
 			printf("digi00x: tx source fmt=0x%08x bps=%u ready=%u "
 			    "pending=%u s0=0x%08x s1=0x%08x s2=0x%08x s3=0x%08x\n",
 			    txch ? txch->format : 0, sample_bytes,
@@ -632,7 +634,7 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 			    (unsigned int)((frames * nch) > 1 ? sp[1] : 0),
 			    (unsigned int)((frames * nch) > 2 ? sp[2] : 0),
 			    (unsigned int)((frames * nch) > 3 ? sp[3] : 0));
-			data_dbg++;
+			ps->tx_dbg_budget--;
 		}
 
 		/* Update peak meter from the source data */
