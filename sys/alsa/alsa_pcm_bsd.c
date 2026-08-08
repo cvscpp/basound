@@ -257,6 +257,17 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	uint32_t bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
 	uint32_t frames;
 
+	/*
+	 * Pick up the OSS channel's CURRENT format.  The channel count
+	 * here determines the frame size, and ch->format can lag behind
+	 * ch->channel->format when the OSS layer reconfigures the format
+	 * without routing it through channel_setformat().
+	 */
+	if (ch->channel != NULL && ch->channel->format != 0)
+		ch->format = ch->channel->format;
+	channels = AFMT_CHANNEL(ch->format);
+	bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
+
 	if (channels == 0) channels = 2;
 
 	/* 1. Calculate how many frames this blocksize represents */
@@ -295,14 +306,25 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	}
 
 	/*
-	 * Allow the sndbuf staging buffer to grow to the app's desired
-	 * size.  The HDSP hardware uses a separate planar DMA buffer
-	 * (hdsp_alloc_dma_buffers) with exactly 2 periods; the sndbuf
-	 * is purely a staging area for the interleave/deinterleave
-	 * conversion in the interrupt handler and does NOT need to
-	 * match the hardware period layout.
+	 * Size the sndbuf staging buffer to exactly match the negotiated
+	 * block size, using as many blocks as fit in the DMA allocation.
+	 *
+	 * CRITICAL: a fixed 32-block count silently FAILS (EINVAL) when
+	 * 32 * blocksize exceeds BASOUND_DMA_BUFSIZE (256 KB).  The
+	 * boundary is exactly 8 channels at 512 frames S16_LE
+	 * (32 * 8192 = 262144 fits; 32 * 9216 = 294912 does not) —
+	 * matching the observed "≤8 ch clean, >8 ch broken" split.
+	 * When the resize fails, ch->buffer keeps its default 2×131072
+	 * geometry while the OSS layer, JACK and this driver all assume
+	 * blocksize-sized blocks: hwptr wraps at the wrong boundary,
+	 * the zero-fill heuristic misfires, and playback glitches.
+	 *
+	 * Compute blkcnt from the available budget so the resize always
+	 * succeeds and blkcnt * blksz == bufsize exactly.
 	 */
-	uint32_t blkcnt = 32;
+	uint32_t blkcnt = BASOUND_DMA_BUFSIZE / blocksize;
+	if (blkcnt < 2)
+		blkcnt = 2;
 	sndbuf_resize(ch->buffer, blkcnt, blocksize);
 
 	/* Keep runtime in sync with the logical buffer size so that
