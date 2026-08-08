@@ -32,6 +32,39 @@ static uint32_t basound_fmtlist[] = {
 	0
 };
 
+/*
+ * digi00x-only format list: adds 32-bit float (AFMT_FLOAT), which is
+ * Audacious' default output format (its config "output_bit_depth=0"
+ * resolves to FMT_FLOAT).  Without a FLOAT entry the OSS layer's
+ * feeder_chain() finds no hardware format for a FLOAT request,
+ * SNDCTL_DSP_SETFMT fails and echoes the old format, and Audacious
+ * reports "Selected audio format is not supported by the device."
+ *
+ * FLOAT is only advertised for digi00x because its sample path
+ * (digi00x-streaming.c) converts float → 24-bit int before DOT
+ * encoding.  HDSP/DICE are bitperfect and consume raw S16/S32 from
+ * the DMA buffer; exposing FLOAT to them would let apps "succeed"
+ * while playing garbage.
+ */
+static uint32_t basound_fmtlist_dg00x[] = {
+	SND_FORMAT(AFMT_S32_LE, 2, 0),
+	SND_FORMAT(AFMT_S16_LE, 2, 0),
+	SND_FORMAT(AFMT_FLOAT, 2, 0),
+	SND_FORMAT(AFMT_S32_LE, 1, 0),
+	SND_FORMAT(AFMT_S16_LE, 1, 0),
+	SND_FORMAT(AFMT_S32_LE, 8, 0),
+	SND_FORMAT(AFMT_S16_LE, 8, 0),
+	SND_FORMAT(AFMT_FLOAT, 8, 0),
+	SND_FORMAT(AFMT_S32_LE, 18, 0),
+	SND_FORMAT(AFMT_S16_LE, 18, 0),
+	SND_FORMAT(AFMT_FLOAT, 18, 0),
+	SND_FORMAT(AFMT_S32_LE, 26, 0),
+	SND_FORMAT(AFMT_S16_LE, 26, 0),
+	SND_FORMAT(AFMT_S32_LE, 32, 0),
+	SND_FORMAT(AFMT_S16_LE, 32, 0),
+	0
+};
+
 static uint32_t basound_line6_fmtlist[] = {
 	SND_FORMAT(AFMT_S16_LE, 2, 0),
 	0
@@ -160,6 +193,11 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	 * constraints and should use the full basound_fmtlist so JACK,
 	 * Audacious and other apps discover the full channel range.
 	 *
+	 * digi00x additionally advertises AFMT_FLOAT (Audacious' default
+	 * output format) because its sample path converts float → 24-bit
+	 * before DOT encoding.  HDSP/DICE are bitperfect and consume raw
+	 * S16/S32 only — exposing FLOAT to them would play garbage.
+	 *
 	 * Drivers without an .open callback (e.g. USB Line6) are simple
 	 * stereo-only devices that use basound_line6_fmtlist.
 	 *
@@ -168,7 +206,10 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	if (substream->pstr->ops && substream->pstr->ops->open &&
 	    ch->runtime != NULL &&
 	    ch->runtime->hw.channels_max > 2) {
-		ch->caps.fmtlist = basound_fmtlist;
+		if (strcmp(pcm->card->driver, "Digi00x") == 0)
+			ch->caps.fmtlist = basound_fmtlist_dg00x;
+		else
+			ch->caps.fmtlist = basound_fmtlist;
 	} else {
 		ch->caps.fmtlist = basound_line6_fmtlist;
 	}
@@ -254,7 +295,7 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	struct snd_pcm_substream *substream = ch->substream;
 	const struct snd_pcm_ops *ops = substream->pstr->ops;
 	uint32_t channels = AFMT_CHANNEL(ch->format);
-	uint32_t bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
+	uint32_t bps = AFMT_BPS(ch->format);
 	uint32_t frames;
 
 	/*
@@ -266,7 +307,10 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	if (ch->channel != NULL && ch->channel->format != 0)
 		ch->format = ch->channel->format;
 	channels = AFMT_CHANNEL(ch->format);
-	bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
+	/* AFMT_BPS handles S16 (2), S32 (4) and FLOAT (4). */
+	bps = AFMT_BPS(ch->format);
+	if (bps != 2 && bps != 4)
+		bps = 2;
 
 	if (channels == 0) channels = 2;
 

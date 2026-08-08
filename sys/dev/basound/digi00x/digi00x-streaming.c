@@ -467,6 +467,11 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		uint8_t srcbuf[18 * 12 * 4];
 		int32_t tmpbuf[18 * 12];
 		const int32_t *sp;
+		/* AFMT_FLOAT (Audacious' default output format) arrives in the
+		 * buffer as 4-byte IEEE floats; the conversion below scales
+		 * them to the same 24-bit-in-32 scale S32_LE uses. */
+		bool is_float = (txch != NULL) &&
+		    (AFMT_ENCODING(txch->format) == AFMT_FLOAT);
 		unsigned int source_off = ps->hwptr;
 		unsigned int ready_bytes = 0;
 		unsigned int pending_bytes = 0;
@@ -536,7 +541,7 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 			memset(tmpbuf, 0, sizeof(tmpbuf));
 			sp = tmpbuf;
 		} else if (read_bytes == bytes && sample_bytes == 4 &&
-		    source_off + bytes <= ps->buffer_bytes) {
+		    !is_float && source_off + bytes <= ps->buffer_bytes) {
 			/* Fast path: full packet available, S32, no wrap. */
 			sp = (const int32_t *)((const uint8_t *)
 			    ps->substream->runtime->dma_area + source_off);
@@ -553,30 +558,60 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 
 			/*
 			 * Read read_bytes (possibly less than the full packet
-			 * when the app is momentarily behind) from the ring,
-			 * zero-padding the remainder of the sample buffer.
-			 * Zeroing first means the tail samples are silence;
-			 * only the available prefix carries real audio.
+			 * when the app is momentarily behind) from the ring
+			 * into srcbuf, then zero-pad the remainder of the
+			 * sample buffer.  Zeroing first means the tail
+			 * samples are silence; only the available prefix
+			 * carries real audio.
 			 */
+			if (read_bytes > 0) {
+				if (source_off + read_bytes <= ps->buffer_bytes) {
+					memcpy(srcbuf,
+					    (const uint8_t *)
+					    ps->substream->runtime->dma_area +
+					    source_off, read_bytes);
+				} else {
+					unsigned int first =
+					    ps->buffer_bytes - source_off;
+					memcpy(srcbuf,
+					    (const uint8_t *)
+					    ps->substream->runtime->dma_area +
+					    source_off, first);
+					memcpy(srcbuf + first,
+					    ps->substream->runtime->dma_area,
+					    read_bytes - first);
+				}
+			}
+
 			if (sample_bytes == 4) {
-				memset(tmpbuf, 0, sizeof(tmpbuf));
-				if (read_bytes > 0) {
-					if (source_off + read_bytes <= ps->buffer_bytes) {
-						memcpy(tmpbuf,
-						    (const uint8_t *)
-						    ps->substream->runtime->dma_area +
-						    source_off, read_bytes);
-					} else {
-						unsigned int first =
-						    ps->buffer_bytes - source_off;
-						memcpy(tmpbuf,
-						    (const uint8_t *)
-						    ps->substream->runtime->dma_area +
-						    source_off, first);
-						memcpy((uint8_t *)tmpbuf + first,
-						    ps->substream->runtime->dma_area,
-						    read_bytes - first);
+				/*
+				 * 32-bit container: S32_LE passes straight to
+				 * the DOT encoder (24-bit top-justified, which
+				 * dot_write_pcm_padded() >> 8's onto the
+				 * wire).  AFMT_FLOAT is scaled to the same
+				 * S32 scale: full-scale float (±1.0) maps to
+				 * ±0x7fffffff, so >> 8 yields the full 24-bit
+				 * range on the wire.
+				 */
+				for (i = 0; i < samples; i++)
+					tmpbuf[i] = 0;
+				if (is_float) {
+					const float *srcf = (const float *)srcbuf;
+					unsigned int ns = read_bytes / 4;
+
+					for (i = 0; i < ns; i++) {
+						float f = srcf[i];
+
+						if (f >= 1.0f)
+							tmpbuf[i] = 2147483647;
+						else if (f <= -1.0f)
+							tmpbuf[i] = -2147483648;
+						else
+							tmpbuf[i] =
+							    (int32_t)(f * 2147483647.0f);
 					}
+				} else if (read_bytes > 0) {
+					memcpy(tmpbuf, srcbuf, read_bytes);
 				}
 				sp = tmpbuf;
 			} else {
@@ -600,22 +635,6 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 				for (i = 0; i < samples; i++)
 					tmpbuf[i] = 0;
 				if (rd_smps > 0) {
-					if (source_off + read_bytes <= ps->buffer_bytes) {
-						memcpy(srcbuf,
-						    (const uint8_t *)
-						    ps->substream->runtime->dma_area +
-						    source_off, read_bytes);
-					} else {
-						unsigned int first =
-						    ps->buffer_bytes - source_off;
-						memcpy(srcbuf,
-						    (const uint8_t *)
-						    ps->substream->runtime->dma_area +
-						    source_off, first);
-						memcpy(srcbuf + first,
-						    ps->substream->runtime->dma_area,
-						    read_bytes - first);
-					}
 					const int16_t *src16 = (const int16_t *)srcbuf;
 
 					for (i = 0; i < rd_smps; i++)
@@ -718,6 +737,10 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 			struct basound_chan *rxch = ps->substream->private_data;
 			unsigned int sample_bytes = (rxch != NULL) ?
 			    AFMT_BPS(rxch->format) : 4;
+			/* AFMT_FLOAT capture: dot_read_pcm yields 24-bit
+			 * top-justified int32; scale back to float [-1,1]. */
+			bool is_float = (rxch != NULL) &&
+			    (AFMT_ENCODING(rxch->format) == AFMT_FLOAT);
 			uint32_t *payload;
 			unsigned int nch;
 
@@ -748,7 +771,8 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 
 			bytes = frames * nch * sample_bytes;
 
-			if (sample_bytes == 4 && ps->hwptr + bytes <= ps->buffer_bytes) {
+			if (sample_bytes == 4 && !is_float &&
+			    ps->hwptr + bytes <= ps->buffer_bytes) {
 				dot_read_pcm(&ps->dot,
 				    (int32_t *)((uint8_t *)
 					ps->substream->runtime->dma_area + ps->hwptr),
@@ -764,6 +788,18 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 				    nch, frames, dbs);
 
 				if (sample_bytes == 4) {
+					if (is_float) {
+						/*
+						 * dot_read_pcm yields 24-bit
+						 * top-justified int32; scale to
+						 * float [-1, 1] (in place).
+						 */
+						float *tmpf = (float *)tmpbuf;
+
+						for (s = 0; s < total_samples; s++)
+							tmpf[s] = (float)tmpbuf[s] /
+							    2147483648.0f;
+					}
 					uint8_t *dst = (uint8_t *)ps->substream->runtime->dma_area + ps->hwptr;
 					unsigned int first_bytes = ps->buffer_bytes - ps->hwptr;
 					if (first_bytes >= bytes) {
