@@ -23,6 +23,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/libkern.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/bus.h>
@@ -77,6 +78,130 @@ MALLOC_DEFINE(M_DG00X_ISO, "dg00x_iso", "digi00x ISO DMA buffers");
  * need at least hz/8000 ≈ 8 chunks.  Use 32 for a 4 ms safety margin.
  */
 #define DG00X_ISO_NCHUNKS	32
+
+/* ------------------------------------------------------------------ */
+/* Float <-> S32 conversion (integer-only, no kernel FPU)              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The AFMT_FLOAT path scales IEEE-754 single-precision samples to the
+ * S32 scale the DOT encoder uses (full-scale ±1.0 -> ±0x7fffffff, so
+ * dot_write_pcm_padded() >> 8 yields the full 24-bit wire range).
+ *
+ * Both conversion sites run in contexts where the FreeBSD kernel FPU
+ * is NOT registered: the RX handler executes inside fwohci_task_dma
+ * (fwohci calls ir->hand() while holding FW_GLOCK), and the TX fill
+ * runs from the 1 ms PCM callout with dg00x->lock and FW_GLOCK held.
+ * Executing any FPU instruction there panics with "Unregistered use of
+ * FPU in kernel" and reboots the machine.  These helpers therefore do
+ * the IEEE-754 <-> integer scaling with pure integer bit manipulation.
+ */
+
+/*
+ * Convert an IEEE-754 single-precision bit pattern to the S32 scale
+ * used by the DOT encoder, matching
+ *
+ *     f >= 1.0f        ->  2147483647
+ *     f <= -1.0f       -> -2147483648
+ *     otherwise        -> (int32_t)(f * 2147483647.0f)
+ *
+ * NaN maps to INT32_MIN (the same result cvttss2si produces), ±Inf
+ * clamps like the comparisons above, and zeros/subnormals map to 0.
+ */
+static inline int32_t
+dg00x_f32_to_s32(uint32_t fbits)
+{
+	uint32_t sign = fbits >> 31;
+	uint32_t exp = (fbits >> 23) & 0xff;
+	uint32_t mant = fbits & 0x7fffff;
+	uint32_t mag;
+	int32_t val;
+
+	if (exp == 0xff) {
+		if (mant == 0)
+			/* ±Inf: clamp like f >= 1.0f / f <= -1.0f. */
+			val = (sign != 0) ? (-2147483647 - 1) : 2147483647;
+		else
+			/* NaN: cvttss2si semantics. */
+			val = -2147483647 - 1;
+	} else if (exp == 0) {
+		/* ±0 and subnormals (< 2^-126) are below the S32 LSB. */
+		val = 0;
+	} else {
+		/*
+		 * f = (1 + mant/2^23) * 2^(exp-127), so
+		 * f * 2^31 = (2^23 + mant) * 2^(exp - 119).
+		 */
+		uint32_t m = 0x800000 | mant;	/* 24-bit significand */
+		int shift = (int)exp - 119;
+
+		if (shift >= 8) {
+			/* |f| >= 1.0: m >= 2^23 and m << shift >= 2^31. */
+			val = (sign != 0) ? (-2147483647 - 1) : 2147483647;
+		} else if (shift >= 0) {
+			/* m < 2^24 and shift <= 7, so mag < 2^31. */
+			mag = m << shift;
+			val = (sign != 0) ? -(int32_t)mag : (int32_t)mag;
+		} else {
+			/* Truncate toward zero, like the (int32_t) cast.
+			 * Guard -shift >= 24: m < 2^24 so the result is 0,
+			 * and a shift count >= 32 would be undefined. */
+			if (-shift >= 24)
+				mag = 0;
+			else
+				mag = m >> -shift;
+			val = (sign != 0) ? -(int32_t)mag : (int32_t)mag;
+		}
+	}
+	return (val);
+}
+
+/*
+ * Convert an S32 sample (24-bit top-justified, full scale ±2^31, as
+ * produced by dot_read_pcm: wire value << 8) to an IEEE-754
+ * single-precision bit pattern, matching
+ *
+ *     (float)v / 2147483648.0f
+ *
+ * i.e. round v to 24 significant bits (round-to-nearest-even, as the
+ * hardware float conversion does) and bias the exponent down by 31.
+ */
+static inline uint32_t
+dg00x_s32_to_f32(int32_t v)
+{
+	uint32_t sign, mag, exp, keep;
+	int p;
+
+	if (v == 0)
+		return (0);
+
+	sign = ((uint32_t)v >> 31) & 1;
+	mag = (uint32_t)v;
+	if (sign != 0)
+		mag = 0u - mag;		/* |INT32_MIN| = 2^31 fits uint32 */
+
+	p = fls(mag) - 1;		/* mag in [2^p, 2^(p+1)) */
+	if (p > 23) {
+		/* Round mag (p+1 bits) to 24 significant bits. */
+		uint32_t shift = p - 23;
+		uint32_t rem = mag & ((1u << shift) - 1);
+		uint32_t half = 1u << (shift - 1);
+
+		keep = mag >> shift;
+		if (rem > half || (rem == half && (keep & 1)))
+			keep++;
+		if (keep == (1u << 24)) {	/* rounded up to 2^24 */
+			keep >>= 1;
+			p++;
+		}
+	} else {
+		keep = mag << (23 - p);		/* exact: mag < 2^24 */
+	}
+
+	/* value = mag / 2^31 = 2^(p-31) * (1 + frac) -> exp = p - 31 + 127. */
+	exp = p + 96;
+	return ((sign << 31) | (exp << 23) | (keep & 0x7fffff));
+}
 
 /* ------------------------------------------------------------------ */
 /* CIP header helpers                                                  */
@@ -596,20 +721,19 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 				for (i = 0; i < samples; i++)
 					tmpbuf[i] = 0;
 				if (is_float) {
-					const float *srcf = (const float *)srcbuf;
+					/* Integer-only conversion: this code
+					 * runs from the PCM callout (and the
+					 * RX counterpart from fwohci_task_dma)
+					 * where the kernel FPU is not
+					 * registered — float arithmetic would
+					 * panic ("Unregistered use of FPU"). */
+					const uint32_t *srcu =
+					    (const uint32_t *)srcbuf;
 					unsigned int ns = read_bytes / 4;
 
-					for (i = 0; i < ns; i++) {
-						float f = srcf[i];
-
-						if (f >= 1.0f)
-							tmpbuf[i] = 2147483647;
-						else if (f <= -1.0f)
-							tmpbuf[i] = -2147483648;
-						else
-							tmpbuf[i] =
-							    (int32_t)(f * 2147483647.0f);
-					}
+					for (i = 0; i < ns; i++)
+						tmpbuf[i] =
+						    dg00x_f32_to_s32(srcu[i]);
 				} else if (read_bytes > 0) {
 					memcpy(tmpbuf, srcbuf, read_bytes);
 				}
@@ -793,12 +917,17 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 						 * dot_read_pcm yields 24-bit
 						 * top-justified int32; scale to
 						 * float [-1, 1] (in place).
+						 * Integer-only: this handler
+						 * runs inside fwohci_task_dma
+						 * where the kernel FPU is not
+						 * registered — float arithmetic
+						 * would panic.
 						 */
-						float *tmpf = (float *)tmpbuf;
+						uint32_t *tmpu = (uint32_t *)tmpbuf;
 
 						for (s = 0; s < total_samples; s++)
-							tmpf[s] = (float)tmpbuf[s] /
-							    2147483648.0f;
+							tmpu[s] =
+							    dg00x_s32_to_f32(tmpbuf[s]);
 					}
 					uint8_t *dst = (uint8_t *)ps->substream->runtime->dma_area + ps->hwptr;
 					unsigned int first_bytes = ps->buffer_bytes - ps->hwptr;
