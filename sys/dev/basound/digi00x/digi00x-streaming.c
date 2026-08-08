@@ -470,7 +470,9 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 		unsigned int source_off = ps->hwptr;
 		unsigned int ready_bytes = 0;
 		unsigned int pending_bytes = 0;
-		bool zero_fill = false;
+		unsigned int read_bytes = 0;
+		bool underrun = false;
+		bool shortfall = false;
 		static int zero_dbg;
 		static int data_dbg;
 
@@ -483,12 +485,32 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 			else
 				pending_bytes = ps->buffer_bytes - rp + source_off;
 
-			if (pending_bytes > ready_bytes ||
-			    ready_bytes - pending_bytes < bytes)
-				zero_fill = true;
+			if (pending_bytes > ready_bytes) {
+				/* True underrun: hwptr has advanced past the
+				 * last byte the OSS layer wrote.  Nothing to
+				 * play — silence the whole packet. */
+				underrun = true;
+				read_bytes = 0;
+			} else {
+				/* Data ahead of hwptr.  If it is less than a
+				 * full packet (the app wrote slightly late),
+				 * read only what is available and zero-pad the
+				 * tail instead of dropping the whole packet —
+				 * a full-packet silence is an audible click,
+				 * a few zero samples at a packet edge is not. */
+				read_bytes = ready_bytes - pending_bytes;
+				if (read_bytes > bytes)
+					read_bytes = bytes;
+				if (read_bytes < bytes)
+					shortfall = true;
+			}
 		} else {
-			zero_fill = true;
+			underrun = true;
 		}
+		/* Round to whole samples so the conversion loops below never
+		 * see a partial sample. */
+		if (sample_bytes > 1)
+			read_bytes -= read_bytes % sample_bytes;
 
 		/*
 		 * Debug test tone: synthesize audio directly instead of
@@ -501,10 +523,9 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 			basound_debug_tone_fill_s32le(tmpbuf, frames, nch,
 			    ps->rate);
 			sp = tmpbuf;
-			zero_fill = false;
-		} else if (zero_fill) {
+		} else if (underrun) {
 			if (zero_dbg < 8) {
-				printf("digi00x: tx zero_fill fmt=0x%08x bps=%u "
+				printf("digi00x: tx underrun fmt=0x%08x bps=%u "
 				    "ready=%u pending=%u source_off=%u bytes=%u\n",
 				    txch ? txch->format : 0, sample_bytes,
 				    ready_bytes, pending_bytes, source_off, bytes);
@@ -512,30 +533,53 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 			}
 			memset(tmpbuf, 0, sizeof(tmpbuf));
 			sp = tmpbuf;
-		} else if (sample_bytes == 4 && source_off + bytes <= ps->buffer_bytes) {
+		} else if (read_bytes == bytes && sample_bytes == 4 &&
+		    source_off + bytes <= ps->buffer_bytes) {
+			/* Fast path: full packet available, S32, no wrap. */
 			sp = (const int32_t *)((const uint8_t *)
 			    ps->substream->runtime->dma_area + source_off);
 		} else {
 			unsigned int samples = frames * nch;
 
-			if (source_off + bytes <= ps->buffer_bytes) {
-				memcpy(srcbuf,
-				    (const uint8_t *)ps->substream->runtime->dma_area +
-				    source_off, bytes);
-			} else {
-				unsigned int first = ps->buffer_bytes - source_off;
-				unsigned int second = bytes - first;
-
-				memcpy(srcbuf,
-				    (const uint8_t *)ps->substream->runtime->dma_area +
-				    source_off, first);
-				memcpy(srcbuf + first,
-				    ps->substream->runtime->dma_area, second);
+			if (shortfall && zero_dbg < 8) {
+				printf("digi00x: tx shortfall ready=%u pending=%u "
+				    "source_off=%u bytes=%u read=%u\n",
+				    ready_bytes, pending_bytes,
+				    source_off, bytes, read_bytes);
+				zero_dbg++;
 			}
 
+			/*
+			 * Read read_bytes (possibly less than the full packet
+			 * when the app is momentarily behind) from the ring,
+			 * zero-padding the remainder of the sample buffer.
+			 * Zeroing first means the tail samples are silence;
+			 * only the available prefix carries real audio.
+			 */
 			if (sample_bytes == 4) {
-				sp = (const int32_t *)srcbuf;
+				memset(tmpbuf, 0, sizeof(tmpbuf));
+				if (read_bytes > 0) {
+					if (source_off + read_bytes <= ps->buffer_bytes) {
+						memcpy(tmpbuf,
+						    (const uint8_t *)
+						    ps->substream->runtime->dma_area +
+						    source_off, read_bytes);
+					} else {
+						unsigned int first =
+						    ps->buffer_bytes - source_off;
+						memcpy(tmpbuf,
+						    (const uint8_t *)
+						    ps->substream->runtime->dma_area +
+						    source_off, first);
+						memcpy((uint8_t *)tmpbuf + first,
+						    ps->substream->runtime->dma_area,
+						    read_bytes - first);
+					}
+				}
+				sp = tmpbuf;
 			} else {
+				unsigned int rd_smps = read_bytes / 2;
+
 				/*
 				 * Convert S16_LE → 24-bit top-justified in a
 				 * 32-bit container.  dot_write_pcm_padded()
@@ -551,15 +595,35 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 				 * state machine keying off a byte-2 pattern
 				 * that no longer matches full-scale data.
 				 */
-				const int16_t *src16 = (const int16_t *)srcbuf;
-
 				for (i = 0; i < samples; i++)
-					tmpbuf[i] = ((int32_t)src16[i]) << 16;
+					tmpbuf[i] = 0;
+				if (rd_smps > 0) {
+					if (source_off + read_bytes <= ps->buffer_bytes) {
+						memcpy(srcbuf,
+						    (const uint8_t *)
+						    ps->substream->runtime->dma_area +
+						    source_off, read_bytes);
+					} else {
+						unsigned int first =
+						    ps->buffer_bytes - source_off;
+						memcpy(srcbuf,
+						    (const uint8_t *)
+						    ps->substream->runtime->dma_area +
+						    source_off, first);
+						memcpy(srcbuf + first,
+						    ps->substream->runtime->dma_area,
+						    read_bytes - first);
+					}
+					const int16_t *src16 = (const int16_t *)srcbuf;
+
+					for (i = 0; i < rd_smps; i++)
+						tmpbuf[i] = ((int32_t)src16[i]) << 16;
+				}
 				sp = tmpbuf;
 			}
 		}
 
-		if (!zero_fill && data_dbg < 8) {
+		if (!underrun && data_dbg < 8) {
 			printf("digi00x: tx source fmt=0x%08x bps=%u ready=%u "
 			    "pending=%u s0=0x%08x s1=0x%08x s2=0x%08x s3=0x%08x\n",
 			    txch ? txch->format : 0, sample_bytes,
