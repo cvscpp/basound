@@ -490,10 +490,25 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 			if (sample_bytes == 4) {
 				sp = (const int32_t *)srcbuf;
 			} else {
+				/*
+				 * Convert S16_LE → 24-bit top-justified in a
+				 * 32-bit container.  dot_write_pcm_padded()
+				 * extracts the wire 24-bit value with >> 8,
+				 * so the 16-bit sample must be shifted by 16
+				 * here to end up at full scale on the wire
+				 * (sample << 16 → >> 8 → sample << 8).
+				 *
+				 * Shifting by only 8 (as was done before)
+				 * produced a wire value of the unscaled
+				 * 16-bit sample in the low 24 bits —
+				 * ~48 dB too quiet, with the DOT encoder
+				 * state machine keying off a byte-2 pattern
+				 * that no longer matches full-scale data.
+				 */
 				const int16_t *src16 = (const int16_t *)srcbuf;
 
 				for (i = 0; i < samples; i++)
-					tmpbuf[i] = ((int32_t)src16[i]) << 8;
+					tmpbuf[i] = ((int32_t)src16[i]) << 16;
 				sp = tmpbuf;
 			}
 		}
@@ -648,9 +663,27 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 						    bytes - first_bytes);
 					}
 				} else {
+					/*
+					 * Convert 24-bit top-justified (in a
+					 * 32-bit container, as produced by
+					 * dot_read_pcm: wire << 8) back to
+					 * S16_LE.  The wire 24-bit sample
+					 * carries a full-scale 16-bit value
+					 * in its top 16 bits (sample << 8),
+					 * so after the << 8 from dot_read_pcm
+					 * the sample sits at bit 24; >> 16
+					 * recovers it exactly.
+					 *
+					 * Using >> 8 (as was done before)
+					 * truncated the 24-bit wire value to
+					 * its low 16 bits — for full-scale
+					 * audio that is the sample's low
+					 * byte plus noise, producing
+					 * distorted capture.
+					 */
 					int16_t tmp16[18 * 12];
 					for (s = 0; s < total_samples; s++)
-						tmp16[s] = (int16_t)(tmpbuf[s] >> 8);
+						tmp16[s] = (int16_t)(tmpbuf[s] >> 16);
 
 					uint8_t *dst = (uint8_t *)ps->substream->runtime->dma_area + ps->hwptr;
 					unsigned int first_bytes = ps->buffer_bytes - ps->hwptr;
