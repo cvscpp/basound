@@ -371,10 +371,56 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	unsigned int i;
 
 	/*
+	 * Re-sync with the OSS layer's CURRENT buffer and format on
+	 * every fill.  chn_resizebuf() can reallocate/remap the hardware
+	 * buffer mid-stream (fragment renegotiation, overrun recovery,
+	 * feeder reconfig) — the log shows repeated
+	 * "chn_resizebuf(): PCMDIR_PLAY (hardware) timeout=37" during
+	 * JACK operation.  Each resize can move the DMA buffer, leaving
+	 * our cached dma_area/hwptr/buffer_bytes pointing at stale
+	 * memory: the fill then reads garbage or the zero-fill heuristic
+	 * misfires, producing periodic dropouts that sound like a slow
+	 * (~1 Hz) volume modulation.  This is far more likely to trip at
+	 * 18 channels where the buffers and per-packet byte counts are
+	 * 9x larger than at 2 channels.
+	 *
+	 * Re-reading the current pointers on every fill is cheap (plain
+	 * memory loads) and keeps hwptr, the zero-fill heuristic and
+	 * pcm_pointer() consistent with the buffer the OSS layer is
+	 * actually feeding.
+	 */
+	if (txch != NULL && txch->channel != NULL && txch->buffer != NULL) {
+		/* Pick up any late format renegotiation (SNDCTL_DSP_*). */
+		if (txch->channel->format != 0)
+			txch->format = txch->channel->format;
+
+		if (ps->substream->runtime != NULL) {
+			ps->substream->runtime->dma_area =
+			    txch->buffer->buf;
+			ps->substream->runtime->dma_addr =
+			    txch->buffer->buf_addr;
+			ps->substream->runtime->dma_bytes =
+			    txch->buffer->bufsize;
+		}
+		ps->buffer_bytes = txch->buffer->bufsize;
+		ps->period_bytes = txch->blocksize;
+		if (ps->buffer_bytes > 0)
+			ps->hwptr %= ps->buffer_bytes;
+	}
+
+	/*
 	 * Number of app channels to consume from the interleaved runtime
 	 * buffer.  Never more than the device channel complement.
 	 */
 	nch = ps->pcm_channels;
+	if (txch != NULL) {
+		unsigned int fmt_ch = AFMT_CHANNEL(txch->format);
+
+		if (fmt_ch != 0 && fmt_ch <= ps->device_channels) {
+			nch = fmt_ch;
+			ps->pcm_channels = nch;
+		}
+	}
 	if (nch > ps->device_channels)
 		nch = ps->device_channels;
 
