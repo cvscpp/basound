@@ -1,12 +1,39 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * dice_bsd.c - FreeBSD glue for the ALSA DICE FireWire driver family
+ *
+ * Bridges FreeBSD firewire devices to the DICE (Digital Interface
+ * Communications Engine) audio interface family.  Generic DICE handling
+ * lives here; the device-specific parts (channel maps, MIDI port counts,
+ * quirks) live in per-family files that register themselves through
+ * dice_model_entry tables:
+ *
+ *   dice_alesis_bsd.c - Alesis iO14/iO26 and MultiMix 12/16 FireWire
+ *   dice_maudio_bsd.c - M-Audio ProFire 2626
+ *
+ * The Digidesign Digi 002/003 driver (digi00x) is a separate driver in
+ * its own directory and is not touched here.  DICE matching additionally
+ * validates the DICE GUID category so digi00x devices are never claimed
+ * by this driver.
+ *
+ * The FreeBSD firewire bus requires each child driver to implement a
+ * device_identify method to create its child device (same pattern as
+ * digi00x_bsd.c).
+ *
+ * Copyright (c) Clemens Ladisch
+ * Copyright (c) 2014 Takashi Sakamoto
+ */
+
 #include <sys/param.h>
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/malloc.h>
-#include <dev/firewire/firewire.h>
-#include <dev/firewire/firewirereg.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/callout.h>
+
 #include <dev/sound/pcm/sound.h>
 
 #include <sound/core.h>
@@ -14,76 +41,356 @@
 #include <sound/pcm_params.h>
 #include <sound/rawmidi.h>
 
-#include "../audio_stream.h"
-
-/* DICE FireWire driver - bridges FreeBSD fw_device to ALSA DICE driver */
+#include "dice_bsd.h"
+#include "dice_streaming.h"
+#include "alsa_pcm_bsd.h"
 
 MALLOC_DECLARE(M_ALSA);
-
-#define OUI_WEISS		0x001c6a
-#define OUI_LOUD		0x000ff2
-#define OUI_FOCUSRITE		0x00130e
-#define OUI_TCELECTRONIC	0x000166
-#define OUI_ALESIS		0x000595
-#define OUI_MAUDIO		0x000d6c
-#define OUI_MYTEK		0x001ee8
-#define OUI_SSL			0x0050c2
-#define OUI_PRESONUS		0x000a92
-#define OUI_HARMAN		0x000fd7
-#define OUI_AVID		0x00a07e
-
-#define DICE_CATEGORY_ID	0x04
-#define WEISS_CATEGORY_ID	0x00
-#define LOUD_CATEGORY_ID	0x10
-#define HARMAN_CATEGORY_ID	0x20
-
-struct dice_bsd_softc {
-	device_t dev;
-	struct device alsa_dev;	/* wrapper so card->dev stays valid after attach */
-	struct fw_device *fwdev;
-	void *alsa_dice;
-	
-	/* Audio streaming framework */
-	struct audio_stream playback_stream;
-	struct audio_stream capture_stream;
-	
-	/* FireWire isochronous context (framework ready) */
-	void *tx_context;  /* Transmit/playback context */
-	void *rx_context;  /* Receive/capture context */
-};
-
 MALLOC_DEFINE(M_DICE_BSD, "dice_bsd", "DICE BSD softc");
 
-/* Check if device is DICE category based on device config ROM */
-static int
-dice_bsd_check_dice_category(struct fw_device *fwdev)
+/* External declarations for fwmem transaction helpers (from fwmem.c). */
+extern struct fw_xfer *fwmem_read_quad(struct fw_device *, caddr_t, uint8_t,
+				       uint16_t, uint32_t, void *,
+				       void (*)(struct fw_xfer *));
+extern struct fw_xfer *fwmem_write_quad(struct fw_device *, caddr_t, uint8_t,
+					uint16_t, uint32_t, void *,
+					void (*)(struct fw_xfer *));
+extern struct fw_xfer *fwmem_read_block(struct fw_device *, caddr_t, uint8_t,
+					uint16_t, uint32_t, int, void *,
+					void (*)(struct fw_xfer *));
+
+/* Forward declarations */
+static void dice_identify(driver_t *, device_t);
+static int  dice_probe(device_t);
+static int  dice_attach(device_t);
+static int  dice_detach(device_t);
+static void dice_discover(void *);
+static int  dice_init_card(struct dice_bsd_softc *);
+
+/* ------------------------------------------------------------------ */
+/* FireWire transaction helpers                                        */
+/*                                                                     */
+/* Synchronous quadlet/block reads and quadlet writes with a 5-second  */
+/* timeout, using the same pattern as digi00x-stream.c (fwmem helpers  */
+/* + tsleep instead of fw_xferwait, which hangs forever when the       */
+/* device does not respond).                                           */
+/* ------------------------------------------------------------------ */
+
+struct dice_txn {
+	struct fw_xfer *xfer;
+	int done;
+	int error;
+};
+
+static void
+dice_txn_callback(struct fw_xfer *xfer)
 {
-	uint32_t vendor_id = fwdev->csrrom[3] >> 8;
-	uint32_t category;
+	struct dice_txn *txn = (struct dice_txn *)xfer->sc;
 
-	if (vendor_id == OUI_WEISS)
-		category = WEISS_CATEGORY_ID;
-	else if (vendor_id == OUI_LOUD)
-		category = LOUD_CATEGORY_ID;
-	else if (vendor_id == OUI_HARMAN)
-		category = HARMAN_CATEGORY_ID;
-	else
-		category = DICE_CATEGORY_ID;
-
-	/* Verify category matches */
-	if ((fwdev->csrrom[3] & 0xFF) != category)
-		return -ENODEV;
-
-	return 0;
+	txn->done = 1;
+	txn->error = (xfer->flag != FWXF_RCVD) ? EIO : 0;
+	wakeup(txn);
 }
 
-/* Check if device matches a known DICE vendor ID */
 static int
-dice_bsd_match_vendor(struct fw_device *fwdev)
+dice_wait_txn(struct dice_txn *txn)
 {
-	uint32_t vendor_id = fwdev->csrrom[3] >> 8;
+	int ret;
 
-	switch (vendor_id) {
+	while (!txn->done) {
+		ret = tsleep(txn, 0, "dicetxn", 5 * hz);
+		if (ret == EWOULDBLOCK) {
+			txn->error = ETIMEDOUT;
+			break;
+		}
+		if (txn->done)
+			break;
+		txn->error = EIO;
+		break;
+	}
+
+	/* On timeout the xfer may still be pending; freeing it risks a
+	 * use-after-free if the callback fires later, so we accept the
+	 * small leak instead of a permanently hung process. */
+	if (txn->xfer != NULL)
+		fw_xfer_free(txn->xfer);
+
+	return (txn->error);
+}
+
+int
+dice_read_quad(struct fw_device *fwdev, uint64_t addr, uint32_t *val)
+{
+	struct dice_txn txn;
+	uint32_t offset_hi, offset_lo;
+
+	if (fwdev == NULL || fwdev->fc == NULL)
+		return (EIO);
+
+	offset_hi = (uint32_t)(addr >> 32);
+	offset_lo = (uint32_t)(addr & 0xffffffff);
+
+	txn.done = 0;
+	txn.error = 0;
+	txn.xfer = fwmem_read_quad(fwdev, (caddr_t)&txn, fwdev->speed,
+				    (uint16_t)offset_hi, offset_lo, val,
+				    dice_txn_callback);
+	if (txn.xfer == NULL)
+		return (ENOMEM);
+
+	return (dice_wait_txn(&txn));
+}
+
+/*
+ * Quadlet write.  The value must already be in big-endian (bus) order;
+ * callers convert with htobe32(), matching the digi00x-stream helpers.
+ * Reads (dice_read_quad/block) return raw big-endian data, hence the
+ * be32toh() calls throughout the detect callbacks.
+ */
+int
+dice_write_quad(struct fw_device *fwdev, uint64_t addr, uint32_t val)
+{
+	struct dice_txn txn;
+	uint32_t offset_hi, offset_lo;
+
+	if (fwdev == NULL || fwdev->fc == NULL)
+		return (EIO);
+
+	offset_hi = (uint32_t)(addr >> 32);
+	offset_lo = (uint32_t)(addr & 0xffffffff);
+
+	txn.done = 0;
+	txn.error = 0;
+	txn.xfer = fwmem_write_quad(fwdev, (caddr_t)&txn, fwdev->speed,
+				     (uint16_t)offset_hi, offset_lo, &val,
+				     dice_txn_callback);
+	if (txn.xfer == NULL)
+		return (ENOMEM);
+
+	return (dice_wait_txn(&txn));
+}
+
+int
+dice_read_block(struct fw_device *fwdev, uint64_t addr, void *buf, size_t len)
+{
+	struct dice_txn txn;
+	uint32_t offset_hi, offset_lo;
+
+	if (fwdev == NULL || fwdev->fc == NULL)
+		return (EIO);
+
+	offset_hi = (uint32_t)(addr >> 32);
+	offset_lo = (uint32_t)(addr & 0xffffffff);
+
+	txn.done = 0;
+	txn.error = 0;
+	txn.xfer = fwmem_read_block(fwdev, (caddr_t)&txn, fwdev->speed,
+				     (uint16_t)offset_hi, offset_lo,
+				     (int)len, buf, dice_txn_callback);
+	if (txn.xfer == NULL)
+		return (ENOMEM);
+
+	return (dice_wait_txn(&txn));
+}
+
+/* ------------------------------------------------------------------ */
+/* Section-relative register access                                    */
+/* ------------------------------------------------------------------ */
+
+static uint64_t
+dice_subaddr(struct dice_bsd_softc *sc, unsigned int section,
+	     unsigned int offset)
+{
+	uint64_t base;
+
+	switch (section) {
+	case 1:	/* TX */
+		base = sc->tx_offset;
+		break;
+	case 2:	/* RX */
+		base = sc->rx_offset;
+		break;
+	case 3:	/* EXT_SYNC */
+		base = sc->sync_offset;
+		break;
+	default: /* GLOBAL */
+		base = sc->global_offset;
+		break;
+	}
+	return (DICE_PRIVATE_SPACE + base + offset);
+}
+
+int
+dice_read_global(struct dice_bsd_softc *sc, unsigned int offset,
+		 void *buf, unsigned int len)
+{
+	if (len == 4)
+		return (dice_read_quad(sc->fwdev,
+				       dice_subaddr(sc, 0, offset), buf));
+	return (dice_read_block(sc->fwdev, dice_subaddr(sc, 0, offset),
+				buf, len));
+}
+
+int
+dice_read_tx(struct dice_bsd_softc *sc, unsigned int offset,
+	     void *buf, unsigned int len)
+{
+	if (len == 4)
+		return (dice_read_quad(sc->fwdev,
+				       dice_subaddr(sc, 1, offset), buf));
+	return (dice_read_block(sc->fwdev, dice_subaddr(sc, 1, offset),
+				buf, len));
+}
+
+int
+dice_read_rx(struct dice_bsd_softc *sc, unsigned int offset,
+	     void *buf, unsigned int len)
+{
+	if (len == 4)
+		return (dice_read_quad(sc->fwdev,
+				       dice_subaddr(sc, 2, offset), buf));
+	return (dice_read_block(sc->fwdev, dice_subaddr(sc, 2, offset),
+				buf, len));
+}
+
+/*
+ * Read the DICE section pointer table and validate the layout, following
+ * ALSA's get_subaddrs().  Section offsets are stored in quadlets.
+ */
+static int
+dice_get_subaddrs(struct dice_bsd_softc *sc)
+{
+	static const unsigned int min_values[8] = {
+		10, 0x60 / 4,	/* global offset/size */
+		10, 0x18 / 4,	/* tx offset/size */
+		10, 0x18 / 4,	/* rx offset/size */
+		0, 0,		/* ext sync offset/size */
+	};
+	uint32_t pointers[8];
+	unsigned int i;
+	int err;
+
+	err = dice_read_block(sc->fwdev, DICE_PRIVATE_SPACE,
+			      pointers, sizeof(pointers));
+	if (err != 0)
+		return (err);
+
+	for (i = 0; i < 8; i++) {
+		uint32_t data = be32toh(pointers[i]);
+
+		if (data < min_values[i] || data >= 0x40000)
+			return (ENODEV);
+	}
+
+	sc->global_offset = (uint64_t)be32toh(pointers[0]) * 4;
+	sc->tx_offset = (uint64_t)be32toh(pointers[2]) * 4;
+	sc->rx_offset = (uint64_t)be32toh(pointers[4]) * 4;
+	sc->sync_offset = (uint64_t)be32toh(pointers[6]) * 4;
+
+	return (0);
+}
+
+/* ------------------------------------------------------------------ */
+/* CSR ROM helpers                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Extract specifier_id / version / model from the unit directory.
+ * csrrom[3..4] hold the EUI-64, csrrom[5] is the root directory header.
+ * A unit-directory pointer has type D (3) and key 0x11; its value is the
+ * byte offset of the unit directory.
+ */
+int
+dice_read_unit_directory(struct fw_device *fwdev, uint32_t *specifier_id,
+			 uint32_t *model, uint32_t *version)
+{
+	uint32_t *rom = fwdev->csrrom;
+	uint32_t spec = 0, mod = 0, ver = 0;
+	int i, ui, ud;
+
+	for (i = 6; i < 256; i++) {
+		uint32_t e = rom[i];
+		int type = (e >> 30) & 0x3;
+		int key = (e >> 24) & 0x3f;
+
+		if (type == 3 && key == 0x11) {
+			ui = ((e & 0xffffff) / 4) + 1;
+			ud = 64;
+			while (ui < 256 && ud-- > 0) {
+				uint32_t ue = rom[ui];
+				int utype = (ue >> 30) & 0x3;
+				int ukey = (ue >> 24) & 0x3f;
+
+				if (utype == 0) {
+					switch (ukey) {
+					case 0x12:	/* specifier id */
+						spec = ue & 0xffffff;
+						break;
+					case 0x13:	/* version */
+						ver = ue & 0xffffff;
+						break;
+					case 0x17:	/* model */
+						mod = ue & 0xffffff;
+						break;
+					}
+				}
+				ui++;
+			}
+			break;
+		}
+	}
+
+	if (specifier_id != NULL)
+		*specifier_id = spec;
+	if (model != NULL)
+		*model = mod;
+	if (version != NULL)
+		*version = ver;
+
+	return (0);
+}
+
+/*
+ * Check that GUID and unit directory are constructed according to DICE
+ * rules (ALSA check_dice_category): the GUID's OUI/category bytes and
+ * its 10-bit product ID must match the unit directory's specifier and
+ * model.
+ */
+int
+dice_check_category(struct fw_device *fwdev, uint32_t vendor, uint32_t model)
+{
+	unsigned int category = DICE_CATEGORY_ID;
+
+	if (vendor == OUI_WEISS)
+		category = WEISS_CATEGORY_ID;
+	else if (vendor == OUI_LOUD)
+		category = LOUD_CATEGORY_ID;
+	else if (vendor == OUI_HARMAN)
+		category = HARMAN_CATEGORY_ID;
+
+	if (fwdev->csrrom[3] != ((vendor << 8) | category))
+		return (-1);
+	if (fwdev->csrrom[4] >> 22 != model)
+		return (-1);
+
+	return (0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Device matching                                                     */
+/* ------------------------------------------------------------------ */
+
+static const struct dice_model_entry dice_generic_entry = {
+	.vendor_id	= 0,	/* any known DICE vendor */
+	.model_id	= DICE_MODEL_ANY,
+	.detect		= dice_detect_current_formats,
+	.desc		= "DICE FireWire",
+};
+
+static int
+dice_known_vendor(uint32_t vendor)
+{
+	switch (vendor) {
 	case OUI_WEISS:
 	case OUI_LOUD:
 	case OUI_FOCUSRITE:
@@ -95,347 +402,716 @@ dice_bsd_match_vendor(struct fw_device *fwdev)
 	case OUI_PRESONUS:
 	case OUI_HARMAN:
 	case OUI_AVID:
-		return 0;
+		return (0);
 	default:
-		return -ENODEV;
+		return (-1);
 	}
 }
 
-/* PCM callback implementations with audio streaming framework */
+/*
+ * Match a fw_device against the family model tables, then the generic
+ * DICE fallback.  Explicit model entries (like the M-Audio ProFire 2626,
+ * whose unit directory version differs from DICE_INTERFACE) do not need
+ * the category/version checks; catch-all entries and the generic fallback
+ * do, which keeps non-DICE devices (e.g. Digidesign Digi 002/003, same
+ * OUI as Avid) out of this driver.
+ */
+static const struct dice_model_entry *
+dice_match_device(struct fw_device *fwdev, uint32_t vendor,
+		  uint32_t model, uint32_t version)
+{
+	static const struct dice_model_entry *const tables[] = {
+		dice_alesis_models,
+		dice_maudio_models,
+		NULL,
+	};
+	int t, i;
+
+	/* 1. Explicit model entries. */
+	for (t = 0; tables[t] != NULL; t++) {
+		for (i = 0; tables[t][i].vendor_id != 0; i++) {
+			const struct dice_model_entry *ent = &tables[t][i];
+
+			if (ent->model_id == DICE_MODEL_ANY)
+				continue;
+			if (ent->vendor_id == vendor && ent->model_id == model)
+				return (ent);
+		}
+	}
+
+	/* 2. Catch-all entries (DICE category + interface version). */
+	for (t = 0; tables[t] != NULL; t++) {
+		for (i = 0; tables[t][i].vendor_id != 0; i++) {
+			const struct dice_model_entry *ent = &tables[t][i];
+
+			if (ent->model_id != DICE_MODEL_ANY)
+				continue;
+			if (ent->vendor_id != vendor)
+				continue;
+			if (model < 32 && (ent->not_model_mask & (1u << model)))
+				continue;
+			if (version != DICE_INTERFACE)
+				continue;
+			if (dice_check_category(fwdev, vendor, model) < 0)
+				continue;
+			return (ent);
+		}
+	}
+
+	/* 3. Generic DICE fallback (ALSA's IEEE1394_MATCH_VERSION entry). */
+	if (dice_known_vendor(vendor) == 0 &&
+	    version == DICE_INTERFACE &&
+	    dice_check_category(fwdev, vendor, model) == 0)
+		return (&dice_generic_entry);
+
+	return (NULL);
+}
+
+static const struct dice_model_entry *
+dice_scan_bus(struct dice_bsd_softc *sc, struct fw_device **found)
+{
+	struct fw_device *fwdev;
+	const struct dice_model_entry *model;
+	uint32_t vendor, model_id, version;
+
+	STAILQ_FOREACH(fwdev, &sc->fc->devices, link) {
+		/*
+		 * Accept both FWDEVATTACHED (normal) and FWDEVINIT
+		 * (bus reset in progress): crom_load() runs before the
+		 * device transitions to FWDEVATTACHED, so FWDEVINIT
+		 * devices may already have valid config ROM data.
+		 */
+		if (fwdev->status != FWDEVATTACHED &&
+		    fwdev->status != FWDEVINIT)
+			continue;
+
+		/* EUI-64 OUI (first 3 bytes) = csrrom[3] >> 8. */
+		vendor = fwdev->csrrom[3] >> 8;
+		dice_read_unit_directory(fwdev, NULL, &model_id, &version);
+
+		model = dice_match_device(fwdev, vendor, model_id, version);
+		if (model != NULL) {
+			if (found != NULL)
+				*found = fwdev;
+			return (model);
+		}
+	}
+
+	return (NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* Rate / clock helpers                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Build the SNDRV_PCM_RATE_* mask from the device's clock capabilities.
+ * Very old firmware without GLOBAL_CLOCK_CAPABILITIES is assumed to
+ * support 44.1/48 kHz only (ALSA check_clock_caps fallback).
+ */
+static void
+dice_config_apply_rates(struct dice_device_config *cfg)
+{
+	unsigned int caps = cfg->clock_caps;
+	unsigned int rates = 0, min = 0, max = 0;
+
+	if (caps == 0)
+		caps = CLOCK_CAP_RATE_44100 | CLOCK_CAP_RATE_48000;
+
+#define ADD_RATE(bit, rate)						\
+	do {								\
+		if (caps & (bit)) {					\
+			rates |= (rate);				\
+			if (min == 0 || (rate) < min)			\
+				min = (rate);				\
+			if ((rate) > max)				\
+				max = (rate);				\
+		}							\
+	} while (0)
+
+	ADD_RATE(CLOCK_CAP_RATE_32000, SNDRV_PCM_RATE_32000);
+	ADD_RATE(CLOCK_CAP_RATE_44100, SNDRV_PCM_RATE_44100);
+	ADD_RATE(CLOCK_CAP_RATE_48000, SNDRV_PCM_RATE_48000);
+	ADD_RATE(CLOCK_CAP_RATE_88200, SNDRV_PCM_RATE_88200);
+	ADD_RATE(CLOCK_CAP_RATE_96000, SNDRV_PCM_RATE_96000);
+	ADD_RATE(CLOCK_CAP_RATE_176400, SNDRV_PCM_RATE_176400);
+	ADD_RATE(CLOCK_CAP_RATE_192000, SNDRV_PCM_RATE_192000);
+#undef ADD_RATE
+
+	if (rates == 0) {
+		rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000;
+		min = 44100;
+		max = 48000;
+	}
+
+	cfg->rates = rates;
+	cfg->rate_min = min;
+	cfg->rate_max = max;
+}
+
+/* ------------------------------------------------------------------ */
+/* Generic format detection                                            */
+/*                                                                     */
+/* Reads the currently configured TX/RX stream formats (ALSA            */
+/* snd_dice_stream_detect_current_formats).  Used for devices without  */
+/* a dedicated detect callback, e.g. the Alesis MultiMix 12/16.        */
+/* ------------------------------------------------------------------ */
+
+int
+dice_detect_current_formats(struct dice_bsd_softc *sc,
+			    struct dice_device_config *cfg)
+{
+	uint32_t reg[2];
+	unsigned int tx_count, tx_size, rx_count, rx_size;
+	unsigned int mode = SND_DICE_RATE_MODE_LOW;
+	unsigned int i;
+	int err;
+
+	/* Assume the low rate mode until the streaming layer negotiates
+	 * the actual mode; registers are read from the current state. */
+	err = dice_read_tx(sc, TX_NUMBER, &reg[0], 4);
+	if (err != 0)
+		return (err);
+	err = dice_read_tx(sc, TX_SIZE, &reg[1], 4);
+	if (err != 0)
+		return (err);
+	tx_count = be32toh(reg[0]);
+	tx_size = be32toh(reg[1]) * 4;
+
+	err = dice_read_rx(sc, RX_NUMBER, &reg[0], 4);
+	if (err != 0)
+		return (err);
+	err = dice_read_rx(sc, RX_SIZE, &reg[1], 4);
+	if (err != 0)
+		return (err);
+	rx_count = be32toh(reg[0]);
+	rx_size = be32toh(reg[1]) * 4;
+
+	for (i = 0; i < tx_count && i < MAX_DICE_STREAMS; i++) {
+		err = dice_read_tx(sc, tx_size * i + TX_NUMBER_AUDIO,
+				   reg, sizeof(reg));
+		if (err != 0)
+			return (err);
+		cfg->tx_pcm_chs[i][mode] = be32toh(reg[0]);
+		if (be32toh(reg[1]) > cfg->tx_midi_ports[i])
+			cfg->tx_midi_ports[i] = be32toh(reg[1]);
+	}
+
+	for (i = 0; i < rx_count && i < MAX_DICE_STREAMS; i++) {
+		err = dice_read_rx(sc, rx_size * i + RX_NUMBER_AUDIO,
+				   reg, sizeof(reg));
+		if (err != 0)
+			return (err);
+		cfg->rx_pcm_chs[i][mode] = be32toh(reg[0]);
+		if (be32toh(reg[1]) > cfg->rx_midi_ports[i])
+			cfg->rx_midi_ports[i] = be32toh(reg[1]);
+	}
+
+	return (0);
+}
+
+/* ------------------------------------------------------------------ */
+/* PCM callback implementations                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Total PCM channels for one direction in one rate mode (sum over
+ * streams, matching what a single ALSA PCM device exposes).
+ */
+static void
+dice_config_channel_range(struct dice_device_config *cfg, int capture,
+			  unsigned int *min_ch, unsigned int *max_ch)
+{
+	unsigned int mode, i;
+	unsigned int mn = UINT_MAX, mx = 0;
+
+	for (mode = 0; mode < SND_DICE_RATE_MODE_COUNT; mode++) {
+		unsigned int total = 0;
+
+		for (i = 0; i < MAX_DICE_STREAMS; i++) {
+			if (capture)
+				total += cfg->tx_pcm_chs[i][mode];
+			else
+				total += cfg->rx_pcm_chs[i][mode];
+		}
+		if (total == 0)
+			continue;
+		if (total < mn)
+			mn = total;
+		if (total > mx)
+			mx = total;
+	}
+
+	if (mx == 0) {
+		/* Detection did not provide anything; keep 2 channels. */
+		mn = 2;
+		mx = 2;
+	}
+
+	*min_ch = mn;
+	*max_ch = mx;
+}
+
+/*
+ * Pick the stream pointer for this substream's direction.
+ */
+static struct dice_pcm_stream *
+dice_stream_for_substream(struct snd_pcm_substream *substream)
+{
+	struct snd_card *card = substream->pcm->card;
+	struct dice_bsd_softc *sc = device_get_softc(card->dev->bsddev);
+
+	if (sc->stream == NULL)
+		return (NULL);
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		return (&sc->stream->playback);
+	else
+		return (&sc->stream->capture);
+}
+
 static int
 dice_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_card *card = substream->pcm->card;
 	struct dice_bsd_softc *sc = device_get_softc(card->dev->bsddev);
-	struct audio_stream *stream;
-	
+	struct dice_pcm_stream *ps;
+	unsigned int min_ch, max_ch;
+
 	if (runtime == NULL)
-		return -ENOMEM;
-	
-	/* Select appropriate stream based on direction */
-	stream = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) ?
-		&sc->playback_stream : &sc->capture_stream;
-	
-	/* Set hardware constraints for playback/capture */
+		return (-ENOMEM);
+
+	ps = dice_stream_for_substream(substream);
+	if (ps == NULL)
+		return (-ENODEV);
+
+	/* One open at a time per direction. */
+	if (ps->substream != NULL)
+		return (-EBUSY);
+
+	/* Set hardware constraints for this device. */
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP |
-			   SNDRV_PCM_INFO_MMAP_VALID |
-			   SNDRV_PCM_INFO_INTERLEAVED;
+	    SNDRV_PCM_INFO_MMAP_VALID |
+	    SNDRV_PCM_INFO_INTERLEAVED;
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S24_3LE |
-			      SNDRV_PCM_FMTBIT_S32_LE;
-	runtime->hw.rates = SNDRV_PCM_RATE_44100 |
-			    SNDRV_PCM_RATE_48000 |
-			    SNDRV_PCM_RATE_96000 |
-			    SNDRV_PCM_RATE_192000;
-	runtime->hw.rate_min = 44100;
-	runtime->hw.rate_max = 192000;
-	runtime->hw.channels_min = 2;
-	runtime->hw.channels_max = 8;
+	    SNDRV_PCM_FMTBIT_S32_LE;
+	runtime->hw.rates = sc->cfg.rates;
+	runtime->hw.rate_min = sc->cfg.rate_min;
+	runtime->hw.rate_max = sc->cfg.rate_max;
+
+	dice_config_channel_range(&sc->cfg,
+	    (substream->stream == SNDRV_PCM_STREAM_CAPTURE),
+	    &min_ch, &max_ch);
+	runtime->hw.channels_min = min_ch;
+	runtime->hw.channels_max = max_ch;
+
 	runtime->hw.buffer_bytes_max = 1 << 24; /* 16MB */
 	runtime->hw.period_bytes_min = 512;
 	runtime->hw.period_bytes_max = 1 << 16; /* 64KB */
 	runtime->hw.periods_min = 2;
 	runtime->hw.periods_max = 1024;
-	
-	/* Initialize stream framework */
-	stream->state = AUDIO_STREAM_PREPARED;
-	runtime->private_data = stream;
-	
-	return 0;
+
+	ps->substream = substream;
+	runtime->private_data = ps;
+	return (0);
 }
 
 static int
 dice_pcm_close(struct snd_pcm_substream *substream)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct audio_stream *stream = runtime->private_data;
-	
-	if (stream == NULL)
-		return 0;
-	
-	/* Ensure stream is stopped */
-	if (stream->state == AUDIO_STREAM_RUNNING || 
-	    stream->state == AUDIO_STREAM_PAUSED)
-		audio_stream_stop(stream);
-	
-	stream->state = AUDIO_STREAM_IDLE;
-	return 0;
+	struct dice_pcm_stream *ps = dice_stream_for_substream(substream);
+
+	if (ps == NULL)
+		return (0);
+
+	/* Stop streaming if still active. */
+	if (ps->active) {
+		struct snd_card *card = substream->pcm->card;
+		struct dice_bsd_softc *sc = device_get_softc(card->dev->bsddev);
+
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			dice_streaming_stop_playback(sc);
+		else
+			dice_streaming_stop_capture(sc);
+		ps->active = false;
+	}
+
+	ps->substream = NULL;
+	if (substream->runtime != NULL)
+		substream->runtime->private_data = NULL;
+	return (0);
 }
 
 static int
 dice_pcm_hw_params(struct snd_pcm_substream *substream, void *hw_params)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct audio_stream *stream = runtime->private_data;
+	struct dice_pcm_stream *ps = runtime->private_data;
+	struct snd_card *card = substream->pcm->card;
+	struct dice_bsd_softc *sc = device_get_softc(card->dev->bsddev);
+	struct basound_chan *ch = substream->private_data;
+	unsigned int rate_idx, mode_idx, device_ch = 0, midi = 0;
+	unsigned int rate, pcm_ch, i;
 	int err;
-	
-	if (runtime == NULL)
-		return -ENOMEM;
-	
-	if (stream == NULL)
-		return -EINVAL;
-	
-	/* Validate parameters */
-	if (runtime->hw.rate_min == 0 || runtime->hw.rate_max == 0)
-		return -EINVAL;
-	
-	/* Allocate DMA buffer for audio data */
-	err = snd_pcm_lib_malloc_pages(substream, 
+
+	if (runtime == NULL || ps == NULL)
+		return (-EINVAL);
+
+	err = snd_pcm_lib_malloc_pages(substream,
 				       runtime->hw.buffer_bytes_max);
 	if (err < 0)
-		return err;
-	
-	/* Verify allocation succeeded */
+		return (err);
 	if (runtime->dma_area == NULL)
-		return -ENOMEM;
-	
-	/* Store DMA and stream parameters */
-	mtx_lock(&stream->lock);
+		return (-ENOMEM);
+
 	runtime->dma_bytes = runtime->hw.buffer_bytes_max;
-	stream->dma_virt = runtime->dma_area;
-	stream->dma_phys = runtime->dma_addr;
-	stream->dma_size = runtime->dma_bytes;
-	stream->channels = 2;  /* Default, set properly in hw_params parsing */
-	stream->sample_rate = 48000;  /* Default */
-	mtx_unlock(&stream->lock);
-	
-	return 0;
+
+	/* Extract rate and channel count from basound channel. */
+	rate = (ch != NULL && ch->speed > 0) ? ch->speed : 48000;
+	pcm_ch = (ch != NULL && ch->format != 0) ?
+	    AFMT_CHANNEL(ch->format) : 2;
+
+	/* Determine rate mode and get channel+MIDI counts from config. */
+	if (rate <= 48000)
+		mode_idx = SND_DICE_RATE_MODE_LOW;
+	else if (rate <= 96000)
+		mode_idx = SND_DICE_RATE_MODE_MIDDLE;
+	else
+		mode_idx = SND_DICE_RATE_MODE_HIGH;
+
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+			device_ch += sc->cfg.tx_pcm_chs[i][mode_idx];
+			midi += sc->cfg.tx_midi_ports[i];
+		} else {
+			device_ch += sc->cfg.rx_pcm_chs[i][mode_idx];
+			midi += sc->cfg.rx_midi_ports[i];
+		}
+	}
+
+	if (device_ch == 0)
+		device_ch = pcm_ch;
+	if (pcm_ch > device_ch)
+		pcm_ch = device_ch;
+
+	/* Configure the stream for the streaming layer. */
+	ps->rate = rate;
+	ps->pcm_channels = pcm_ch;
+	ps->device_channels = device_ch;
+	ps->midi_ports = midi;
+	ps->double_pcm_frames = !sc->cfg.disable_double_pcm_frames;
+
+	/* AM824 data block quadlets: one per PCM channel + one for MIDI. */
+	ps->data_block_quadlets = device_ch + (midi > 0 ? 1 : 0);
+
+	/* Dual-wire at >96 kHz doubles the data block. */
+	if (ps->double_pcm_frames && rate > 96000)
+		ps->data_block_quadlets *= 2;
+
+	ps->period_bytes = (ch != NULL) ? ch->blocksize : 512;
+	ps->buffer_bytes = runtime->dma_bytes;
+
+	/*
+	 * Clamp the CIP SFC field.  Rate modes above HIGH need to be
+	 * signalled differently; for now we cap at 192 kHz.
+	 */
+	rate_idx = dice_rate_to_sfc(rate);
+
+	return (0);
 }
 
 static int
 dice_pcm_hw_free(struct snd_pcm_substream *substream)
 {
-	/* Free allocated DMA buffers */
-	return snd_pcm_lib_free_pages(substream);
+	return (snd_pcm_lib_free_pages(substream));
 }
 
 static int
 dice_pcm_prepare(struct snd_pcm_substream *substream)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct audio_stream *stream = runtime->private_data;
-	
-	if (runtime == NULL || runtime->dma_area == NULL)
-		return -EINVAL;
-	
-	if (stream == NULL)
-		return -EINVAL;
-	
-	/* Prepare stream for playback/capture */
-	mtx_lock(&stream->lock);
-	stream->position = 0;
-	stream->state = AUDIO_STREAM_PREPARED;
-	mtx_unlock(&stream->lock);
-	
-	return 0;
+	struct dice_pcm_stream *ps = dice_stream_for_substream(substream);
+
+	if (ps == NULL)
+		return (-EINVAL);
+
+	ps->hwptr = 0;
+	ps->period_accum = 0;
+	ps->tx_dbc = 0;
+	ps->frame_cycle = 0;
+	return (0);
 }
 
 static int
 dice_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct audio_stream *stream = runtime->private_data;
+	struct snd_card *card = substream->pcm->card;
+	struct dice_bsd_softc *sc = device_get_softc(card->dev->bsddev);
 	int err = 0;
-	
-	if (runtime == NULL)
-		return -EINVAL;
-	
-	if (stream == NULL)
-		return -EINVAL;
-	
+
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		/* Start audio streaming via framework */
-		err = audio_stream_start(stream);
-		if (err == 0)
-			runtime->state = SNDRV_PCM_STATE_RUNNING;
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			err = dice_streaming_start_playback(sc);
+		else
+			err = dice_streaming_start_capture(sc);
 		break;
-		
 	case SNDRV_PCM_TRIGGER_STOP:
-		/* Stop audio streaming via framework */
-		err = audio_stream_stop(stream);
-		if (err == 0)
-			runtime->state = SNDRV_PCM_STATE_STOPPED;
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			dice_streaming_stop_playback(sc);
+		else
+			dice_streaming_stop_capture(sc);
 		break;
-		
-	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		/* Pause streaming */
-		err = audio_stream_pause(stream);
-		if (err == 0)
-			runtime->state = SNDRV_PCM_STATE_PAUSED;
-		break;
-		
-	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		/* Resume from pause */
-		err = audio_stream_resume(stream);
-		if (err == 0)
-			runtime->state = SNDRV_PCM_STATE_RUNNING;
-		break;
-		
 	default:
-		return -EINVAL;
+		return (-EINVAL);
 	}
-	
-	return err;
+
+	return (err);
 }
 
 static unsigned long
 dice_pcm_pointer(struct snd_pcm_substream *substream)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct audio_stream *stream = runtime->private_data;
-	unsigned long position;
-	
-	if (runtime == NULL || runtime->dma_area == NULL)
-		return 0;
-	
-	if (stream == NULL)
-		return 0;
-	
-	/* Return current streaming position with wraparound handling */
-	mtx_lock(&stream->lock);
-	position = stream->position % runtime->dma_bytes;
-	mtx_unlock(&stream->lock);
-	
-	return position;
+	struct dice_pcm_stream *ps = dice_stream_for_substream(substream);
+
+	if (ps == NULL || ps->buffer_bytes == 0)
+		return (0);
+	return (ps->hwptr % ps->buffer_bytes);
 }
 
 static const struct snd_pcm_ops dice_pcm_ops = {
-	.open = dice_pcm_open,
-	.close = dice_pcm_close,
-	.hw_params = dice_pcm_hw_params,
-	.hw_free = dice_pcm_hw_free,
-	.prepare = dice_pcm_prepare,
-	.trigger = dice_pcm_trigger,
-	.pointer = dice_pcm_pointer,
+	.open		= dice_pcm_open,
+	.close		= dice_pcm_close,
+	.hw_params	= dice_pcm_hw_params,
+	.hw_free	= dice_pcm_hw_free,
+	.prepare	= dice_pcm_prepare,
+	.trigger	= dice_pcm_trigger,
+	.pointer	= dice_pcm_pointer,
 };
 
-static int
-dice_bsd_probe(device_t dev)
+/* ------------------------------------------------------------------ */
+/* FreeBSD device interface                                            */
+/* ------------------------------------------------------------------ */
+
+static void
+dice_identify(driver_t *driver, device_t parent)
 {
-	struct firewire_dev_comm *fdc;
-	struct fw_device *fwdev;
+	if (device_find_child(parent, "basound_dice", DEVICE_UNIT_ANY) == NULL)
+		BUS_ADD_CHILD(parent, 0, "basound_dice", DEVICE_UNIT_ANY);
+}
 
-	fdc = device_get_softc(dev);
-	if (fdc == NULL)
-		return ENXIO;
-
-	/* Get the fw_device from the FireWire bus */
-	fwdev = NULL;
-	/* Note: In FreeBSD, the fw_device is obtained from the bus.
-	 * For now, we do basic vendor matching.
-	 * The actual device is passed via device_get_ivars(dev)
-	 */
-	if (device_get_ivars(dev) == NULL)
-		return ENXIO;
-
-	fwdev = (struct fw_device *)device_get_ivars(dev);
-
-	/* Check if this is a DICE device */
-	if (dice_bsd_match_vendor(fwdev) < 0)
-		return ENXIO;
-
-	if (dice_bsd_check_dice_category(fwdev) < 0)
-		return ENXIO;
-
+static int
+dice_probe(device_t dev)
+{
+	/* Real device matching happens in attach/discover, where the
+	 * firewire bus has been explored. */
 	device_set_desc(dev, "DICE FireWire Audio Device");
 	return (BUS_PROBE_DEFAULT);
 }
 
 static int
-dice_bsd_attach(device_t dev)
+dice_attach(device_t dev)
 {
 	struct dice_bsd_softc *sc = device_get_softc(dev);
+	struct fw_device *fwdev;
+	const struct dice_model_entry *model;
+
+	/* The ivar on firewire bus children is struct firewire_comm *. */
+	sc->fc = (struct firewire_comm *)device_get_ivars(dev);
+	if (sc->fc == NULL)
+		return (ENXIO);
+
+	sc->dev = dev;
+	sc->fwdev = NULL;
+	sc->model = NULL;
+	sc->attached = false;
+	sc->alsa_dev.bsddev = dev;
+
+	callout_init(&sc->discover_callout, 1);
+
+	/* Try to find the device immediately. */
+	model = dice_scan_bus(sc, &fwdev);
+	if (model != NULL) {
+		int err;
+
+		sc->fwdev = fwdev;
+		sc->model = model;
+		err = dice_init_card(sc);
+		if (err != 0) {
+			/* Attach failed; detach() will not be called, so
+			 * clean up the resources we took here. */
+			dice_streaming_fini(sc);
+			return (err);
+		}
+		return (0);
+	}
+
+	sc->discover_retries = 0;
+	device_printf(dev, "No DICE device found yet, "
+	    "scheduling deferred discovery\n");
+	callout_reset(&sc->discover_callout, hz, dice_discover, sc);
+	return (0);
+}
+
+static void
+dice_discover(void *arg)
+{
+	struct dice_bsd_softc *sc = (struct dice_bsd_softc *)arg;
+	struct fw_device *fwdev;
+	const struct dice_model_entry *model;
+	int err;
+
+	if (sc->attached || sc->fwdev != NULL)
+		return;
+
+	model = dice_scan_bus(sc, &fwdev);
+	if (model == NULL) {
+		sc->discover_retries++;
+		if (sc->discover_retries == 5)
+			device_printf(sc->dev,
+			    "still waiting for DICE device (retry %d)\n",
+			    sc->discover_retries);
+		/* Retry indefinitely - the device will appear after a
+		 * bus reset completes. */
+		callout_reset(&sc->discover_callout, hz, dice_discover, sc);
+		return;
+	}
+
+	device_printf(sc->dev, "DICE device found on firewire bus (%s)\n",
+		      model->desc);
+	sc->fwdev = fwdev;
+	sc->model = model;
+	err = dice_init_card(sc);
+	if (err != 0)
+		device_printf(sc->dev, "Failed to init card: %d\n", err);
+}
+
+/* ------------------------------------------------------------------ */
+/* Card setup                                                          */
+/* ------------------------------------------------------------------ */
+
+static int
+dice_init_card(struct dice_bsd_softc *sc)
+{
 	struct snd_card *card;
 	struct snd_pcm *pcm;
-	struct fw_device *fwdev;
-	int err, unit;
-	
-	/* Get the FireWire device */
-	fwdev = (struct fw_device *)device_get_ivars(dev);
-	if (fwdev == NULL)
-		return ENXIO;
-	
-	sc->dev = dev;
-	sc->fwdev = fwdev;
-	sc->alsa_dev.bsddev = dev;
-	
-	/* Initialize audio streaming framework */
-	audio_stream_init(&sc->playback_stream, "dice_playback_stream");
-	audio_stream_init(&sc->capture_stream, "dice_capture_stream");
-	
-	/* Set up streaming callbacks (framework ready for real implementation) */
-	sc->playback_stream.dev_private = sc;
-	sc->capture_stream.dev_private = sc;
-	/* TODO: Set start/stop/pause/resume callbacks for FireWire transfers */
-	
-	unit = device_get_unit(dev);
-	
-	/* Create ALSA sound card */
-	err = snd_card_new(&sc->alsa_dev, unit, "DICE", NULL, 0, &card);
+	struct snd_rawmidi *rmidi;
+	struct dice_device_config *cfg = &sc->cfg;
+	unsigned int tx_midi = 0, rx_midi = 0, i;
+	uint32_t reg;
+	int err;
+
+	memset(cfg, 0, sizeof(*cfg));
+
+	/* Locate the DICE register sections. */
+	err = dice_get_subaddrs(sc);
 	if (err != 0) {
-		device_printf(dev, "Failed to create ALSA card: %d\n", err);
-		goto fail;
+		device_printf(sc->dev, "DICE subaddresses invalid (%d)\n", err);
+		return (err);
 	}
-	
+
+	/* Clock capabilities; very old firmware does not implement this
+	 * register, in which case we keep the 44.1/48 kHz fallback. */
+	err = dice_read_global(sc, GLOBAL_CLOCK_CAPABILITIES, &reg, 4);
+	if (err == 0)
+		cfg->clock_caps = be32toh(reg);
+
+	/* Device-specific format detection. */
+	err = sc->model->detect(sc, cfg);
+	if (err != 0) {
+		device_printf(sc->dev, "%s: format detection failed (%d)\n",
+			      sc->model->desc, err);
+		return (err);
+	}
+
+	dice_config_apply_rates(cfg);
+
+	err = snd_card_new(&sc->alsa_dev, device_get_unit(sc->dev), "DICE",
+			   NULL, 0, &card);
+	if (err != 0) {
+		device_printf(sc->dev, "Failed to create ALSA card: %d\n", err);
+		return (err);
+	}
+
 	strlcpy(card->driver, "basound_dice", sizeof(card->driver));
-	strlcpy(card->shortname, "DICE FireWire", sizeof(card->shortname));
+	strlcpy(card->shortname, sc->model->desc, sizeof(card->shortname));
 	snprintf(card->longname, sizeof(card->longname),
-		"DICE FireWire audio interface");
-	
-	/* Create PCM device */
+		 "%s, GUID %08x%08x at S%d",
+		 sc->model->desc, sc->fwdev->csrrom[3], sc->fwdev->csrrom[4],
+		 100 << sc->fwdev->speed);
+
+	/* One PCM device covering playback (RX) and capture (TX). */
 	err = snd_pcm_new(card, "DICE Audio", 0, 1, 1, &pcm);
 	if (err != 0) {
-		device_printf(dev, "Failed to create PCM device: %d\n", err);
+		device_printf(sc->dev, "Failed to create PCM device: %d\n", err);
 		snd_card_free(card);
-		goto fail;
+		return (err);
 	}
-	
+
 	pcm->private_data = sc;
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &dice_pcm_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &dice_pcm_ops);
-	
-	/* Create MIDI device */
-	err = snd_rawmidi_new(card, "DICE MIDI", 0, 1, 1, NULL);
-	if (err != 0) {
-		device_printf(dev, "Failed to create MIDI device: %d\n", err);
-		/* MIDI is optional, continue without it */
+
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		tx_midi += cfg->tx_midi_ports[i];
+		rx_midi += cfg->rx_midi_ports[i];
 	}
-	
-	/* Register with sound system */
+	err = snd_rawmidi_new(card, "DICE MIDI", 0, rx_midi, tx_midi, &rmidi);
+	if (err != 0) {
+		device_printf(sc->dev, "Failed to create MIDI device: %d\n",
+			      err);
+		/* MIDI is optional, continue without it. */
+	}
+
 	err = snd_card_register(card);
 	if (err != 0) {
-		device_printf(dev, "Failed to register ALSA card: %d\n", err);
+		device_printf(sc->dev, "Failed to register ALSA card: %d\n",
+			      err);
 		snd_card_free(card);
-		goto fail;
+		return (err);
 	}
-	
-	device_printf(dev, "DICE FireWire audio device attached\n");
-	return 0;
-	
-fail:
-	audio_stream_destroy(&sc->playback_stream);
-	audio_stream_destroy(&sc->capture_stream);
-	return ENXIO;
+
+	/* Initialise the ISO DMA streaming layer. */
+	err = dice_streaming_init(sc);
+	if (err != 0) {
+		device_printf(sc->dev, "Failed to init streaming: %d\n", err);
+		snd_card_free(card);
+		return (err);
+	}
+
+	sc->attached = true;
+	device_printf(sc->dev, "%s attached (rates %u-%u, "
+	    "capture %u/%u ch, playback %u/%u ch)\n",
+	    sc->model->desc, cfg->rate_min, cfg->rate_max,
+	    cfg->tx_pcm_chs[0][0] + cfg->tx_pcm_chs[1][0],
+	    cfg->tx_pcm_chs[0][SND_DICE_RATE_MODE_HIGH] +
+	    cfg->tx_pcm_chs[1][SND_DICE_RATE_MODE_HIGH],
+	    cfg->rx_pcm_chs[0][0] + cfg->rx_pcm_chs[1][0],
+	    cfg->rx_pcm_chs[0][SND_DICE_RATE_MODE_HIGH] +
+	    cfg->rx_pcm_chs[1][SND_DICE_RATE_MODE_HIGH]);
+
+	return (0);
 }
 
 static int
-dice_bsd_detach(device_t dev)
+dice_detach(device_t dev)
 {
 	struct dice_bsd_softc *sc = device_get_softc(dev);
-	
-	if (sc != NULL) {
-		audio_stream_destroy(&sc->playback_stream);
-		audio_stream_destroy(&sc->capture_stream);
-	}
-	
-	return 0;
+
+	if (sc == NULL)
+		return (0);
+
+	callout_drain(&sc->discover_callout);
+	dice_streaming_fini(sc);
+	sc->attached = false;
+
+	return (0);
 }
 
 static device_method_t dice_bsd_methods[] = {
-	DEVMETHOD(device_probe,		dice_bsd_probe),
-	DEVMETHOD(device_attach,	dice_bsd_attach),
-	DEVMETHOD(device_detach,	dice_bsd_detach),
+	DEVMETHOD(device_identify,	dice_identify),
+	DEVMETHOD(device_probe,		dice_probe),
+	DEVMETHOD(device_attach,	dice_attach),
+	DEVMETHOD(device_detach,	dice_detach),
 	DEVMETHOD_END
 };
 
