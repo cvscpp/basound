@@ -193,10 +193,10 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	 * constraints and should use the full basound_fmtlist so JACK,
 	 * Audacious and other apps discover the full channel range.
 	 *
-	 * digi00x additionally advertises AFMT_FLOAT (Audacious' default
-	 * output format) because its sample path converts float → 24-bit
-	 * before DOT encoding.  HDSP/DICE are bitperfect and consume raw
-	 * S16/S32 only — exposing FLOAT to them would play garbage.
+	 * digi00x and DICE additionally advertise AFMT_FLOAT (Audacious'
+	 * default output format) because their sample paths convert float
+	 * → 24-bit int before encoding.  HDSP is bitperfect and consumes
+	 * raw S16/S32 only — exposing FLOAT to it would play garbage.
 	 *
 	 * Drivers without an .open callback (e.g. USB Line6) are simple
 	 * stereo-only devices that use basound_line6_fmtlist.
@@ -204,12 +204,21 @@ basound_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b, struct pcm_chan
 	 * NOTE: This must run AFTER ops->open() so that ch->runtime->hw
 	 * is populated with the real constraints before we inspect it. */
 	if (substream->pstr->ops && substream->pstr->ops->open &&
-	    ch->runtime != NULL &&
-	    ch->runtime->hw.channels_max > 2) {
-		if (strcmp(pcm->card->driver, "Digi00x") == 0)
+	    ch->runtime != NULL) {
+		if (strcmp(pcm->card->driver, "basound_dice") == 0) {
+			/* DICE advertises a stereo playback stream even when
+			 * its RX_NUMBER_AUDIO is 0 (channels_min/max fall
+			 * back to 2), so it must still get the float list.
+			 * Audacious defaults to FLOAT output. */
 			ch->caps.fmtlist = basound_fmtlist_dg00x;
-		else
-			ch->caps.fmtlist = basound_fmtlist;
+		} else if (ch->runtime->hw.channels_max > 2) {
+			if (strcmp(pcm->card->driver, "Digi00x") == 0)
+				ch->caps.fmtlist = basound_fmtlist_dg00x;
+			else
+				ch->caps.fmtlist = basound_fmtlist;
+		} else {
+			ch->caps.fmtlist = basound_line6_fmtlist;
+		}
 	} else {
 		ch->caps.fmtlist = basound_line6_fmtlist;
 	}

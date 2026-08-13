@@ -234,6 +234,96 @@ dice_decode_am824(int32_t *dest, const uint32_t *src, unsigned int channels)
 }
 
 /* ------------------------------------------------------------------ */
+/* Float <-> S32 conversion (integer-only, no kernel FPU)              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The AFMT_FLOAT path scales IEEE-754 single-precision samples to the
+ * same 24-bit-in-32 scale the AM824 encoder consumes: full-scale ±1.0
+ * maps to ±0x7fffffff, whose top 24 bits (>> 8) cover the full wire
+ * range.
+ *
+ * Both conversion sites run in contexts where the FreeBSD kernel FPU
+ * is NOT registered: the RX handler runs inside fwohci_task_dma while
+ * FW_GLOCK is held, and the TX fill runs from the 1 ms PCM callout.
+ * Executing any FPU instruction there panics with "Unregistered use of
+ * FPU in kernel", so these helpers use pure integer bit manipulation.
+ */
+static inline int32_t
+dice_f32_to_s32(uint32_t fbits)
+{
+	uint32_t sign = fbits >> 31;
+	uint32_t exp = (fbits >> 23) & 0xff;
+	uint32_t mant = fbits & 0x7fffff;
+	uint32_t mag;
+	int32_t val;
+
+	if (exp == 0xff) {
+		if (mant == 0)
+			/* ±Inf: clamp like f >= 1.0f / f <= -1.0f. */
+			val = (sign != 0) ? (-2147483647 - 1) : 2147483647;
+		else
+			/* NaN: cvttss2si semantics. */
+			val = -2147483647 - 1;
+	} else if (exp == 0) {
+		/* ±0 and subnormals (< 2^-126) are below the S32 LSB. */
+		val = 0;
+	} else {
+		uint32_t m = 0x800000 | mant;	/* 24-bit significand */
+		int shift = (int)exp - 119;
+
+		if (shift >= 8) {
+			val = (sign != 0) ? (-2147483647 - 1) : 2147483647;
+		} else if (shift >= 0) {
+			mag = m << shift;
+			val = (sign != 0) ? -(int32_t)mag : (int32_t)mag;
+		} else {
+			if (-shift >= 24)
+				mag = 0;
+			else
+				mag = m >> -shift;
+			val = (sign != 0) ? -(int32_t)mag : (int32_t)mag;
+		}
+	}
+	return (val);
+}
+
+static inline uint32_t
+dice_s32_to_f32(int32_t v)
+{
+	uint32_t sign, mag, exp, keep;
+	int p;
+
+	if (v == 0)
+		return (0);
+
+	sign = ((uint32_t)v >> 31) & 1;
+	mag = (uint32_t)v;
+	if (sign != 0)
+		mag = 0u - mag;		/* |INT32_MIN| = 2^31 fits uint32 */
+
+	p = fls(mag) - 1;		/* mag in [2^p, 2^(p+1)) */
+	if (p > 23) {
+		uint32_t shift = p - 23;
+		uint32_t rem = mag & ((1u << shift) - 1);
+		uint32_t half = 1u << (shift - 1);
+
+		keep = mag >> shift;
+		if (rem > half || (rem == half && (keep & 1)))
+			keep++;
+		if (keep == (1u << 24)) {
+			keep >>= 1;
+			p++;
+		}
+	} else {
+		keep = mag << (23 - p);
+	}
+
+	exp = p + 96;
+	return ((sign << 31) | (exp << 23) | (keep & 0x7fffff));
+}
+
+/* ------------------------------------------------------------------ */
 /* DICE register helpers — use the proper dice_write_quad from dice_bsd.c */
 /* ------------------------------------------------------------------ */
 
@@ -282,6 +372,7 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 	struct basound_chan *txch = ps->substream ?
 	    ps->substream->private_data : NULL;
 	unsigned int sample_bytes;
+	bool is_float;
 
 	if (txch != NULL && txch->channel != NULL && txch->buffer != NULL) {
 		if (txch->channel->format != 0)
@@ -310,6 +401,8 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 
 	sample_bytes = (txch != NULL) ? AFMT_BPS(txch->format) : 4;
 	if (sample_bytes != 2 && sample_bytes != 4) sample_bytes = 4;
+	is_float = (txch != NULL) &&
+	    (AFMT_ENCODING(txch->format) == AFMT_FLOAT);
 
 	bytes = frames * nch * sample_bytes;
 	pkt_len = 8 + frames * dbs * 4;
@@ -362,13 +455,15 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 				memset(tmpbuf, 0, frames * nch * sizeof(int32_t));
 				sp = tmpbuf;
 			} else if (read_bytes >= bytes && sample_bytes == 4 &&
-			    source_off + bytes <= ps->buffer_bytes) {
+			    !is_float && source_off + bytes <= ps->buffer_bytes) {
 				sp = (const int32_t *)((const uint8_t *)
 				    ps->substream->runtime->dma_area + source_off);
 			} else {
 				unsigned int samples = frames * nch;
 				for (i = 0; i < samples; i++) tmpbuf[i] = 0;
 				if (read_bytes > 0 && sample_bytes == 4) {
+					unsigned int ns = read_bytes / 4;
+
 					if (source_off + read_bytes <= ps->buffer_bytes)
 						memcpy(tmpbuf,
 						    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
@@ -381,6 +476,12 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 						memcpy((uint8_t *)tmpbuf + first,
 						    ps->substream->runtime->dma_area,
 						    read_bytes - first);
+					}
+					if (is_float) {
+						uint32_t *u = (uint32_t *)tmpbuf;
+
+						for (i = 0; i < ns; i++)
+							tmpbuf[i] = dice_f32_to_s32(u[i]);
 					}
 				} else if (read_bytes > 0 && sample_bytes == 2) {
 					unsigned int rd = read_bytes / 2;
@@ -443,6 +544,8 @@ dice_rx_handler(struct fw_xferq *xferq)
 		    xferq->buf != NULL) {
 			struct basound_chan *rxch = ps->substream->private_data;
 			unsigned int sample_bytes = (rxch) ? AFMT_BPS(rxch->format) : 4;
+			bool is_float = (rxch != NULL) &&
+			    (AFMT_ENCODING(rxch->format) == AFMT_FLOAT);
 			uint32_t *payload;
 			unsigned int nch;
 
@@ -463,6 +566,14 @@ dice_rx_handler(struct fw_xferq *xferq)
 					const uint32_t *blk = &payload[CIP_HEADER_QUADLETS + fi * dbs];
 					unsigned int mo = ps->midi_ports > 0 ? 1 : 0;
 					dice_decode_am824(&tmpbuf[fi * nch], &blk[mo], nch);
+				}
+
+				if (is_float) {
+					unsigned int s;
+
+					for (s = 0; s < frames * nch; s++)
+						tmpbuf[s] = (int32_t)
+						    dice_s32_to_f32(tmpbuf[s]);
 				}
 
 				if (sample_bytes == 4 &&
