@@ -19,6 +19,9 @@ SRCS=	sys/dev/basound/basound.c \
 	sys/dev/basound/hdsp/hdsp_midi.c \
 	sys/dev/basound/hdsp/hdsp_cdev.c \
 	sys/dev/basound/dice/dice_bsd.c \
+	sys/dev/basound/dice/dice_alesis_bsd.c \
+	sys/dev/basound/dice/dice_maudio_bsd.c \
+	sys/dev/basound/dice/dice_streaming.c \
 	sys/dev/basound/line6/line6_bsd.c \
 	sys/dev/basound/maudio/maudio_midisport.c \
 	sys/dev/basound/digi00x/digi00x_bsd.c \
@@ -38,5 +41,8 @@ CFLAGS+= -I${.CURDIR}/sys/alsa/include \
 	-I${.CURDIR}/sys/dev/basound/hdsp \
 	-I${.CURDIR}/sys/dev/basound/digi00x \
 	-I${.CURDIR}/sys/dev/usb
+
+.PATH: ${SYSDIR}/dev/sound/midi
+SRCS+=	mpu_if.h mpufoi_if.h
 
 .include <bsd.kmod.mk>

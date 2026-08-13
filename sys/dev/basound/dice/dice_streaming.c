@@ -19,10 +19,6 @@
 #include <sys/mbuf.h>
 #include <machine/bus.h>
 
-#include <dev/firewire/firewire.h>
-#include <dev/firewire/firewirereg.h>
-#include <dev/firewire/fwdma.h>
-
 #include <sys/lock.h>
 #include <sys/mutex.h>
 
@@ -32,6 +28,7 @@
 #include <sound/pcm.h>
 
 #include "dice_bsd.h"
+#include <dev/firewire/fwdma.h>
 #include "dice_streaming.h"
 #include "alsa_pcm_bsd.h"
 
@@ -372,7 +369,6 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 				unsigned int samples = frames * nch;
 				for (i = 0; i < samples; i++) tmpbuf[i] = 0;
 				if (read_bytes > 0 && sample_bytes == 4) {
-					unsigned int rd = read_bytes / 4;
 					if (source_off + read_bytes <= ps->buffer_bytes)
 						memcpy(tmpbuf,
 						    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
@@ -613,7 +609,7 @@ dice_stream_configure(struct dice_pcm_stream *ps, int dir, unsigned int rate)
 int
 dice_streaming_start_playback(struct dice_bsd_softc *sc)
 {
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx;
+	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
 	struct dice_pcm_stream *ps = &DSTREAM(sc)->playback;
 	struct fw_xferq *xferq;
 	struct firewire_comm *fc;
@@ -666,7 +662,7 @@ dice_streaming_start_playback(struct dice_bsd_softc *sc)
 int
 dice_streaming_start_capture(struct dice_bsd_softc *sc)
 {
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
+	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx;
 	struct dice_pcm_stream *ps = &DSTREAM(sc)->capture;
 	struct fw_xferq *xferq;
 	struct firewire_comm *fc;
@@ -708,7 +704,7 @@ dice_streaming_stop_playback(struct dice_bsd_softc *sc)
 {
 	if (sc->stream == NULL) return;
 	struct dice_pcm_stream *ps = &DSTREAM(sc)->playback;
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx;
+	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
 	struct firewire_comm *fc = ISO_FC(ch);
 
 	if (ch->dmach < 0) return;
@@ -729,7 +725,7 @@ dice_streaming_stop_capture(struct dice_bsd_softc *sc)
 {
 	if (sc->stream == NULL) return;
 	struct dice_pcm_stream *ps = &DSTREAM(sc)->capture;
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
+	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx;
 	struct firewire_comm *fc = ISO_FC(ch);
 
 	if (ch->dmach < 0) return;
@@ -748,7 +744,7 @@ void
 dice_streaming_refill_tx(struct dice_bsd_softc *sc)
 {
 	if (sc->stream == NULL) return;
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx;
+	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
 	struct dice_pcm_stream *ps = &DSTREAM(sc)->playback;
 	struct fw_xferq *xferq;
 	struct firewire_comm *fc;

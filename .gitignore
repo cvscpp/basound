@@ -15,6 +15,8 @@ feeder_if.h
 i386
 machine
 mixer_if.h
+mpu_if.h
+mpufoi_if.h
 opt_global.h
 pci_if.h
 tools/bsm_digi00x/bsm_digi00x

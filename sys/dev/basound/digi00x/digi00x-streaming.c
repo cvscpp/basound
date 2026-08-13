@@ -579,7 +579,8 @@ dg00x_fill_tx_chunk(struct snd_dg00x *dg00x, struct fw_xferq *xferq,
 	    CIP_FMT_AM, ps->fdf, 0xffff);
 
 	for (i = 0; i < frames; i++)
-		payload[CIP_HEADER_QUADLETS + i * dbs] = 0x00000080;
+		payload[CIP_HEADER_QUADLETS + i * dbs] =
+		    dot_write_midi_one(dg00x->tx_midi);
 
 	/*
 	 * Read PCM data from the DMA ring at ps->hwptr, but do not call
@@ -980,6 +981,18 @@ dg00x_rx_handler(struct fw_xferq *xferq)
 				ps->hwptr = 0;
 
 			dg00x_pcm_update_position(ps, bytes);
+
+			/* Read MIDI bytes from each data block's
+			 * MIDI quadlet.  MIDI is at payload[CIP_HEADER_QUADLETS
+			 * + f * dbs] for each frame f. */
+			{
+				unsigned int f;
+
+				for (f = 0; f < frames; f++)
+					dot_read_midi_one(
+					    payload[CIP_HEADER_QUADLETS +
+					    f * dbs], dg00x->rx_midi);
+			}
 		}
 
 		/* Recycle the chunk for the next receive */

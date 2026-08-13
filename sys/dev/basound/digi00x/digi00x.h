@@ -30,10 +30,12 @@ struct fw_device;
 #include <sound/pcm_params.h>
 #include <sound/firewire.h>
 #include <sound/hwdep.h>
-#include <sound/rawmidi.h>
 #include <linux/wait.h>
 
 #include "amdtp-dot.h"
+
+/* Forward declaration from dev/sound/midi/midi.h */
+struct snd_midi;
 
 struct snd_dg00x;
 
@@ -53,9 +55,6 @@ struct dg00x_stream {
 	unsigned int midi_ports;
 	unsigned int rate;
 	struct dot_state state;
-	struct snd_rawmidi_substream *midi[3];
-	int midi_fifo_used[3];
-	int midi_fifo_limit;
 };
 
 /* PCM streaming state — hwptr is driven by ISO DMA handlers.
@@ -199,6 +198,10 @@ struct snd_dg00x {
 
 	/* Console models have additional MIDI ports. */
 	bool is_console;
+
+	/* MIDI devices created by dg00x_create_midi(). */
+	struct snd_midi *tx_midi[DOT_MAX_MIDI_PORTS];
+	struct snd_midi *rx_midi[DOT_MAX_MIDI_PORTS];
 
 	/* Async message addr registered with device */
 	uint64_t async_handler_offset;

@@ -13,6 +13,10 @@
 #include <sound/control.h>
 #include "../audio_stream.h"
 
+/* Forward declarations for MIDI (full includes in hdsp_midi.c) */
+struct mpu401;
+typedef int mpu401_intr_t(struct mpu401 *);
+
 /* Register Offsets */
 #define HDSP_resetPointer               0
 #define HDSP_freqReg                    0
@@ -68,12 +72,11 @@ enum HDSP_IO_Type {
 struct hdsp_midi {
 	struct hdsp *hdsp;
 	int id;
-	/* struct snd_rawmidi_substream *input; */
-	/* struct snd_rawmidi_substream *output; */
 	char pending;
 	struct mtx lock;
-	/* struct timer_list timer; */
 	int istimer;
+	struct mpu401 *mpu;
+	mpu401_intr_t *mpu_intr;
 };
 
 struct hdsp {
@@ -235,6 +238,8 @@ int hdsp_read_gain(struct hdsp *hdsp, int addr);
 int hdsp_write_gain(struct hdsp *hdsp, unsigned int addr, unsigned short data);
 void snd_hdsp_create_mixer(struct snd_card *card, struct hdsp *hdsp);
 void snd_hdsp_midi_work(struct work_struct *work);
+int  snd_hdsp_create_midi(struct hdsp *hdsp);
+void snd_hdsp_free_midi(struct hdsp *hdsp);
 
 /* Character device for the native FreeBSD mixer tool */
 int  hdsp_cdev_create(struct hdsp *hdsp, int unit);

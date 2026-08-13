@@ -15,8 +15,8 @@
 
 #include <sys/types.h>
 
-/* Forward declaration from sound/rawmidi.h */
-struct snd_rawmidi_substream;
+/* Forward declaration from dev/sound/midi/midi.h */
+struct snd_midi;
 
 /*
  * The double-oh-three algorithm. Each audio sample (32-bit cell) has its
@@ -62,16 +62,33 @@ void dot_write_silence(uint32_t *dest, unsigned int channels,
 		       unsigned int data_blocks,
 		       unsigned int data_block_quadlets);
 
-/* MIDI encode/decode within DOT data block (byte 0 = MIDI byte, byte 3 = control) */
+/*
+ * MIDI encode/decode within DOT data block.
+ *
+ * DOT MIDI format (one byte per data block per port):
+ *   b[0] = 0x80 (no MIDI) or 0x81 | port (MIDI present)
+ *   b[1] = MIDI data byte
+ *   b[2] = 0x02 (DOT MIDI marker), set by dot_encode_step()
+ *   b[3] = 0
+ *
+ * midi_out is called to pull bytes from the FreeBSD midi(4) output
+ * queue; midi_in pushes received bytes into the input queue.
+ */
 void dot_write_midi(uint32_t *buffer, unsigned int data_blocks,
-		    unsigned int data_block_counter,
-		    struct snd_rawmidi_substream *midi[3],
-		    int midi_fifo_used[3], int midi_fifo_limit,
-		    unsigned int syt_interval, unsigned int sfc_rate,
+		    struct snd_midi *midi_out[DOT_MAX_MIDI_PORTS],
 		    unsigned int data_block_quadlets);
 
 void dot_read_midi(const uint32_t *buffer, unsigned int data_blocks,
-		   struct snd_rawmidi_substream *midi[3],
+		   struct snd_midi *midi_in[DOT_MAX_MIDI_PORTS],
 		   unsigned int data_block_quadlets);
+
+/*
+ * Write MIDI bytes into a single DOT data-block MIDI quadlet.
+ * Called once per data block from the TX fill path.
+ * Returns the MIDI quadlet value in host byte order.
+ */
+uint32_t dot_write_midi_one(struct snd_midi *mo[DOT_MAX_MIDI_PORTS]);
+void dot_read_midi_one(uint32_t quadlet,
+		       struct snd_midi *mi[DOT_MAX_MIDI_PORTS]);
 
 #endif

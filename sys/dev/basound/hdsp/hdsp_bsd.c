@@ -164,6 +164,9 @@ hdsp_bsd_detach(device_t dev)
 	/* Free planar DMA buffers before tearing down the card and PCI resources. */
 	hdsp_free_dma_buffers(&sc->chip);
 
+	/* Tear down MIDI ports (mpu401_uninit → midi_uninit). */
+	snd_hdsp_free_midi(&sc->chip);
+
 	if (sc->chip.card) {
 		snd_card_free(sc->chip.card);
 	}

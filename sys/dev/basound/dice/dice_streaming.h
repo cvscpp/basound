@@ -28,14 +28,13 @@
 #include <sys/mutex.h>
 #include <sys/callout.h>
 
-#include <dev/firewire/firewire.h>
-#include <dev/firewire/firewirereg.h>
-
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 
-#include "dice_bsd.h"
+/* Forward declarations — dice_streaming.h does NOT include dice_bsd.h
+ * to avoid pulling firewire.h/firewirereg.h twice (those headers lack
+ * include guards). */
 
 /* Forward declarations */
 struct dice_bsd_softc;

@@ -750,7 +750,7 @@ dice_pcm_hw_params(struct snd_pcm_substream *substream, void *hw_params)
 	struct snd_card *card = substream->pcm->card;
 	struct dice_bsd_softc *sc = device_get_softc(card->dev->bsddev);
 	struct basound_chan *ch = substream->private_data;
-	unsigned int rate_idx, mode_idx, device_ch = 0, midi = 0;
+	unsigned int mode_idx, device_ch = 0, midi = 0;
 	unsigned int rate, pcm_ch, i;
 	int err;
 
@@ -810,12 +810,6 @@ dice_pcm_hw_params(struct snd_pcm_substream *substream, void *hw_params)
 
 	ps->period_bytes = (ch != NULL) ? ch->blocksize : 512;
 	ps->buffer_bytes = runtime->dma_bytes;
-
-	/*
-	 * Clamp the CIP SFC field.  Rate modes above HIGH need to be
-	 * signalled differently; for now we cap at 192 kHz.
-	 */
-	rate_idx = dice_rate_to_sfc(rate);
 
 	return (0);
 }

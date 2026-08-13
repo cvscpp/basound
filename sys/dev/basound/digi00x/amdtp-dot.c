@@ -12,8 +12,9 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/kobj.h>
 
-#include <sound/rawmidi.h>
+#include <dev/sound/midi/midi.h>
 
 #include "amdtp-dot.h"
 
@@ -156,38 +157,77 @@ dot_write_silence(uint32_t *dest, unsigned int channels,
 	}
 }
 
-void
-dot_write_midi(uint32_t *buffer, unsigned int data_blocks,
-	       unsigned int data_block_counter __unused,
-	       struct snd_rawmidi_substream *midi[3] __unused,
-	       int midi_fifo_used[3] __unused, int midi_fifo_limit __unused,
-	       unsigned int syt_interval __unused, unsigned int sfc_rate __unused,
-	       unsigned int data_block_quadlets)
+/*
+ * Write MIDI bytes from the FreeBSD midi(4) output queue into DOT data
+ * blocks.  One byte per data block per port: b[0] = 0x80 | (port+1),
+ * b[1] = MIDI byte, b[2] = 0x02 (DOT MIDI marker), b[3] = 0.
+ * Called from the TX refill callout (every 1 ms).
+ */
+/*
+ * Build a single DOT MIDI quadlet (host byte order) for one data block.
+ * Returns the final quadlet; callers write it into the TX packet.
+ */
+uint32_t
+dot_write_midi_one(struct snd_midi *mo[DOT_MAX_MIDI_PORTS])
 {
-	unsigned int f;
+	uint8_t b[4] = {0x80, 0, 0, 0};
+	uint8_t midi_byte;
+	unsigned int p;
 
-	for (f = 0; f < data_blocks; f++) {
-		uint8_t *b = (uint8_t *)&buffer[0];
-
-		/* TODO: Transmit MIDI bytes using snd_rawmidi_transmit */
-		b[0] = 0x80;
-		b[1] = 0;
-		b[2] = 0;
-		b[3] = 0;
-
-		buffer += data_block_quadlets;
+	/* Try each output port in order. */
+	for (p = 0; p < DOT_MIDI_OUT_PORTS; p++) {
+		if (mo[p] != NULL &&
+		    midi_out(mo[p], &midi_byte, 1) == 1) {
+			b[0] = 0x80 | (p + 1);
+			b[1] = midi_byte;
+			b[2] = 0x02;	/* DOT MIDI marker */
+			break;
+		}
 	}
+
+	return ((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+		((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
 }
 
+/*
+ * Decode a single DOT MIDI quadlet from the RX packet and push the byte
+ * into the FreeBSD midi(4) input queue.
+ */
+void
+dot_read_midi_one(uint32_t quadlet,
+		  struct snd_midi *mi[DOT_MAX_MIDI_PORTS])
+{
+	unsigned int port = quadlet & 0x0f;
+	uint8_t midi_byte = (quadlet >> 8) & 0xff;
+
+	if (port > 0 && port <= DOT_MIDI_IN_PORTS &&
+	    mi[port - 1] != NULL)
+		midi_in(mi[port - 1], &midi_byte, 1);
+}
+
+/*
+ * Read MIDI bytes from DOT data blocks into the FreeBSD midi(4) input
+ * queue.  b[0] low nibble = port+1 (0 means no MIDI), b[1] = MIDI byte.
+ * Called from the ISO receive handler.
+ */
 void
 dot_read_midi(const uint32_t *buffer, unsigned int data_blocks,
-	      struct snd_rawmidi_substream *midi[3] __unused,
+	      struct snd_midi *mi[DOT_MAX_MIDI_PORTS],
 	      unsigned int data_block_quadlets)
 {
 	unsigned int f;
 
 	for (f = 0; f < data_blocks; f++) {
-		(void)(*(const uint8_t *)&buffer[0]); /* placeholder - check b[3] & 0x0f for MIDI */
+		const uint8_t *b = (const uint8_t *)&buffer[0];
+		unsigned int port = b[0] & 0x0f;
+
+		/* Port 0 means no MIDI data in this block. */
+		if (port > 0 && port <= DOT_MIDI_IN_PORTS &&
+		    mi[port - 1] != NULL) {
+			uint8_t midi_byte = b[1];
+
+			midi_in(mi[port - 1], &midi_byte, 1);
+		}
 
 		buffer += data_block_quadlets;
 	}

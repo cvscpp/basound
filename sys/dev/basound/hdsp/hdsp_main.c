@@ -185,6 +185,13 @@ snd_hdsp_create(struct snd_card *card, struct hdsp *hdsp)
 	}
 	INIT_WORK(&hdsp->midi_work, (void *)snd_hdsp_midi_work);
 
+	err = snd_hdsp_create_midi(hdsp);
+	if (err != 0) {
+		dev_err(card->dev, "Failed to create MIDI devices\n");
+		/* MIDI is optional — continue without it */
+		err = 0;
+	}
+
 	snd_hdsp_create_mixer(card, hdsp);
 
 	dev_info(card->dev, "Found %s at 0x%jx", hdsp->card_name, (uintmax_t)hdsp->iobase);
