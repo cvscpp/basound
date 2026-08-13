@@ -565,8 +565,14 @@ dice_streaming_init(struct dice_bsd_softc *sc)
 	callout_init(&DSTREAM(sc)->callout, 1);
 	mtx_init(&DSTREAM(sc)->playback_lock, "dice_playback", NULL, MTX_DEF);
 	mtx_init(&DSTREAM(sc)->capture_lock, "dice_capture", NULL, MTX_DEF);
-	DSTREAM(sc)->tx_channel = -1;
-	DSTREAM(sc)->rx_channel = -1;
+	/*
+	 * The FreeBSD firewire stack exposes no isochronous channel
+	 * allocator, so (like digi00x) use fixed channel numbers.  DICE
+	 * uses one channel per direction: RX is host->device (playback),
+	 * TX is device->host (capture).
+	 */
+	DSTREAM(sc)->rx_channel = 2;
+	DSTREAM(sc)->tx_channel = 3;
 	return (0);
 }
 
@@ -629,8 +635,9 @@ dice_streaming_start_playback(struct dice_bsd_softc *sc)
 
 	dice_stream_configure(ps, SNDRV_PCM_STREAM_PLAYBACK, ps->rate);
 
-	/* Program RX isochronous channel, speed, then enable */
-	dice_program_iso(sc, 0, 0, 0);
+	/* Program the DICE RX isochronous channel (host -> device), then
+	 * (re)enable streaming so the device starts listening. */
+	dice_program_iso(sc, 0, 0, DSTREAM(sc)->rx_channel);
 	dice_enable(sc, true);
 
 	FW_GLOCK(fc);
@@ -680,7 +687,23 @@ dice_streaming_start_capture(struct dice_bsd_softc *sc)
 	mtx_unlock(&DSTREAM(sc)->capture_lock);
 
 	dice_stream_configure(ps, SNDRV_PCM_STREAM_CAPTURE, ps->rate);
-	dice_program_iso(sc, 1, 0, 0);
+
+	/* Program the DICE TX isochronous channel (device -> host) and the
+	 * speed at which the device should transmit, then (re)enable
+	 * streaming. */
+	dice_program_iso(sc, 1, 0, DSTREAM(sc)->tx_channel);
+	dice_write_quad(sc->fwdev,
+	    DICE_PRIVATE_SPACE + sc->tx_offset + 0x014, /* TX_SPEED */
+	    htobe32(fc->speed));
+	dice_enable(sc, true);
+
+	/* Match the CIP tag and channel on the host receive context so
+	 * fwohci_irx_enable() programs OHCI_IRMATCH correctly. */
+	{
+		uint32_t fv = DICE_ISO_TAG_CIP |
+		    (DSTREAM(sc)->tx_channel >= 0 ? (DSTREAM(sc)->tx_channel & 0x3f) : 0);
+		xferq->flag = (xferq->flag & ~FWXFERQ_CHTAGMASK) | fv;
+	}
 
 	FW_GLOCK(fc);
 	err = fc->irx_enable(fc, ch->dmach);
@@ -717,7 +740,8 @@ dice_streaming_stop_playback(struct dice_bsd_softc *sc)
 
 	fc->itx_disable(fc, ch->dmach);
 	if (DSTREAM(sc)->active_streams > 0) DSTREAM(sc)->active_streams--;
-	dice_enable(sc, false);
+	if (DSTREAM(sc)->active_streams == 0)
+		dice_enable(sc, false);
 }
 
 void
@@ -738,6 +762,8 @@ dice_streaming_stop_capture(struct dice_bsd_softc *sc)
 
 	fc->irx_disable(fc, ch->dmach);
 	if (DSTREAM(sc)->active_streams > 0) DSTREAM(sc)->active_streams--;
+	if (DSTREAM(sc)->active_streams == 0)
+		dice_enable(sc, false);
 }
 
 void
