@@ -45,6 +45,15 @@ MALLOC_DEFINE(M_DICE_ISO, "dice_iso", "DICE ISO DMA buffers");
 
 #define DSTREAM(sc)	((sc)->stream)
 
+/*
+ * TX stall watchdog limit (in 1 ms callout ticks).  While the stream is
+ * active the OHCI completes ~8 packets per millisecond, so a healthy
+ * context always has chunks to recycle.  If stfree stays empty for this
+ * many consecutive ticks the context is dead (bus reset / DMA error)
+ * and the whole stream must be restarted.
+ */
+#define DICE_TX_STALL_LIMIT	25
+
 /* ------------------------------------------------------------------ */
 /* Rate → SFC conversion                                               */
 /* ------------------------------------------------------------------ */
@@ -355,6 +364,33 @@ dice_enable(struct dice_bsd_softc *sc, bool en)
 	return (dice_write_quad(sc->fwdev, addr, val));
 }
 
+/*
+ * Set the device clock rate (ALSA select_clock()).  Without this the
+ * device keeps whatever rate it was last set to (often 44.1 kHz on the
+ * Alesis MultiMix 16) while we stream CIP with the FDF of the rate the
+ * app negotiated (typically 48 kHz).  The device rejects/misinterprets
+ * a stream whose rate does not match its clock, which shows up as no
+ * audio and can make the device reset the streaming state.
+ *
+ * The clock-source bits are preserved; only the rate field (bits 8-15,
+ * encoded as the DICE SFC index) is replaced.  GLOBAL_CLOCK_SELECT may
+ * be changed while streams are running, but we do it before enabling.
+ */
+static int
+dice_set_rate(struct dice_bsd_softc *sc, unsigned int rate)
+{
+	uint32_t val, cur;
+	int err;
+
+	err = dice_read_global(sc, 0x04c /* GLOBAL_CLOCK_SELECT */, &val, 4);
+	if (err != 0)
+		return (err);
+	cur = be32toh(val);
+	cur = (cur & 0x000000ff) | (dice_rate_to_sfc(rate) << 8);
+	return (dice_write_quad(sc->fwdev,
+	    DICE_PRIVATE_SPACE + sc->global_offset + 0x04c, htobe32(cur)));
+}
+
 /* ------------------------------------------------------------------ */
 /* TX fill — encode PCM into one ISO chunk (playback direction)         */
 /* ------------------------------------------------------------------ */
@@ -416,7 +452,15 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 	dice_build_cip_header(&payload[0], sc->fwdev->fc->nodeid,
 	    dbs, dbc, CIP_FMT_AM, ps->fdf, 0xffff);
 
-	/* Fill data blocks */
+	/* Fill data blocks.
+	 *
+	 * IMPORTANT: the conversion and the block-fill loops MUST use
+	 * separate loop variables.  The old code reused the frame index
+	 * inside the sample conversion loops, so after the first block
+	 * `i` had advanced to frames*nch: only one data block was ever
+	 * filled per packet, blocks 1..frames-1 carried stale/uninitialized
+	 * DMA memory (audible garbage), and the AM824 encode read past the
+	 * end of the stack tmpbuf (out-of-bounds stack read). */
 	{
 		struct snd_dbuf *sb = txch ? txch->buffer : NULL;
 		int32_t tmpbuf[MAX_DICE_PCM_CH * 12];
@@ -445,66 +489,70 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 		}
 		if (sample_bytes > 1) read_bytes -= read_bytes % sample_bytes;
 
+		if (underrun) {
+			memset(tmpbuf, 0, frames * nch * sizeof(int32_t));
+			sp = tmpbuf;
+		} else if (read_bytes >= bytes && sample_bytes == 4 &&
+		    !is_float && source_off + bytes <= ps->buffer_bytes) {
+			/* Fast path: full packet of S32_LE, no wrap. */
+			sp = (const int32_t *)((const uint8_t *)
+			    ps->substream->runtime->dma_area + source_off);
+		} else {
+			unsigned int fi;
+			unsigned int samples = frames * nch;
+
+			for (fi = 0; fi < samples; fi++) tmpbuf[fi] = 0;
+			if (read_bytes > 0 && sample_bytes == 4) {
+				unsigned int ns = read_bytes / 4;
+
+				if (source_off + read_bytes <= ps->buffer_bytes)
+					memcpy(tmpbuf,
+					    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
+					    read_bytes);
+				else {
+					unsigned int first = ps->buffer_bytes - source_off;
+					memcpy(tmpbuf,
+					    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
+					    first);
+					memcpy((uint8_t *)tmpbuf + first,
+					    ps->substream->runtime->dma_area,
+					    read_bytes - first);
+				}
+				if (is_float) {
+					uint32_t *u = (uint32_t *)tmpbuf;
+
+					for (fi = 0; fi < ns; fi++)
+						tmpbuf[fi] = dice_f32_to_s32(u[fi]);
+				}
+			} else if (read_bytes > 0 && sample_bytes == 2) {
+				unsigned int rd = read_bytes / 2;
+				const int16_t *s16;
+				uint8_t sbuf[18*12*2];
+				if (source_off + read_bytes <= ps->buffer_bytes)
+					s16 = (const int16_t *)((const uint8_t *)
+					    ps->substream->runtime->dma_area + source_off);
+				else {
+					unsigned int first = ps->buffer_bytes - source_off;
+					memcpy(sbuf,
+					    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
+					    first);
+					memcpy(sbuf + first,
+					    ps->substream->runtime->dma_area,
+					    read_bytes - first);
+					s16 = (const int16_t *)sbuf;
+				}
+				for (fi = 0; fi < rd; fi++)
+					tmpbuf[fi] = ((int32_t)s16[fi]) << 16;
+			}
+			sp = tmpbuf;
+		}
+
 		for (i = 0; i < frames; i++) {
 			uint32_t *blk = &payload[CIP_HEADER_QUADLETS + i * dbs];
 			unsigned int midi_off = ps->midi_ports > 0 ? 1 : 0;
 
 			if (ps->midi_ports > 0) blk[0] = 0x00000080; /* no MIDI */
 
-			if (underrun) {
-				memset(tmpbuf, 0, frames * nch * sizeof(int32_t));
-				sp = tmpbuf;
-			} else if (read_bytes >= bytes && sample_bytes == 4 &&
-			    !is_float && source_off + bytes <= ps->buffer_bytes) {
-				sp = (const int32_t *)((const uint8_t *)
-				    ps->substream->runtime->dma_area + source_off);
-			} else {
-				unsigned int samples = frames * nch;
-				for (i = 0; i < samples; i++) tmpbuf[i] = 0;
-				if (read_bytes > 0 && sample_bytes == 4) {
-					unsigned int ns = read_bytes / 4;
-
-					if (source_off + read_bytes <= ps->buffer_bytes)
-						memcpy(tmpbuf,
-						    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
-						    read_bytes);
-					else {
-						unsigned int first = ps->buffer_bytes - source_off;
-						memcpy(tmpbuf,
-						    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
-						    first);
-						memcpy((uint8_t *)tmpbuf + first,
-						    ps->substream->runtime->dma_area,
-						    read_bytes - first);
-					}
-					if (is_float) {
-						uint32_t *u = (uint32_t *)tmpbuf;
-
-						for (i = 0; i < ns; i++)
-							tmpbuf[i] = dice_f32_to_s32(u[i]);
-					}
-				} else if (read_bytes > 0 && sample_bytes == 2) {
-					unsigned int rd = read_bytes / 2;
-					const int16_t *s16;
-					uint8_t sbuf[18*12*2];
-					if (source_off + read_bytes <= ps->buffer_bytes)
-						s16 = (const int16_t *)((const uint8_t *)
-						    ps->substream->runtime->dma_area + source_off);
-					else {
-						unsigned int first = ps->buffer_bytes - source_off;
-						memcpy(sbuf,
-						    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
-						    first);
-						memcpy(sbuf + first,
-						    ps->substream->runtime->dma_area,
-						    read_bytes - first);
-						s16 = (const int16_t *)sbuf;
-					}
-					for (i = 0; i < rd; i++)
-						tmpbuf[i] = ((int32_t)s16[i]) << 16;
-				}
-				sp = tmpbuf;
-			}
 			dice_encode_am824_padded(&blk[midi_off],
 			    &sp[i * nch], nch, ps->device_channels);
 		}
@@ -731,7 +779,7 @@ dice_streaming_start_playback(struct dice_bsd_softc *sc)
 	struct fw_xferq *xferq;
 	struct firewire_comm *fc;
 	struct fw_bulkxfer *bx;
-	int i;
+	int err, i;
 
 	if (sc->stream == NULL || ch->dmach < 0) return (0);
 	xferq = ISO_XFERQ(ch);
@@ -746,10 +794,29 @@ dice_streaming_start_playback(struct dice_bsd_softc *sc)
 
 	dice_stream_configure(ps, SNDRV_PCM_STREAM_PLAYBACK, ps->rate);
 
+	/* Make the device's clock match the stream we are about to send
+	 * (ALSA select_clock()).  Non-fatal: if the device is already at
+	 * this rate the write is a no-op, and if the register access
+	 * fails we still try to stream (and log it once). */
+	err = dice_set_rate(sc, ps->rate);
+	if (err != 0)
+		device_printf(sc->dev, "dice: failed to set rate %u (%d)\n",
+		    ps->rate, err);
+
 	/* Program the DICE RX isochronous channel (host -> device), then
 	 * (re)enable streaming so the device starts listening. */
-	dice_program_iso(sc, 0, 0, DSTREAM(sc)->rx_channel);
-	dice_enable(sc, true);
+	err = dice_program_iso(sc, 0, 0, DSTREAM(sc)->rx_channel);
+	if (err != 0) {
+		device_printf(sc->dev, "dice: RX_ISOCHRONOUS write failed (%d)\n",
+		    err);
+		goto fail;
+	}
+	err = dice_enable(sc, true);
+	if (err != 0) {
+		device_printf(sc->dev, "dice: GLOBAL_ENABLE write failed (%d)\n",
+		    err);
+		goto fail;
+	}
 
 	FW_GLOCK(fc);
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
@@ -766,15 +833,29 @@ dice_streaming_start_playback(struct dice_bsd_softc *sc)
 	{
 		uint32_t fv = DICE_ISO_TAG_CIP |
 		    (DSTREAM(sc)->rx_channel >= 0 ? (DSTREAM(sc)->rx_channel & 0x3f) : 0);
+
 		xferq->flag = (xferq->flag & ~FWXFERQ_CHTAGMASK) | fv;
-		fc->itx_enable(fc, ch->dmach);
+		err = fc->itx_enable(fc, ch->dmach);
+		if (err != 0) {
+			device_printf(sc->dev, "dice: itx_enable failed (%d)\n",
+			    err);
+			goto fail;
+		}
 	}
 
 	if (DSTREAM(sc)->active_streams == 0)
 		callout_reset(&DSTREAM(sc)->callout, 1, dice_pcm_stream_cb, sc);
 	DSTREAM(sc)->active_streams++;
+	DSTREAM(sc)->tx_stall_ticks = 0;
+	DSTREAM(sc)->tx_restart = false;
 	ps->active = true;
 	return (0);
+
+fail:
+	mtx_lock(&DSTREAM(sc)->playback_lock);
+	DSTREAM(sc)->rx_use_count = 0;
+	mtx_unlock(&DSTREAM(sc)->playback_lock);
+	return (-err);
 }
 
 int
@@ -799,14 +880,34 @@ dice_streaming_start_capture(struct dice_bsd_softc *sc)
 
 	dice_stream_configure(ps, SNDRV_PCM_STREAM_CAPTURE, ps->rate);
 
+	err = dice_set_rate(sc, ps->rate);
+	if (err != 0)
+		device_printf(sc->dev, "dice: failed to set rate %u (%d)\n",
+		    ps->rate, err);
+
 	/* Program the DICE TX isochronous channel (device -> host) and the
 	 * speed at which the device should transmit, then (re)enable
 	 * streaming. */
-	dice_program_iso(sc, 1, 0, DSTREAM(sc)->tx_channel);
-	dice_write_quad(sc->fwdev,
+	err = dice_program_iso(sc, 1, 0, DSTREAM(sc)->tx_channel);
+	if (err != 0) {
+		device_printf(sc->dev, "dice: TX_ISOCHRONOUS write failed (%d)\n",
+		    err);
+		goto fail;
+	}
+	err = dice_write_quad(sc->fwdev,
 	    DICE_PRIVATE_SPACE + sc->tx_offset + 0x014, /* TX_SPEED */
 	    htobe32(fc->speed));
-	dice_enable(sc, true);
+	if (err != 0) {
+		device_printf(sc->dev, "dice: TX_SPEED write failed (%d)\n",
+		    err);
+		goto fail;
+	}
+	err = dice_enable(sc, true);
+	if (err != 0) {
+		device_printf(sc->dev, "dice: GLOBAL_ENABLE write failed (%d)\n",
+		    err);
+		goto fail;
+	}
 
 	/* Match the CIP tag and channel on the host receive context so
 	 * fwohci_irx_enable() programs OHCI_IRMATCH correctly. */
@@ -820,10 +921,8 @@ dice_streaming_start_capture(struct dice_bsd_softc *sc)
 	err = fc->irx_enable(fc, ch->dmach);
 	FW_GUNLOCK(fc);
 	if (err != 0) {
-		mtx_lock(&DSTREAM(sc)->capture_lock);
-		DSTREAM(sc)->tx_use_count = 0;
-		mtx_unlock(&DSTREAM(sc)->capture_lock);
-		return (err);
+		device_printf(sc->dev, "dice: irx_enable failed (%d)\n", err);
+		goto fail;
 	}
 
 	if (DSTREAM(sc)->active_streams == 0)
@@ -831,6 +930,12 @@ dice_streaming_start_capture(struct dice_bsd_softc *sc)
 	DSTREAM(sc)->active_streams++;
 	ps->active = true;
 	return (0);
+
+fail:
+	mtx_lock(&DSTREAM(sc)->capture_lock);
+	DSTREAM(sc)->tx_use_count = 0;
+	mtx_unlock(&DSTREAM(sc)->capture_lock);
+	return (-err);
 }
 
 void
@@ -847,6 +952,8 @@ dice_streaming_stop_playback(struct dice_bsd_softc *sc)
 	mtx_lock(&DSTREAM(sc)->playback_lock);
 	if (DSTREAM(sc)->rx_use_count == 0) { mtx_unlock(&DSTREAM(sc)->playback_lock); return; }
 	if (--DSTREAM(sc)->rx_use_count > 0) { mtx_unlock(&DSTREAM(sc)->playback_lock); return; }
+	DSTREAM(sc)->tx_stall_ticks = 0;
+	DSTREAM(sc)->tx_restart = false;
 	mtx_unlock(&DSTREAM(sc)->playback_lock);
 
 	fc->itx_disable(fc, ch->dmach);
@@ -877,6 +984,80 @@ dice_streaming_stop_capture(struct dice_bsd_softc *sc)
 		dice_enable(sc, false);
 }
 
+/*
+ * Restart a stalled TX stream.
+ *
+ * Called from the refill watchdog when the OHCI IT context has stopped
+ * completing packets (e.g. a FireWire bus reset — fwohci halts all ISO
+ * contexts on reset and never restarts them, and the DICE firmware
+ * clears GLOBAL_ENABLE).  Nothing would ever be recycled into stfree
+ * again, so the sndbuf fills up and the app's write() blocks forever.
+ *
+ * Sequence, mirroring start_playback:
+ *   1. re-program the device (rate + RX channel + enable) — fwmem
+ *      transactions may tsleep up to 5s each, so no locks are held;
+ *   2. itx_disable() the dead context — its internal pause() sleeps
+ *      1s, again with no locks held;
+ *   3. under playback_lock + FW_GLOCK, drain every chunk back to stfree,
+ *      refill, and itx_enable() to rebuild the DMA descriptors.
+ *
+ * hwptr is deliberately NOT reset: the sound layer disposes the sndbuf
+ * based on the hwptr delta reported by pcm_pointer(), so moving it
+ * backwards would double-play buffered audio.
+ */
+static void
+dice_streaming_restart_tx(struct dice_bsd_softc *sc)
+{
+	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
+	struct dice_pcm_stream *ps = &DSTREAM(sc)->playback;
+	struct firewire_comm *fc;
+	struct fw_xferq *xferq;
+	struct fw_bulkxfer *bx;
+	int refilled = 0, i;
+
+	if (sc->stream == NULL || ch->dmach < 0 || !ps->active) {
+		if (sc->stream != NULL) {
+			DSTREAM(sc)->tx_restart = false;
+			DSTREAM(sc)->tx_stall_ticks = 0;
+		}
+		return;
+	}
+	fc = ISO_FC(ch);
+	xferq = ISO_XFERQ(ch);
+	if (fc == NULL || xferq == NULL) return;
+
+	device_printf(sc->dev, "dice: TX DMA stalled, restarting stream\n");
+
+	/* Device side. */
+	(void)dice_set_rate(sc, ps->rate);
+	(void)dice_program_iso(sc, 0, 0, DSTREAM(sc)->rx_channel);
+	(void)dice_enable(sc, true);
+
+	/* Host side: tear down the dead context (pause 1s inside). */
+	fc->itx_disable(fc, ch->dmach);
+
+	mtx_lock(&DSTREAM(sc)->playback_lock);
+	FW_GLOCK(fc);
+	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
+	STAILQ_CONCAT(&xferq->stfree, &xferq->stvalid);
+	ps->tx_dbc = 0;
+	ps->frame_cycle = 0;
+	for (i = 0; i < DICE_ISO_NCHUNKS; i++) {
+		bx = STAILQ_FIRST(&xferq->stfree);
+		if (bx == NULL) break;
+		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
+		dice_fill_tx_chunk(sc, xferq, bx);
+		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
+		refilled++;
+	}
+	FW_GUNLOCK(fc);
+	if (refilled > 0)
+		fc->itx_enable(fc, ch->dmach);
+	DSTREAM(sc)->tx_stall_ticks = 0;
+	DSTREAM(sc)->tx_restart = false;
+	mtx_unlock(&DSTREAM(sc)->playback_lock);
+}
+
 void
 dice_streaming_refill_tx(struct dice_bsd_softc *sc)
 {
@@ -903,6 +1084,23 @@ dice_streaming_refill_tx(struct dice_bsd_softc *sc)
 		refilled++;
 	}
 	FW_GUNLOCK(fc);
-	if (refilled > 0) fc->itx_enable(fc, ch->dmach);
+	if (refilled > 0) {
+		DSTREAM(sc)->tx_stall_ticks = 0;
+		fc->itx_enable(fc, ch->dmach);
+	} else if (++DSTREAM(sc)->tx_stall_ticks >= DICE_TX_STALL_LIMIT) {
+		/*
+		 * No chunk has been recycled for the whole limit window.
+		 * A healthy context completes ~8 packets/ms, so this means
+		 * the OHCI IT context is dead (bus reset / DMA error).
+		 * Defer the restart until after playback_lock is dropped:
+		 * it sleeps (itx_disable pause, fwmem timeouts) and must
+		 * not run with the mutex held.
+		 */
+		DSTREAM(sc)->tx_stall_ticks = 0;
+		DSTREAM(sc)->tx_restart = true;
+	}
 	mtx_unlock(&DSTREAM(sc)->playback_lock);
+
+	if (DSTREAM(sc)->tx_restart)
+		dice_streaming_restart_tx(sc);
 }

@@ -133,6 +133,15 @@ struct dice_streaming {
 	unsigned int	tx_use_count;
 	unsigned int	rx_use_count;
 
+	/* TX stall watchdog: consecutive 1 ms callout ticks during which
+	 * no ISO chunk was recycled (the OHCI IT context has stopped
+	 * completing packets, e.g. after a FireWire bus reset — fwohci
+	 * halts all ISO contexts on reset and never restarts them, and
+	 * the DICE firmware clears GLOBAL_ENABLE).  When the counter
+	 * reaches the limit the whole stream is restarted. */
+	unsigned int	tx_stall_ticks;
+	bool		tx_restart;
+
 	struct mtx	playback_lock;	/* serialises TX (playback) start/stop/refill */
 	struct mtx	capture_lock;	/* serialises RX (capture) start/stop */
 
