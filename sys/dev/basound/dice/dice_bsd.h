@@ -168,6 +168,15 @@ struct dice_model_entry {
 
 /* Softc for the FreeBSD side of the DICE driver. */
 struct dice_bsd_softc {
+	/*
+	 * MUST be the first member: the firewire bus dispatches
+	 * post_busreset/post_explore by casting the child softc to
+	 * struct firewire_dev_comm.  Without this the first fields of
+	 * this softc would be interpreted as those function pointers
+	 * and called as code - a guaranteed kernel panic on the first
+	 * bus reset after attach (e.g. when a device is plugged in).
+	 */
+	struct firewire_dev_comm fwc;
 	device_t dev;
 	struct device alsa_dev;		/* wrapper so card->dev stays valid */
 	struct firewire_comm *fc;
@@ -187,6 +196,7 @@ struct dice_bsd_softc {
 	/* Deferred discovery (FireWire bus may not be explored yet). */
 	struct callout discover_callout;
 	int discover_retries;
+	volatile u_int discovering;	/* re-entry guard for dice_discover */
 	bool attached;
 };
 

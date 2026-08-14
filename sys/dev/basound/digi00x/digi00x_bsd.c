@@ -10,6 +10,7 @@
  */
 
 #include <sys/param.h>
+#include <machine/atomic.h>
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
@@ -41,6 +42,15 @@ MALLOC_DECLARE(M_ALSA);
 /* No CSR ROM parsing macros needed - we match by EUI64 OUI */
 
 struct digi00x_softc {
+	/*
+	 * MUST be the first member: the firewire bus dispatches
+	 * post_busreset/post_explore by casting the child softc to
+	 * struct firewire_dev_comm.  Without this the first fields of
+	 * this softc would be interpreted as those function pointers
+	 * and called as code - a guaranteed kernel panic on the first
+	 * bus reset after attach (e.g. when a device is plugged in).
+	 */
+	struct firewire_dev_comm fwc;
 	device_t dev;
 	struct device alsa_dev;
 	struct firewire_comm *fc;
@@ -49,6 +59,7 @@ struct digi00x_softc {
 	int unit;
 	bool attached;
 	int discover_retries;
+	volatile u_int discovering;	/* re-entry guard for dg00x_discover */
 	struct callout discover_callout;
 };
 
@@ -58,6 +69,8 @@ static int  dg00x_probe(device_t);
 static int  dg00x_attach(device_t);
 static int  dg00x_detach(device_t);
 static void dg00x_discover(void *);
+static void dg00x_post_busreset(void *);
+static void dg00x_post_explore(void *);
 static int  dg00x_init_card(struct digi00x_softc *);
 
 /* ------------------------------------------------------------------ */
@@ -167,19 +180,34 @@ dg00x_attach(device_t dev)
 	sc->fwdev = NULL;
 	sc->dg00x = NULL;
 	sc->attached = false;
+	sc->discovering = 0;
 	sc->alsa_dev.bsddev = dev;
+
+	/*
+	 * firewire bus dispatch contract: fw_busreset()/fw_attach_dev()
+	 * cast our softc to struct firewire_dev_comm (hence the fwc
+	 * first member) and call post_busreset/post_explore if set.
+	 * post_busreset runs with FW_GLOCK held, so it must not sleep.
+	 */
+	sc->fwc.dev = dev;
+	sc->fwc.fc = fc;
+	sc->fwc.post_busreset = dg00x_post_busreset;
+	sc->fwc.post_explore = dg00x_post_explore;
 
 	/* Initialize callout for deferred discovery */
 	callout_init(&sc->discover_callout, 1);
 
-	/* Try to find device immediately, defer if bus not yet explored */
+	/* Try to find device immediately, defer if bus not yet explored.
+	 * The scan only reads fw_device memory, so FW_GLOCK is safe. */
 	fwdev = NULL;
+	FW_GLOCK(fc);
 	STAILQ_FOREACH(fwdev, &fc->devices, link) {
 		if (fwdev->status != FWDEVATTACHED)
 			continue;
 		if (match_digidesign(fwdev) == 0)
 			break;
 	}
+	FW_GUNLOCK(fc);
 
 	if (fwdev != NULL) {
 		/* Found immediately - set up card */
@@ -193,6 +221,35 @@ dg00x_attach(device_t dev)
 		      "scheduling deferred discovery\n");
 	callout_reset(&sc->discover_callout, hz, dg00x_discover, sc);
 	return (0);
+}
+
+/*
+ * Called by the firewire bus after every bus reset, with FW_GLOCK
+ * held (fwohci_task_busreset -> fw_busreset).  We must not sleep or
+ * take FW_GLOCK here - just re-arm the discovery callout so the new
+ * topology is scanned shortly.
+ */
+static void
+dg00x_post_busreset(void *arg)
+{
+	struct digi00x_softc *sc = (struct digi00x_softc *)arg;
+
+	if (!sc->attached && sc->fwdev == NULL)
+		callout_reset(&sc->discover_callout, hz, dg00x_discover, sc);
+}
+
+/*
+ * Called by fw_attach_dev() after bus exploration completes, on the
+ * firewire probe thread with no locks held.  This is the race-free
+ * moment to scan the device list: list mutation (fw_attach_dev's
+ * free of stale entries) happens on this same thread before us.
+ */
+static void
+dg00x_post_explore(void *arg)
+{
+	struct digi00x_softc *sc = (struct digi00x_softc *)arg;
+
+	dg00x_discover(sc);
 }
 
 /*
@@ -210,7 +267,14 @@ dg00x_discover(void *arg)
 	if (sc->attached || sc->fwdev != NULL)
 		return;
 
+	/* Re-entry guard: post_explore (probe thread) and the callout
+	 * (softclock) can race each other. */
+	if (!atomic_cmpset_int(&sc->discovering, 0, 1))
+		return;
+
+	/* The scan only reads fw_device memory, so FW_GLOCK is safe. */
 	fwdev = NULL;
+	FW_GLOCK(sc->fc);
 	STAILQ_FOREACH(fwdev, &sc->fc->devices, link) {
 		/*
 		 * Accept both FWDEVATTACHED (normal) and FWDEVINIT
@@ -225,6 +289,7 @@ dg00x_discover(void *arg)
 		if (match_digidesign(fwdev) == 0)
 			break;
 	}
+	FW_GUNLOCK(sc->fc);
 
 	if (fwdev == NULL) {
 		sc->discover_retries++;
@@ -235,6 +300,7 @@ dg00x_discover(void *arg)
 		/* Retry indefinitely — the device will appear after a
 		 * bus reset completes. */
 		callout_reset(&sc->discover_callout, hz, dg00x_discover, sc);
+		atomic_store_int(&sc->discovering, 0);
 		return;
 	}
 
@@ -242,8 +308,15 @@ dg00x_discover(void *arg)
 	sc->fwdev = fwdev;
 	sc->unit = get_model_id(fwdev);
 	err = dg00x_init_card(sc);
-	if (err != 0)
+	if (err != 0) {
 		device_printf(sc->dev, "Failed to init card: %d\n", err);
+		/* Drop the failed match and keep retrying; the device
+		 * may not have been ready yet. */
+		sc->fwdev = NULL;
+		sc->discover_retries = 0;
+		callout_reset(&sc->discover_callout, hz, dg00x_discover, sc);
+	}
+	atomic_store_int(&sc->discovering, 0);
 }
 
 /* ------------------------------------------------------------------ */

@@ -25,6 +25,7 @@
  */
 
 #include <sys/param.h>
+#include <machine/atomic.h>
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
@@ -65,6 +66,8 @@ static int  dice_probe(device_t);
 static int  dice_attach(device_t);
 static int  dice_detach(device_t);
 static void dice_discover(void *);
+static void dice_post_busreset(void *);
+static void dice_post_explore(void *);
 static int  dice_init_card(struct dice_bsd_softc *);
 
 /* ------------------------------------------------------------------ */
@@ -474,6 +477,18 @@ dice_scan_bus(struct dice_bsd_softc *sc, struct fw_device **found)
 	const struct dice_model_entry *model;
 	uint32_t vendor, model_id, version;
 
+	model = NULL;
+	if (found != NULL)
+		*found = NULL;
+
+	/*
+	 * Hold the firewire bus lock while iterating.  The body only
+	 * reads fw_device memory (status/csrrom) - it never sleeps or
+	 * issues transactions - so holding FW_GLOCK is safe.  Without
+	 * it, fw_attach_dev() may free stale fw_device entries right
+	 * out from under the scan after a bus reset.
+	 */
+	FW_GLOCK(sc->fc);
 	STAILQ_FOREACH(fwdev, &sc->fc->devices, link) {
 		/*
 		 * Accept both FWDEVATTACHED (normal) and FWDEVINIT
@@ -493,11 +508,12 @@ dice_scan_bus(struct dice_bsd_softc *sc, struct fw_device **found)
 		if (model != NULL) {
 			if (found != NULL)
 				*found = fwdev;
-			return (model);
+			break;
 		}
 	}
+	FW_GUNLOCK(sc->fc);
 
-	return (NULL);
+	return (model);
 }
 
 /* ------------------------------------------------------------------ */
@@ -918,7 +934,19 @@ dice_attach(device_t dev)
 	sc->fwdev = NULL;
 	sc->model = NULL;
 	sc->attached = false;
+	sc->discovering = 0;
 	sc->alsa_dev.bsddev = dev;
+
+	/*
+	 * firewire bus dispatch contract: fw_busreset()/fw_attach_dev()
+	 * cast our softc to struct firewire_dev_comm (hence the fwc
+	 * first member) and call post_busreset/post_explore if set.
+	 * post_busreset runs with FW_GLOCK held, so it must not sleep.
+	 */
+	sc->fwc.dev = dev;
+	sc->fwc.fc = sc->fc;
+	sc->fwc.post_busreset = dice_post_busreset;
+	sc->fwc.post_explore = dice_post_explore;
 
 	callout_init(&sc->discover_callout, 1);
 
@@ -933,6 +961,8 @@ dice_attach(device_t dev)
 		if (err != 0) {
 			/* Attach failed; detach() will not be called, so
 			 * clean up the resources we took here. */
+			sc->fwdev = NULL;
+			sc->model = NULL;
 			dice_streaming_fini(sc);
 			return (err);
 		}
@@ -946,6 +976,35 @@ dice_attach(device_t dev)
 	return (0);
 }
 
+/*
+ * Called by the firewire bus after every bus reset, with FW_GLOCK
+ * held (fwohci_task_busreset -> fw_busreset).  We must not sleep or
+ * take FW_GLOCK here - just re-arm the discovery callout so the new
+ * topology is scanned shortly.
+ */
+static void
+dice_post_busreset(void *arg)
+{
+	struct dice_bsd_softc *sc = (struct dice_bsd_softc *)arg;
+
+	if (!sc->attached && sc->fwdev == NULL)
+		callout_reset(&sc->discover_callout, hz, dice_discover, sc);
+}
+
+/*
+ * Called by fw_attach_dev() after bus exploration completes, on the
+ * firewire probe thread with no locks held.  This is the race-free
+ * moment to scan the device list: list mutation (fw_attach_dev's
+ * free of stale entries) happens on this same thread before us.
+ */
+static void
+dice_post_explore(void *arg)
+{
+	struct dice_bsd_softc *sc = (struct dice_bsd_softc *)arg;
+
+	dice_discover(sc);
+}
+
 static void
 dice_discover(void *arg)
 {
@@ -955,6 +1014,11 @@ dice_discover(void *arg)
 	int err;
 
 	if (sc->attached || sc->fwdev != NULL)
+		return;
+
+	/* Re-entry guard: post_explore (probe thread) and the callout
+	 * (softclock) can race each other. */
+	if (!atomic_cmpset_int(&sc->discovering, 0, 1))
 		return;
 
 	model = dice_scan_bus(sc, &fwdev);
@@ -967,6 +1031,7 @@ dice_discover(void *arg)
 		/* Retry indefinitely - the device will appear after a
 		 * bus reset completes. */
 		callout_reset(&sc->discover_callout, hz, dice_discover, sc);
+		atomic_store_int(&sc->discovering, 0);
 		return;
 	}
 
@@ -975,8 +1040,16 @@ dice_discover(void *arg)
 	sc->fwdev = fwdev;
 	sc->model = model;
 	err = dice_init_card(sc);
-	if (err != 0)
+	if (err != 0) {
 		device_printf(sc->dev, "Failed to init card: %d\n", err);
+		/* Drop the failed match and keep retrying; the device
+		 * may not have been ready yet. */
+		sc->fwdev = NULL;
+		sc->model = NULL;
+		sc->discover_retries = 0;
+		callout_reset(&sc->discover_callout, hz, dice_discover, sc);
+	}
+	atomic_store_int(&sc->discovering, 0);
 }
 
 /* ------------------------------------------------------------------ */
