@@ -534,24 +534,27 @@ dice_config_apply_rates(struct dice_device_config *cfg)
 	if (caps == 0)
 		caps = CLOCK_CAP_RATE_44100 | CLOCK_CAP_RATE_48000;
 
-#define ADD_RATE(bit, rate)						\
+	/* rate_min/rate_max carry the real sample rate in Hz (used for
+	 * the channel caps and the runtime hw constraints), while
+	 * `rates` stays the SNDRV_PCM_RATE_* bitmask. */
+#define ADD_RATE(bit, hz, rate)						\
 	do {								\
 		if (caps & (bit)) {					\
 			rates |= (rate);				\
-			if (min == 0 || (rate) < min)			\
-				min = (rate);				\
-			if ((rate) > max)				\
-				max = (rate);				\
+			if (min == 0 || (hz) < min)			\
+				min = (hz);				\
+			if ((hz) > max)					\
+				max = (hz);				\
 		}							\
 	} while (0)
 
-	ADD_RATE(CLOCK_CAP_RATE_32000, SNDRV_PCM_RATE_32000);
-	ADD_RATE(CLOCK_CAP_RATE_44100, SNDRV_PCM_RATE_44100);
-	ADD_RATE(CLOCK_CAP_RATE_48000, SNDRV_PCM_RATE_48000);
-	ADD_RATE(CLOCK_CAP_RATE_88200, SNDRV_PCM_RATE_88200);
-	ADD_RATE(CLOCK_CAP_RATE_96000, SNDRV_PCM_RATE_96000);
-	ADD_RATE(CLOCK_CAP_RATE_176400, SNDRV_PCM_RATE_176400);
-	ADD_RATE(CLOCK_CAP_RATE_192000, SNDRV_PCM_RATE_192000);
+	ADD_RATE(CLOCK_CAP_RATE_32000, 32000, SNDRV_PCM_RATE_32000);
+	ADD_RATE(CLOCK_CAP_RATE_44100, 44100, SNDRV_PCM_RATE_44100);
+	ADD_RATE(CLOCK_CAP_RATE_48000, 48000, SNDRV_PCM_RATE_48000);
+	ADD_RATE(CLOCK_CAP_RATE_88200, 88200, SNDRV_PCM_RATE_88200);
+	ADD_RATE(CLOCK_CAP_RATE_96000, 96000, SNDRV_PCM_RATE_96000);
+	ADD_RATE(CLOCK_CAP_RATE_176400, 176400, SNDRV_PCM_RATE_176400);
+	ADD_RATE(CLOCK_CAP_RATE_192000, 192000, SNDRV_PCM_RATE_192000);
 #undef ADD_RATE
 
 	if (rates == 0) {
@@ -758,16 +761,82 @@ dice_pcm_close(struct snd_pcm_substream *substream)
 	return (0);
 }
 
+/*
+ * Re-derive the stream's rate/channel geometry from the OSS channel's
+ * CURRENT speed and format.
+ *
+ * basound_chan_setformat() runs ops->hw_params before the OSS
+ * SNDCTL_DSP_SPEED ioctl is applied, so at hw_params time ch->speed is
+ * still the 48000 Hz default; the rate the app actually negotiated (e.g.
+ * 44100 Hz for a CD track in Audacious) only lands in ch->speed later.
+ * If the streaming layer kept the stale 48000 the CIP FDF and the device
+ * clock would say 48 kHz while the app fed 44.1 kHz audio — the device
+ * stays at its own (48 kHz) rate, the stream never locks and the meter
+ * LEDs stay dark.  Re-syncing from the channel at prepare/start time
+ * makes ps->rate the real rate, which is also what dice_set_rate()
+ * programs the device clock to.
+ */
+static void
+dice_stream_sync_from_channel(struct dice_bsd_softc *sc,
+			      struct dice_pcm_stream *ps,
+			      struct basound_chan *ch)
+{
+	unsigned int mode_idx, device_ch = 0, midi = 0, rate, pcm_ch, i;
+	int capture = (ps == &sc->stream->capture);
+
+	if (ch == NULL)
+		return;
+
+	rate = (ch->speed > 0) ? ch->speed :
+	    ((ps->rate != 0) ? ps->rate : 48000);
+	pcm_ch = AFMT_CHANNEL(ch->format);
+	if (pcm_ch == 0)
+		pcm_ch = 2;
+
+	/* Determine rate mode and get channel+MIDI counts from config. */
+	if (rate <= 48000)
+		mode_idx = SND_DICE_RATE_MODE_LOW;
+	else if (rate <= 96000)
+		mode_idx = SND_DICE_RATE_MODE_MIDDLE;
+	else
+		mode_idx = SND_DICE_RATE_MODE_HIGH;
+
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		if (capture) {
+			device_ch += sc->cfg.tx_pcm_chs[i][mode_idx];
+			midi += sc->cfg.tx_midi_ports[i];
+		} else {
+			device_ch += sc->cfg.rx_pcm_chs[i][mode_idx];
+			midi += sc->cfg.rx_midi_ports[i];
+		}
+	}
+
+	if (device_ch == 0)
+		device_ch = pcm_ch;
+	if (pcm_ch > device_ch)
+		pcm_ch = device_ch;
+
+	ps->rate = rate;
+	ps->pcm_channels = pcm_ch;
+	ps->device_channels = device_ch;
+	ps->midi_ports = midi;
+	ps->double_pcm_frames = !sc->cfg.disable_double_pcm_frames;
+
+	/* AM824 data block quadlets: one per PCM channel + one for MIDI. */
+	ps->data_block_quadlets = device_ch + (midi > 0 ? 1 : 0);
+
+	/* Dual-wire at >96 kHz doubles the data block. */
+	if (ps->double_pcm_frames && rate > 96000)
+		ps->data_block_quadlets *= 2;
+}
+
 static int
 dice_pcm_hw_params(struct snd_pcm_substream *substream, void *hw_params)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct dice_pcm_stream *ps = runtime->private_data;
-	struct snd_card *card = substream->pcm->card;
-	struct dice_bsd_softc *sc = device_get_softc(card->dev->bsddev);
+	struct dice_bsd_softc *sc = device_get_softc(substream->pcm->card->dev->bsddev);
 	struct basound_chan *ch = substream->private_data;
-	unsigned int mode_idx, device_ch = 0, midi = 0;
-	unsigned int rate, pcm_ch, i;
 	int err;
 
 	if (runtime == NULL || ps == NULL)
@@ -782,47 +851,12 @@ dice_pcm_hw_params(struct snd_pcm_substream *substream, void *hw_params)
 
 	runtime->dma_bytes = runtime->hw.buffer_bytes_max;
 
-	/* Extract rate and channel count from basound channel. */
-	rate = (ch != NULL && ch->speed > 0) ? ch->speed : 48000;
-	pcm_ch = (ch != NULL && ch->format != 0) ?
-	    AFMT_CHANNEL(ch->format) : 2;
-
-	/* Determine rate mode and get channel+MIDI counts from config. */
-	if (rate <= 48000)
-		mode_idx = SND_DICE_RATE_MODE_LOW;
-	else if (rate <= 96000)
-		mode_idx = SND_DICE_RATE_MODE_MIDDLE;
-	else
-		mode_idx = SND_DICE_RATE_MODE_HIGH;
-
-	for (i = 0; i < MAX_DICE_STREAMS; i++) {
-		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
-			device_ch += sc->cfg.tx_pcm_chs[i][mode_idx];
-			midi += sc->cfg.tx_midi_ports[i];
-		} else {
-			device_ch += sc->cfg.rx_pcm_chs[i][mode_idx];
-			midi += sc->cfg.rx_midi_ports[i];
-		}
-	}
-
-	if (device_ch == 0)
-		device_ch = pcm_ch;
-	if (pcm_ch > device_ch)
-		pcm_ch = device_ch;
-
-	/* Configure the stream for the streaming layer. */
-	ps->rate = rate;
-	ps->pcm_channels = pcm_ch;
-	ps->device_channels = device_ch;
-	ps->midi_ports = midi;
-	ps->double_pcm_frames = !sc->cfg.disable_double_pcm_frames;
-
-	/* AM824 data block quadlets: one per PCM channel + one for MIDI. */
-	ps->data_block_quadlets = device_ch + (midi > 0 ? 1 : 0);
-
-	/* Dual-wire at >96 kHz doubles the data block. */
-	if (ps->double_pcm_frames && rate > 96000)
-		ps->data_block_quadlets *= 2;
+	/* Extract rate and channel count from basound channel.  Note that
+	 * basound_chan_setformat() runs ops->hw_params BEFORE the OSS
+	 * SNDCTL_DSP_SPEED ioctl has been applied, so ch->speed is still
+	 * the 48000 Hz default here.  dice_pcm_prepare() re-syncs with
+	 * the real speed at stream start. */
+	dice_stream_sync_from_channel(sc, ps, ch);
 
 	ps->period_bytes = (ch != NULL) ? ch->blocksize : 512;
 	ps->buffer_bytes = runtime->dma_bytes;
@@ -840,9 +874,27 @@ static int
 dice_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct dice_pcm_stream *ps = dice_stream_for_substream(substream);
+	struct dice_bsd_softc *sc;
+	struct basound_chan *ch;
 
 	if (ps == NULL)
 		return (-EINVAL);
+
+	/*
+	 * The OSS layer runs prepare at every trigger START, by which
+	 * time SNDCTL_DSP_SPEED has applied the app's real rate — re-sync
+	 * the stream geometry from the channel so the device clock, the
+	 * CIP FDF and the frame rate all agree with what the app feeds
+	 * (hw_params alone is not enough: it ran before the speed ioctl).
+	 */
+	sc = device_get_softc(substream->pcm->card->dev->bsddev);
+	ch = substream->private_data;
+	dice_stream_sync_from_channel(sc, ps, ch);
+	if (ch != NULL) {
+		if (ch->buffer != NULL)
+			ps->buffer_bytes = ch->buffer->bufsize;
+		ps->period_bytes = ch->blocksize;
+	}
 
 	ps->hwptr = 0;
 	ps->period_accum = 0;
@@ -1129,18 +1181,29 @@ dice_init_card(struct dice_bsd_softc *sc)
 		/* MIDI is optional, continue without it. */
 	}
 
-	err = snd_card_register(card);
+	/*
+	 * Initialise the ISO DMA streaming layer BEFORE snd_card_register
+	 * (i.e. before the pcm channels are created and their .open ops
+	 * run).  dice_pcm_open() resolves the per-stream state through
+	 * sc->stream, so if streaming_init ran after the channels were
+	 * added, open would fail (sc->stream == NULL), ps->substream
+	 * would never be set, the 1 ms refill callout would bail out on
+	 * every tick, hwptr would never advance and the app's write()
+	 * would block forever — "transport starts, then stops, no
+	 * audio" (observed on the Alesis MultiMix and iO26).
+	 */
+	err = dice_streaming_init(sc);
 	if (err != 0) {
-		device_printf(sc->dev, "Failed to register ALSA card: %d\n",
-			      err);
+		device_printf(sc->dev, "Failed to init streaming: %d\n", err);
 		snd_card_free(card);
 		return (err);
 	}
 
-	/* Initialise the ISO DMA streaming layer. */
-	err = dice_streaming_init(sc);
+	err = snd_card_register(card);
 	if (err != 0) {
-		device_printf(sc->dev, "Failed to init streaming: %d\n", err);
+		device_printf(sc->dev, "Failed to register ALSA card: %d\n",
+			      err);
+		dice_streaming_fini(sc);
 		snd_card_free(card);
 		return (err);
 	}
