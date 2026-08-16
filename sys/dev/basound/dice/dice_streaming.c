@@ -104,6 +104,166 @@ dice_rate_to_sfc(unsigned int rate)
 }
 
 /* ------------------------------------------------------------------ */
+/* IEC 61883-6 blocking mode + presentation timestamps                 */
+/*                                                                     */
+/* DICE devices recover their media clock from the SYT sequence of the */
+/* host's playback stream; ALSA's dice driver is the only firewire     */
+/* driver that uses CIP_BLOCKING *without* CIP_UNAWARE_SYT.  In        */
+/* blocking mode each packet carries either syt_interval data blocks   */
+/* plus a valid SYT, or zero data blocks with FDF=0xff / SYT=0xffff    */
+/* (NODATA).  These helpers are direct ports of amdtp-stream.c         */
+/* pool_ideal_syt_offsets()/compute_syt()/pool_blocking_data_blocks()  */
+/* and the initial_state table in amdtp_stream_start().                */
+/* ------------------------------------------------------------------ */
+
+#define DICE_TICKS_PER_CYCLE	3072u	/* 125 us in 24.576 MHz ticks */
+#define DICE_TICKS_PER_SECOND	24576000u
+#define DICE_TRANSFER_DELAY_TICKS	0x2e00u /* 479.17 us */
+#define DICE_SYT_NO_INFO	0xffffu
+#define DICE_FDF_NO_DATA	0xffu
+
+static unsigned int
+dice_syt_interval(unsigned int rate)
+{
+	if (rate <= 48000)
+		return (8);
+	if (rate <= 96000)
+		return (16);
+	return (32);
+}
+
+/*
+ * Initialise the blocking-mode sequence state for a stream.  rate is the
+ * AMDTP stream rate, i.e. the sample rate halved when the dual-wire quirk
+ * packs two PCM frames per data block at >96 kHz (ALSA keep_resources()).
+ */
+static void
+dice_blocking_init(struct dice_pcm_stream *ps, unsigned int rate)
+{
+	ps->base_44100 = (rate == 44100 || rate == 88200 ||
+			  rate == 176400);
+	ps->syt_interval = dice_syt_interval(rate);
+	ps->transfer_delay = DICE_TRANSFER_DELAY_TICKS - DICE_TICKS_PER_CYCLE +
+			     (DICE_TICKS_PER_SECOND * ps->syt_interval) / rate;
+	ps->last_syt_offset = DICE_TICKS_PER_CYCLE;
+	if (ps->base_44100)
+		ps->syt_offset_state = 67;
+	else if (rate == 32000)
+		ps->syt_offset_state = 3072;
+	else
+		ps->syt_offset_state = 1024;
+}
+
+/*
+ * Generate the SYT offset (ticks from this packet's cycle to the next
+ * presentation point) for one packet.  Returns DICE_SYT_NO_INFO for
+ * empty cycles.  Port of amdtp-stream.c calculate_syt_offset().
+ */
+static unsigned int
+dice_calculate_syt_offset(struct dice_pcm_stream *ps)
+{
+	unsigned int syt_offset;
+
+	if (ps->last_syt_offset < DICE_TICKS_PER_CYCLE) {
+		if (!ps->base_44100) {
+			syt_offset = ps->last_syt_offset +
+				     ps->syt_offset_state;
+		} else {
+			/*
+			 * The time, in ticks, of the n'th SYT_INTERVAL
+			 * sample is n * SYT_INTERVAL * 24576000 / rate.
+			 * Modulo TICKS_PER_CYCLE the difference between
+			 * successive elements is about 1386.23; rounding
+			 * to SYT precision yields 1386 1386 1387 ...
+			 * The 147-phase sequence reproduces it exactly.
+			 */
+			unsigned int phase = ps->syt_offset_state;
+			unsigned int index = phase % 13;
+
+			syt_offset = ps->last_syt_offset;
+			syt_offset += 1386 + ((index && !(index & 3)) ||
+					      phase == 146);
+			if (++phase >= 147)
+				phase = 0;
+			ps->syt_offset_state = phase;
+		}
+	} else {
+		syt_offset = ps->last_syt_offset - DICE_TICKS_PER_CYCLE;
+	}
+	ps->last_syt_offset = syt_offset;
+
+	if (syt_offset >= DICE_TICKS_PER_CYCLE)
+		syt_offset = DICE_SYT_NO_INFO;
+
+	return (syt_offset);
+}
+
+/*
+ * Turn an SYT offset and the packet's transmission cycle into the 16-bit
+ * CIP SYT field (4-bit cycle + 12-bit offset).  Port of
+ * amdtp-stream.c compute_syt().
+ */
+static unsigned int
+dice_compute_syt(unsigned int syt_offset, unsigned int cycle,
+		 unsigned int transfer_delay)
+{
+	unsigned int syt;
+
+	syt_offset += transfer_delay;
+	syt = ((cycle + syt_offset / DICE_TICKS_PER_CYCLE) << 12) |
+	      (syt_offset % DICE_TICKS_PER_CYCLE);
+	return (syt & DICE_SYT_NO_INFO);
+}
+
+/*
+ * Determine the framing of the next TX packet (blocking mode): either
+ * syt_interval data blocks with a valid SYT, or an empty NODATA packet.
+ * Also advances the transmission-cycle counter (the OHCI IT context
+ * transmits exactly one packet per 125 us cycle).
+ */
+static void
+dice_blocking_framing(struct dice_pcm_stream *ps, unsigned int *data_blocks,
+		      unsigned int *syt, bool *no_data)
+{
+	unsigned int syt_offset;
+
+	syt_offset = dice_calculate_syt_offset(ps);
+	if (syt_offset != DICE_SYT_NO_INFO) {
+		*data_blocks = ps->syt_interval;
+		*syt = dice_compute_syt(syt_offset, ps->tx_cycle,
+					ps->transfer_delay);
+		*no_data = false;
+	} else {
+		*data_blocks = 0;
+		*syt = DICE_SYT_NO_INFO;
+		*no_data = true;
+	}
+	ps->tx_cycle = (ps->tx_cycle + 1) & 0x1fff;
+}
+
+/*
+ * Cycle number at which the first queued TX packet will be transmitted.
+ * Mirrors fwohci_next_cycle() (CYCLE_DELAY 8, rounded up to 16) which
+ * fwohci_itxbuf_enable() uses for the IT context's cycle match.
+ */
+static unsigned int
+dice_first_tx_cycle(struct dice_bsd_softc *sc)
+{
+	struct firewire_comm *fc = sc->fwdev->fc;
+	unsigned int cycle_now, cycle;
+
+	cycle_now = (fc->cyctimer(fc) >> 12) & 0x7fff;
+	cycle = cycle_now & 0x1fff;
+	cycle += 8;
+	if (cycle >= 8000)
+		cycle -= 8000;
+	cycle = roundup2(cycle, 16);
+	if (cycle >= 8000)
+		cycle = (cycle == 8000) ? 0 : 16;
+	return (cycle & 0x1fff);
+}
+
+/* ------------------------------------------------------------------ */
 /* CIP header builder                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -535,25 +695,40 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 	}
 	if (nch > ps->device_channels) nch = ps->device_channels;
 
-	frames = dice_frames_this_packet(ps);
-	dbc = ps->tx_dbc; ps->tx_dbc = (dbc + frames) & 0xff;
+	/*
+	 * Blocking-mode framing: either syt_interval data blocks with a
+	 * computed SYT presentation time, or an empty NODATA packet
+	 * (FDF=0xff, SYT=0xffff).  DICE devices recover their media
+	 * clock from this sequence; ALSA's dice driver is the only
+	 * firewire driver that is both blocking and SYT-aware.
+	 */
+	{
+		unsigned int syt;
+		bool no_data;
 
-	sample_bytes = (txch != NULL) ? AFMT_BPS(txch->format) : 4;
-	if (sample_bytes != 2 && sample_bytes != 4) sample_bytes = 4;
-	is_float = (txch != NULL) &&
-	    (AFMT_ENCODING(txch->format) == AFMT_FLOAT);
+		dice_blocking_framing(ps, &frames, &syt, &no_data);
+		dbc = ps->tx_dbc;
+		ps->tx_dbc = (dbc + frames) & 0xff;
 
-	bytes = frames * nch * sample_bytes;
-	pkt_len = 8 + frames * dbs * 4;
+		sample_bytes = (txch != NULL) ? AFMT_BPS(txch->format) : 4;
+		if (sample_bytes != 2 && sample_bytes != 4) sample_bytes = 4;
+		is_float = (txch != NULL) &&
+		    (AFMT_ENCODING(txch->format) == AFMT_FLOAT);
 
-	fp = (struct fw_pkt *)fwdma_v_addr(xferq->buf, bx->poffset);
-	if (fp == NULL) return;
+		bytes = frames * nch * sample_bytes;
+		/* Empty packets still carry the 8-byte CIP header. */
+		pkt_len = 8 + frames * dbs * 4;
 
-	fp->mode.stream.len = pkt_len;
-	payload = (uint32_t *)fp->mode.stream.payload;
+		fp = (struct fw_pkt *)fwdma_v_addr(xferq->buf, bx->poffset);
+		if (fp == NULL) return;
 
-	dice_build_cip_header(&payload[0], sc->fwdev->fc->nodeid,
-	    dbs, dbc, CIP_FMT_AM, ps->fdf, 0xffff);
+		fp->mode.stream.len = pkt_len;
+		payload = (uint32_t *)fp->mode.stream.payload;
+
+		dice_build_cip_header(&payload[0], sc->fwdev->fc->nodeid,
+		    dbs, dbc, CIP_FMT_AM,
+		    no_data ? DICE_FDF_NO_DATA : ps->fdf, syt);
+	}
 
 	/* Fill data blocks.
 	 *
@@ -735,7 +910,18 @@ dice_rx_handler(struct fw_xferq *xferq)
 			    (AFMT_ENCODING(rxch->format) == AFMT_FLOAT);
 
 			payload = (uint32_t *)fwdma_v_addr(xferq->buf, bx->poffset);
-			frames = dice_frames_this_packet(ps);
+			/*
+			 * Blocking-mode capture: the device transmits either
+			 * syt_interval data blocks (valid SYT) or empty
+			 * NODATA packets (FDF=0xff) on the cycles between.
+			 * The FDF field of the received CIP header tells
+			 * which; data-block count is otherwise fixed.
+			 */
+			if (payload != NULL &&
+			    ((be32toh(payload[1]) >> 16) & 0xff) == DICE_FDF_NO_DATA)
+				frames = 0;
+			else
+				frames = ps->syt_interval;
 			dbs = ps->data_block_quadlets;
 			nch = ps->pcm_channels;
 			if (nch > ps->device_channels) nch = ps->device_channels;
@@ -935,6 +1121,8 @@ dice_streaming_fini(struct dice_bsd_softc *sc)
 static void
 dice_stream_configure(struct dice_pcm_stream *ps, int dir, unsigned int rate)
 {
+	unsigned int eff_rate;
+
 	ps->direction = dir;
 	ps->sfc = dice_rate_to_sfc(rate);
 	/*
@@ -953,6 +1141,12 @@ dice_stream_configure(struct dice_pcm_stream *ps, int dir, unsigned int rate)
 	ps->frame_cycle = 0;
 	ps->frames_per_packet = rate / 8000;
 	ps->frame_remainder = rate % 8000;
+
+	/* Blocking-mode SYT sequence (DICE media clock recovery). */
+	eff_rate = rate;
+	if (ps->double_pcm_frames && rate > 96000)
+		eff_rate /= 2;	/* dual-wire: 2 PCM frames per data block */
+	dice_blocking_init(ps, eff_rate);
 }
 
 /*
@@ -1016,6 +1210,15 @@ dice_clone_geometry(struct dice_bsd_softc *sc, struct dice_pcm_stream *from)
 	to->frame_remainder = from->frame_remainder;
 	to->frame_cycle = 0;
 	to->tx_dbc = 0;
+
+	/* Blocking-mode SYT sequence for the complementary stream. */
+	{
+		unsigned int eff_rate = to->rate;
+
+		if (to->double_pcm_frames && to->rate > 96000)
+			eff_rate /= 2;
+		dice_blocking_init(to, eff_rate);
+	}
 }
 
 /*
@@ -1087,13 +1290,28 @@ dice_ensure_host_tx(struct dice_bsd_softc *sc)
 	}
 	mtx_unlock(&DSTREAM(sc)->playback_lock);
 
+	/*
+	 * The IT context is (re)armed at a fresh cycle match, so restart
+	 * the blocking-mode SYT sequence and re-sync the transmission
+	 * cycle counter with the bus.
+	 */
+	{
+		struct dice_pcm_stream *pb = &DSTREAM(sc)->playback;
+
+		dice_stream_configure(pb, SNDRV_PCM_STREAM_PLAYBACK,
+				      pb->rate);
+		pb->tx_cycle = dice_first_tx_cycle(sc);
+	}
+
 	/* DEBUG (remove after diagnosis). */
 	device_printf(sc->dev,
-	    "dice: ensure_tx dmach=%d pre free=%u dma=%u val=%u run=%d\n",
+	    "dice: ensure_tx dmach=%d pre free=%u dma=%u val=%u run=%d "
+	    "first_cycle=%u\n",
 	    ch->dmach,
 	    dice_qcount(xferq, 0), dice_qcount(xferq, 1),
 	    dice_qcount(xferq, 2),
-	    (xferq->flag & FWXFERQ_RUNNING) != 0);
+	    (xferq->flag & FWXFERQ_RUNNING) != 0,
+	    DSTREAM(sc)->playback.tx_cycle);
 
 	FW_GLOCK(fc);
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
@@ -1467,8 +1685,12 @@ dice_streaming_restart_tx(struct dice_bsd_softc *sc)
 	FW_GLOCK(fc);
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
 	STAILQ_CONCAT(&xferq->stfree, &xferq->stvalid);
-	ps->tx_dbc = 0;
-	ps->frame_cycle = 0;
+
+	/* Fresh blocking-mode sequence; the rearmed IT context starts at
+	 * a new cycle match, so re-sync the transmission cycle too. */
+	dice_stream_configure(ps, SNDRV_PCM_STREAM_PLAYBACK, ps->rate);
+	ps->tx_cycle = dice_first_tx_cycle(sc);
+
 	for (i = 0; i < DICE_ISO_NCHUNKS; i++) {
 		bx = STAILQ_FIRST(&xferq->stfree);
 		if (bx == NULL) break;

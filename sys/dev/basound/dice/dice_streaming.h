@@ -97,10 +97,28 @@ struct dice_pcm_stream {
 	/* DICE register stream index (0 or 1) */
 	unsigned int	stream_index;
 
-	/* AMDTP fractional framing */
+	/* AMDTP fractional framing (non-blocking fallback) */
 	unsigned int	frames_per_packet;
 	unsigned int	frame_cycle;
 	unsigned int	frame_remainder;
+
+	/*
+	 * IEC 61883-6 blocking mode with presentation timestamps.
+	 *
+	 * DICE firmware recovers the media clock from the SYT sequence of
+	 * the host's playback stream (ALSA's dice driver is the only
+	 * firewire driver that uses CIP_BLOCKING *without* CIP_UNAWARE_SYT).
+	 * In blocking mode a packet carries either syt_interval data
+	 * blocks with a valid SYT, or zero blocks and FDF=0xff (NODATA).
+	 * These fields mirror amdtp-stream.c pool_ideal_syt_offsets() /
+	 * compute_syt() / pool_blocking_data_blocks().
+	 */
+	unsigned int	syt_interval;	/* data blocks per SYT packet (8/16/32) */
+	unsigned int	transfer_delay;	/* presentation-time lead, in ticks */
+	unsigned int	last_syt_offset;
+	unsigned int	syt_offset_state;
+	unsigned int	tx_cycle;	/* 13-bit cycle of the next TX packet */
+	bool		base_44100;	/* 44.1/88.2/176.4 kHz family */
 
 	struct snd_pcm_substream *substream;
 
