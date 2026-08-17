@@ -120,7 +120,9 @@ struct hdsp_mixer_entry {
  *   dBFS = 10 * log10(rms / (2^63))   (approx; hardware dependent)
  *
  * output_peaks has 28 entries: channels 0..25 are the normal outputs,
- * 26..27 are the S/PDIF outputs present on all card variants.
+ * 26..27 are the phones (headphone) outputs present on all card
+ * variants (on a Multiface these are the headphone jack; SPDIF is
+ * 24/25).
  */
 struct hdsp_peak_levels {
 	uint32_t input_peaks[26];

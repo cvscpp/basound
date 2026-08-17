@@ -358,29 +358,33 @@ snd_hdsp_enable_io(struct hdsp *hdsp)
  * Initialize the hardware matrix mixer to a usable default state:
  *
  *  1. Silence all 2048 entries (MINUS_INFINITY_GAIN = 0).
- *  2. Route each playback channel N directly to output N at unity gain.
- *  3. For the Multiface, also route playback 0/1 to headphone outputs
- *     (8/9) so stereo applications are audible on the headphone jack
- *     without needing hdspmixer configuration.
+ *  2. Route each playback channel N to its physical output at unity
+ *     gain using the per-card DSP output map below.
+ *  3. On the Multiface, additionally route playback 0/1 to the phones
+ *     outputs (DSP channels 26/27) so stereo applications are audible
+ *     on the headphone jack without needing hdspmixer configuration.
  *
  * Without step 2 the DMA playback buffers are never connected to the
  * physical outputs and no sound is produced, even if the DMA engine is
  * running correctly.
  *
- * Output map (Multiface):
- *   0-1: Analog line out 1/2
- *   2-3: Analog line out 3/4
- *   4-5: Analog line out 5/6
- *   6-7: Analog line out 7/8
- *   8-9: Headphone (phones)
- *  10-17: ADAT
+ * DSP matrix mixer output channel map (0-indexed).  This is the same
+ * map the Linux hdspmixer tool uses (alsa-tools/hdspmixer/channelmap.cxx):
  *
- * Output map (Digiface / H9652 — all digital):
- *   0-7: ADAT 1
- *   8-15: ADAT 2
- *  16-17: SPDIF
- *   (Headphone on Digiface is the same physical jack as SPDIF,
- *    controlled by the HDSP_LineOut bit — we keep it routed too.)
+ *   Digiface / H9652 (identity with playback channels):
+ *     0-7: ADAT 1, 8-15: ADAT 2, 16-23: ADAT 3, 24-25: SPDIF
+ *
+ *   Multiface (analog, ADAT and SPDIF outputs are NOT contiguous —
+ *   DSP outputs 8-15 are unused because they are the Digiface's
+ *   second ADAT port):
+ *     0-7:   Analog line out 1-8
+ *     16-23: ADAT out 1-8
+ *     24-25: SPDIF out 1-2
+ *     26-27: Phones L/R (headphone amp; destination-only channels)
+ *
+ * The Multiface headphone jack is fed exclusively by DSP outputs
+ * 26/27, so routing playback to outputs 8/9 (as this code previously
+ * did) produces silence on the phones output.
  */
 static int
 hdsp_init_mixer(struct hdsp *hdsp)
@@ -396,31 +400,43 @@ hdsp_init_mixer(struct hdsp *hdsp)
 		}
 	}
 
-	/* Direct playback N → output N at 0 dB */
-	for (i = 0; i < hdsp->max_channels; ++i) {
-		addr = hdsp_playback_to_output_key(hdsp, i, i);
-		if (hdsp_write_gain(hdsp, addr, UNITY_GAIN) < 0) {
-			dev_err(hdsp->card->dev,
-			    "mixer init: unity gain write failed ch %d\n", i);
-			return -EIO;
-		}
-	}
+	if (hdsp->io_type == Multiface) {
+		/* playback channel → DSP mixer output, per the map above */
+		static const int mf_outmap[18] = {
+			0, 1, 2, 3, 4, 5, 6, 7,         /* analog out 1-8   */
+			16, 17, 18, 19, 20, 21, 22, 23, /* ADAT out 1-8     */
+			24, 25                          /* SPDIF out 1-2    */
+		};
 
-	/*
-	 * Route stereo out (playback 0/1) to headphone outputs (8/9) so that
-	 * stereo applications (JACK with 2 channels, Audacious, etc.) are
-	 * audible on the headphone jack without manual mixer setup.
-	 *
-	 * For Multiface, output 8/9 is the headphone (phones) jack.
-	 * For Digiface, output 8/1? is unused or SPDIF, so this is harmless.
-	 * This extra routing is additive — it does not alter the existing
-	 * playback N → output N paths.
-	 */
-	if (hdsp->max_channels >= 10) {
-		addr = hdsp_playback_to_output_key(hdsp, 0, 8);
-		hdsp_write_gain(hdsp, addr, UNITY_GAIN);
-		addr = hdsp_playback_to_output_key(hdsp, 1, 9);
-		hdsp_write_gain(hdsp, addr, UNITY_GAIN);
+		for (i = 0; i < (int)hdsp->ss_out_channels && i < 18; ++i) {
+			addr = hdsp_playback_to_output_key(hdsp, i, mf_outmap[i]);
+			if (hdsp_write_gain(hdsp, addr, UNITY_GAIN) < 0) {
+				dev_err(hdsp->card->dev,
+				    "mixer init: unity gain write failed ch %d\n", i);
+				return -EIO;
+			}
+		}
+
+		/* Phones: feed the headphone amp from playback 1/2.  DSP
+		 * outputs 26/27 exist on all HDSP cards as destination-only
+		 * mixer channels; the Multiface headphone jack is wired to
+		 * them. */
+		addr = hdsp_playback_to_output_key(hdsp, 0, 26);
+		if (hdsp_write_gain(hdsp, addr, UNITY_GAIN) < 0)
+			return -EIO;
+		addr = hdsp_playback_to_output_key(hdsp, 1, 27);
+		if (hdsp_write_gain(hdsp, addr, UNITY_GAIN) < 0)
+			return -EIO;
+	} else {
+		/* Digiface / H9652: playback N maps 1:1 to output N */
+		for (i = 0; i < hdsp->max_channels; ++i) {
+			addr = hdsp_playback_to_output_key(hdsp, i, i);
+			if (hdsp_write_gain(hdsp, addr, UNITY_GAIN) < 0) {
+				dev_err(hdsp->card->dev,
+				    "mixer init: unity gain write failed ch %d\n", i);
+				return -EIO;
+			}
+		}
 	}
 
 	dev_info(hdsp->card->dev,
@@ -843,12 +859,19 @@ snd_hdsp_open(struct snd_pcm_substream *substream)
 	 * The HDSP hardware's true period/latency is set independently in
 	 * snd_hdsp_hw_params via the HDSP_controlRegister latency bits.
 	 * Allow the app to negotiate a reasonable staging buffer size.
+	 *
+	 * The HDSP is a strict 2-period double buffer: the hw pointer
+	 * alternates 0/period_bytes and the ISR deinterleaves ring blocks
+	 * 0/1 at fixed offsets.  Exactly 2 periods must be used (Linux
+	 * also forces periods_min = periods_max = 2); basound_chan_
+	 * setblocksize() enforces the same by sizing the sndbuf to 2
+	 * blocks regardless of what the app requests.
 	 */
 	runtime->hw.buffer_bytes_max = BASOUND_DMA_BUFSIZE;
 	runtime->hw.period_bytes_min = 64;
 	runtime->hw.period_bytes_max = 65536;
 	runtime->hw.periods_min = 2;
-	runtime->hw.periods_max = 1024;
+	runtime->hw.periods_max = 2;
 
 	return 0;
 }

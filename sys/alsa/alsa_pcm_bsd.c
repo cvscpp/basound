@@ -342,6 +342,28 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 		uint32_t p2frames = 64;
 		while (p2frames < frames) p2frames <<= 1;
 		frames = p2frames;
+
+		/*
+		 * The HDSP hardware is a strict 2-period double buffer:
+		 * the driver's hw pointer returns only 0 or period_bytes
+		 * (HDSP_BufferID bit), the ISR deinterleaves ring blocks
+		 * 0/1 at fixed offsets, and the DSP interrupt interval is
+		 * set from the negotiated period.  The sndbuf must therefore
+		 * be exactly 2 blocks of `blocksize' — if the ring has more
+		 * blocks, chn_dmaupdate() computes delta = B, (bufsize-B),
+		 * B, ... from the alternating pointer and the PCM layer
+		 * believes 2× (or more) data was consumed, producing
+		 * "double tempo, unchanged pitch" playback (chunks skipped).
+		 *
+		 * Cap frames so that 2 × blocksize fits the 256 KB DMA
+		 * allocation; round DOWN to a power of two.
+		 */
+		uint32_t maxframes = (BASOUND_DMA_BUFSIZE / 2) /
+		    (channels * bps);
+		if (maxframes < 64)
+			maxframes = 64;
+		while (frames > maxframes)
+			frames >>= 1;
 	} else {
 		/* Keep period above tiny defaults that add jitter/distortion. */
 		if (frames < 64)
@@ -374,10 +396,26 @@ basound_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	 *
 	 * Compute blkcnt from the available budget so the resize always
 	 * succeeds and blkcnt * blksz == bufsize exactly.
+	 *
+	 * HDSP is the exception: the hardware is a strict 2-period
+	 * double buffer and the driver's pointer / ISR / deinterleave
+	 * logic all assume exactly 2 blocks (see the frames cap above).
+	 * Forcing blkcnt=2 makes chn_dmaupdate() compute a constant
+	 * delta = blocksize per interrupt instead of the alternating
+	 * B / (bufsize-B) deltas produced when the alternating
+	 * 0/period_bytes pointer is folded into a larger ring — the
+	 * latter makes the PCM layer consume data at 2× (or more) the
+	 * real-time rate, heard as "faster tempo, unchanged pitch".
 	 */
-	uint32_t blkcnt = BASOUND_DMA_BUFSIZE / blocksize;
-	if (blkcnt < 2)
+	uint32_t blkcnt;
+	if (substream->pcm->private_data != NULL &&
+	    strcmp(substream->pcm->card->driver, "hdsp") == 0) {
 		blkcnt = 2;
+	} else {
+		blkcnt = BASOUND_DMA_BUFSIZE / blocksize;
+		if (blkcnt < 2)
+			blkcnt = 2;
+	}
 	sndbuf_resize(ch->buffer, blkcnt, blocksize);
 
 	/* Keep runtime in sync with the logical buffer size so that
