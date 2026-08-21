@@ -59,6 +59,9 @@ extern struct fw_xfer *fwmem_write_quad(struct fw_device *, caddr_t, uint8_t,
 extern struct fw_xfer *fwmem_read_block(struct fw_device *, caddr_t, uint8_t,
 					uint16_t, uint32_t, int, void *,
 					void (*)(struct fw_xfer *));
+extern struct fw_xfer *fwmem_write_block(struct fw_device *, caddr_t, uint8_t,
+					 uint16_t, uint32_t, int, void *,
+					 void (*)(struct fw_xfer *));
 
 /* Forward declarations */
 static void dice_identify(driver_t *, device_t);
@@ -188,6 +191,33 @@ dice_read_block(struct fw_device *fwdev, uint64_t addr, void *buf, size_t len)
 	txn.done = 0;
 	txn.error = 0;
 	txn.xfer = fwmem_read_block(fwdev, (caddr_t)&txn, fwdev->speed,
+				     (uint16_t)offset_hi, offset_lo,
+				     (int)len, buf, dice_txn_callback);
+	if (txn.xfer == NULL)
+		return (ENOMEM);
+
+	return (dice_wait_txn(&txn));
+}
+
+/*
+ * Block write.  Like dice_write_quad(), the buffer must already contain
+ * big-endian quadlets in bus order.
+ */
+int
+dice_write_block(struct fw_device *fwdev, uint64_t addr, void *buf, size_t len)
+{
+	struct dice_txn txn;
+	uint32_t offset_hi, offset_lo;
+
+	if (fwdev == NULL || fwdev->fc == NULL)
+		return (EIO);
+
+	offset_hi = (uint32_t)(addr >> 32);
+	offset_lo = (uint32_t)(addr & 0xffffffff);
+
+	txn.done = 0;
+	txn.error = 0;
+	txn.xfer = fwmem_write_block(fwdev, (caddr_t)&txn, fwdev->speed,
 				     (uint16_t)offset_hi, offset_lo,
 				     (int)len, buf, dice_txn_callback);
 	if (txn.xfer == NULL)
@@ -1209,6 +1239,16 @@ dice_init_card(struct dice_bsd_softc *sc)
 	}
 
 	sc->attached = true;
+
+	/* The /dev/pf2626N control interface only applies to EAP devices
+	 * (ProFire 2626), which set cfg->setup_router during detection. */
+	if (cfg->setup_router != NULL) {
+		err = dice_cdev_create(sc, device_get_unit(sc->dev));
+		if (err != 0)
+			device_printf(sc->dev,
+			    "Failed to create mixer device: %d\n", err);
+	}
+
 	device_printf(sc->dev, "%s attached (rates %u-%u, "
 	    "capture %u/%u ch, playback %u/%u ch)\n",
 	    sc->model->desc, cfg->rate_min, cfg->rate_max,
@@ -1231,6 +1271,7 @@ dice_detach(device_t dev)
 		return (0);
 
 	callout_drain(&sc->discover_callout);
+	dice_cdev_destroy(sc);
 	dice_streaming_fini(sc);
 	sc->attached = false;
 

@@ -827,12 +827,21 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 
 		for (i = 0; i < frames; i++) {
 			uint32_t *blk = &payload[CIP_HEADER_QUADLETS + i * dbs];
-			unsigned int midi_off = ps->midi_ports > 0 ? 1 : 0;
 
-			if (ps->midi_ports > 0) blk[0] = 0x00000080; /* no MIDI */
-
-			dice_encode_am824_padded(&blk[midi_off],
+			/*
+			 * DICE data-block layout: the PCM quadlets come first,
+			 * followed by the MIDI conformant-data quadlet (see
+			 * dice-interface.h RX_NUMBER_MIDI and Linux
+			 * amdtp-am824.c, which sets pcm_positions[i] = i and
+			 * midi_position = pcm_channels).  Placing MIDI first
+			 * shifted every PCM channel by one quadlet, so the
+			 * device saw stream channel 1 as "left" and channel 2
+			 * as "right" — the reported "rear 2+3" routing offset.
+			 */
+			dice_encode_am824_padded(blk,
 			    &sp[i * nch], nch, ps->device_channels);
+			if (ps->midi_ports > 0)
+				blk[ps->device_channels] = 0x00000080; /* no MIDI */
 		}
 	}
 
@@ -933,8 +942,10 @@ dice_rx_handler(struct fw_xferq *xferq)
 
 				for (fi = 0; fi < frames; fi++) {
 					const uint32_t *blk = &payload[CIP_HEADER_QUADLETS + fi * dbs];
-					unsigned int mo = ps->midi_ports > 0 ? 1 : 0;
-					dice_decode_am824(&tmpbuf[fi * nch], &blk[mo], nch);
+
+					/* PCM quadlets are first; MIDI (if any)
+					 * follows after the audio quadlets. */
+					dice_decode_am824(&tmpbuf[fi * nch], blk, nch);
 				}
 
 				if (is_float) {
@@ -1509,6 +1520,14 @@ dice_streaming_start_playback(struct dice_bsd_softc *sc)
 		device_printf(sc->dev, "dice: failed to set rate %u (%d)\n",
 		    ps->rate, err);
 
+	/* EAP devices (ProFire 2626) need their internal router set up so
+	 * FireWire playback actually reaches the physical outputs. */
+	if (sc->cfg.setup_router != NULL) {
+		err = sc->cfg.setup_router(sc, ps->rate);
+		if (err != 0)
+			return (-err);
+	}
+
 	/* Program the device only when the session leaves idle. */
 	if (DSTREAM(sc)->active_streams == 0) {
 		err = dice_program_device(sc);
@@ -1554,6 +1573,12 @@ dice_streaming_start_capture(struct dice_bsd_softc *sc)
 	if (err != 0)
 		device_printf(sc->dev, "dice: failed to set rate %u (%d)\n",
 		    ps->rate, err);
+
+	if (sc->cfg.setup_router != NULL) {
+		err = sc->cfg.setup_router(sc, ps->rate);
+		if (err != 0)
+			return (-err);
+	}
 
 	if (DSTREAM(sc)->active_streams == 0) {
 		err = dice_program_device(sc);

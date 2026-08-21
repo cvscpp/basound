@@ -22,6 +22,7 @@ SRCS=	sys/dev/basound/basound.c \
 	sys/dev/basound/dice/dice_alesis_bsd.c \
 	sys/dev/basound/dice/dice_maudio_bsd.c \
 	sys/dev/basound/dice/dice_streaming.c \
+	sys/dev/basound/dice/dice_cdev.c \
 	sys/dev/basound/line6/line6_bsd.c \
 	sys/dev/basound/maudio/maudio_midisport.c \
 	sys/dev/basound/digi00x/digi00x_bsd.c \

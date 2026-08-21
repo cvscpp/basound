@@ -24,6 +24,7 @@
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/callout.h>
+#include <sys/conf.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
@@ -143,6 +144,14 @@ struct dice_device_config {
 	unsigned int tx_midi_ports[MAX_DICE_STREAMS];
 	unsigned int rx_midi_ports[MAX_DICE_STREAMS];
 	bool disable_double_pcm_frames;	/* IEC 61883-1/6 compliant devices */
+
+	/*
+	 * Optional per-device router programming (TCAT EAP extension
+	 * devices such as the M-Audio ProFire 2626).  Called at stream
+	 * start so FireWire playback is actually routed to the physical
+	 * analog/digital outputs.  NULL for devices that do not use EAP.
+	 */
+	int (*setup_router)(struct dice_bsd_softc *sc, unsigned int rate);
 };
 
 typedef int (*dice_detect_formats_t)(struct dice_bsd_softc *sc,
@@ -193,6 +202,9 @@ struct dice_bsd_softc {
 	/* Audio streaming framework (PCM plumbing). */
 	struct dice_streaming *stream;
 
+	/* /dev/pf2626N mixer/control interface (ProFire 2626 only). */
+	struct cdev *cdev;
+
 	/* Deferred discovery (FireWire bus may not be explored yet). */
 	struct callout discover_callout;
 	int discover_retries;
@@ -208,6 +220,8 @@ int dice_read_quad(struct fw_device *fwdev, uint64_t addr, uint32_t *val);
 int dice_write_quad(struct fw_device *fwdev, uint64_t addr, uint32_t val);
 int dice_read_block(struct fw_device *fwdev, uint64_t addr,
 		    void *buf, size_t len);
+int dice_write_block(struct fw_device *fwdev, uint64_t addr,
+		     void *buf, size_t len);
 
 /* Section-relative reads used by the format detection callbacks. */
 int dice_read_global(struct dice_bsd_softc *sc, unsigned int offset,
@@ -244,6 +258,31 @@ int dice_alesis_detect_multimix_formats(struct dice_bsd_softc *sc,
 /* dice_maudio_bsd.c */
 int dice_maudio_detect_profire2626_formats(struct dice_bsd_softc *sc,
 					   struct dice_device_config *cfg);
+int dice_maudio_setup_router(struct dice_bsd_softc *sc, unsigned int rate);
+int dice_maudio_read_caps(struct dice_bsd_softc *sc,
+			  uint16_t *router_max, uint8_t *router_exposed,
+			  uint8_t *router_readonly,
+			  uint16_t *mixer_in, uint16_t *mixer_out,
+			  uint8_t *mixer_exposed, uint8_t *mixer_readonly);
+int dice_maudio_get_router(struct dice_bsd_softc *sc, unsigned int rate_mode,
+			   uint32_t *entries, unsigned int max_entries,
+			   unsigned int *count_out);
+int dice_maudio_set_router(struct dice_bsd_softc *sc, unsigned int rate_mode,
+			   const uint32_t *entries, unsigned int count);
+int dice_maudio_get_mixer(struct dice_bsd_softc *sc, unsigned int inputs,
+			  unsigned int outputs, uint32_t *coeff);
+int dice_maudio_set_mixer(struct dice_bsd_softc *sc, unsigned int inputs,
+			  unsigned int outputs, const uint32_t *coeff);
+int dice_maudio_get_peaks(struct dice_bsd_softc *sc, uint32_t *input_peak,
+			  uint32_t *output_peak);
+int dice_maudio_get_clock(struct dice_bsd_softc *sc, uint32_t *select,
+			  uint32_t *status);
+int dice_maudio_set_clock(struct dice_bsd_softc *sc, unsigned int source,
+			  unsigned int rate);
+
+/* dice_cdev.c */
+int  dice_cdev_create(struct dice_bsd_softc *sc, int unit);
+void dice_cdev_destroy(struct dice_bsd_softc *sc);
 
 /* ------------------------------------------------------------------ */
 /* Family model tables                                                 */

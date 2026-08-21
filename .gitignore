@@ -22,6 +22,7 @@ opt_global.h
 pci_if.h
 tools/bsm_digi00x/bsm_digi00x
 tools/bsm_hdsp/bsm_hdsp
+tools/bsm_pf2626/bsm_pf2626
 vnode_if.h
 vnode_if_newproto.h
 vnode_if_typedef.h
