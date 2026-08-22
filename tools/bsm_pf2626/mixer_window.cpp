@@ -418,7 +418,7 @@ void MixerWindow::build_meter_tab() {
 	meter_scroll_->color(fl_rgb_color(30, 30, 30));
 	meter_scroll_->begin();
 
-	Fl_Box *in_cap = new Fl_Box(FL_NO_BOX, 10, 2, 300, 12,
+	Fl_Box *in_cap = new Fl_Box(FL_NO_BOX, 10, 2, 900, 12,
 	    "Inputs (capture): 1-8 analog, 9-16 ADAT A, 17-24 ADAT B, 25-26 S/PDIF");
 	in_cap->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 	in_cap->labelcolor(fl_rgb_color(170, 180, 190));
@@ -430,7 +430,7 @@ void MixerWindow::build_meter_tab() {
 		vu_in_.push_back(new VuMeter(10 + i * 40, 16, 34, 170, buf));
 	}
 
-	Fl_Box *out_cap = new Fl_Box(FL_NO_BOX, 10, 198, 300, 12,
+	Fl_Box *out_cap = new Fl_Box(FL_NO_BOX, 10, 198, 900, 12,
 	    "Outputs (playback): 1-8 analog, 9-16 ADAT A, 17-24 ADAT B, 25-26 S/PDIF");
 	out_cap->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 	out_cap->labelcolor(fl_rgb_color(170, 180, 190));

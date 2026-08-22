@@ -41,8 +41,12 @@ void VuMeter::draw() {
         fl_rectf(bx, by, bw, bh);
         return;
     }
-    fl_color(fl_rgb_color(12, 14, 18));
+    /* Meter well: clearly lighter than the surrounding panel so an idle
+     * (floor-level) meter still reads as a meter. */
+    fl_color(fl_rgb_color(26, 30, 40));
     fl_rectf(bx, by, bw, meter_h);
+
+    /* Fill from the bottom up; green -> yellow -> red. */
     const float frac = (level_db_ - kFloor) / -kFloor;
     const int fill = (int)(frac * meter_h);
     const float kGreenTop  = 0.67f;
@@ -60,15 +64,19 @@ void VuMeter::draw() {
         int bar_y = by + meter_h - 1 - row;
         fl_line(bx, bar_y, bx + bw - 1, bar_y);
     }
+
+    /* Scale grid: minor ticks every 3 dB, brighter major ticks. */
     static const float kMajor[] = {0.f,-6.f,-12.f,-18.f,-24.f,-36.f,-60.f};
     for (float db = kFloor; db <= 0.0f; db += 3.0f) {
         float f   = (db - kFloor) / -kFloor;
         int   ty  = by + meter_h - 1 - (int)(f * (meter_h - 1));
         bool major = false;
         for (float m : kMajor) { if (fabsf(db - m) < 0.5f) { major = true; break; } }
-        fl_color(major ? FL_WHITE : fl_rgb_color(80, 80, 80));
+        fl_color(major ? fl_rgb_color(190, 195, 205) : fl_rgb_color(88, 94, 108));
         fl_line(bx, ty, bx + bw - 1, ty);
     }
+
+    /* Peak hold line. */
     if (peak_hold_db_ > kFloor) {
         float pf = (peak_hold_db_ - kFloor) / -kFloor;
         int   py = by + meter_h - 1 - (int)(pf * (meter_h - 1));
@@ -76,10 +84,14 @@ void VuMeter::draw() {
         fl_line(bx, py, bx + bw - 1, py);
         fl_line(bx, py - 1, bx + bw - 1, py - 1);
     }
-    fl_color(fl_rgb_color(100, 100, 110));
+
+    /* Frame. */
+    fl_color(fl_rgb_color(120, 126, 140));
     fl_rect(bx, by, bw, meter_h);
+
+    /* Channel label strip. */
     if (lh > 0) {
-        fl_color(fl_rgb_color(50, 50, 50));
+        fl_color(fl_rgb_color(45, 48, 56));
         fl_rectf(bx, by + meter_h, bw, lh);
         fl_color(FL_WHITE);
         fl_font(FL_HELVETICA, 9);
