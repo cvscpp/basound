@@ -180,50 +180,93 @@ int
 dice_read_block(struct fw_device *fwdev, uint64_t addr, void *buf, size_t len)
 {
 	struct dice_txn txn;
-	uint32_t offset_hi, offset_lo;
+	uint8_t *p = buf;
+	size_t chunk, n;
 
 	if (fwdev == NULL || fwdev->fc == NULL)
 		return (EIO);
 
-	offset_hi = (uint32_t)(addr >> 32);
-	offset_lo = (uint32_t)(addr & 0xffffffff);
+	/* IEEE 1212 max_rec: maximum record size is 2^(maxrec+1) bytes.
+	 * DICE audio interfaces typically advertise 512 bytes (maxrec 8);
+	 * a block read larger than that (e.g. the 1152-byte matrix mixer)
+	 * is rejected by the device, so split the transfer into chunks. */
+	chunk = (size_t)1 << (fwdev->maxrec + 1);
+	if (chunk < 32)
+		chunk = 32;
+	if (chunk > 2048)
+		chunk = 2048;
 
-	txn.done = 0;
-	txn.error = 0;
-	txn.xfer = fwmem_read_block(fwdev, (caddr_t)&txn, fwdev->speed,
-				     (uint16_t)offset_hi, offset_lo,
-				     (int)len, buf, dice_txn_callback);
-	if (txn.xfer == NULL)
-		return (ENOMEM);
+	while (len > 0) {
+		uint32_t offset_hi, offset_lo;
 
-	return (dice_wait_txn(&txn));
+		n = len > chunk ? chunk : len;
+		offset_hi = (uint32_t)(addr >> 32);
+		offset_lo = (uint32_t)(addr & 0xffffffff);
+
+		txn.done = 0;
+		txn.error = 0;
+		txn.xfer = fwmem_read_block(fwdev, (caddr_t)&txn, fwdev->speed,
+					     (uint16_t)offset_hi, offset_lo,
+					     (int)n, p, dice_txn_callback);
+		if (txn.xfer == NULL)
+			return (ENOMEM);
+
+		txn.error = dice_wait_txn(&txn);
+		if (txn.error != 0)
+			return (txn.error);
+
+		addr += n;
+		p += n;
+		len -= n;
+	}
+	return (0);
 }
 
 /*
  * Block write.  Like dice_write_quad(), the buffer must already contain
- * big-endian quadlets in bus order.
+ * big-endian quadlets in bus order.  Split into max_rec-sized chunks for
+ * the same reason as dice_read_block().
  */
 int
 dice_write_block(struct fw_device *fwdev, uint64_t addr, void *buf, size_t len)
 {
 	struct dice_txn txn;
-	uint32_t offset_hi, offset_lo;
+	uint8_t *p = buf;
+	size_t chunk, n;
 
 	if (fwdev == NULL || fwdev->fc == NULL)
 		return (EIO);
 
-	offset_hi = (uint32_t)(addr >> 32);
-	offset_lo = (uint32_t)(addr & 0xffffffff);
+	chunk = (size_t)1 << (fwdev->maxrec + 1);
+	if (chunk < 32)
+		chunk = 32;
+	if (chunk > 2048)
+		chunk = 2048;
 
-	txn.done = 0;
-	txn.error = 0;
-	txn.xfer = fwmem_write_block(fwdev, (caddr_t)&txn, fwdev->speed,
-				     (uint16_t)offset_hi, offset_lo,
-				     (int)len, buf, dice_txn_callback);
-	if (txn.xfer == NULL)
-		return (ENOMEM);
+	while (len > 0) {
+		uint32_t offset_hi, offset_lo;
 
-	return (dice_wait_txn(&txn));
+		n = len > chunk ? chunk : len;
+		offset_hi = (uint32_t)(addr >> 32);
+		offset_lo = (uint32_t)(addr & 0xffffffff);
+
+		txn.done = 0;
+		txn.error = 0;
+		txn.xfer = fwmem_write_block(fwdev, (caddr_t)&txn, fwdev->speed,
+					     (uint16_t)offset_hi, offset_lo,
+					     (int)n, p, dice_txn_callback);
+		if (txn.xfer == NULL)
+			return (ENOMEM);
+
+		txn.error = dice_wait_txn(&txn);
+		if (txn.error != 0)
+			return (txn.error);
+
+		addr += n;
+		p += n;
+		len -= n;
+	}
+	return (0);
 }
 
 /* ------------------------------------------------------------------ */
