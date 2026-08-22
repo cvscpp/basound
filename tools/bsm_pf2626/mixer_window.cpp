@@ -59,7 +59,12 @@ MixerWindow::MixerWindow(int w, int h, const char *title)
 	build_meter_tab();
 	build_clock_tab();
 	tabs_->end();
-	tabs_->value(tab_router_);
+
+	/* Open on the Meters tab: live level meters are the primary view of
+	 * this tool (the digi00x sibling shows them on the main screen).
+	 * A user clicking the Router/Mixer/Clock tabs gets them back via the
+	 * tab buttons. */
+	tabs_->value(tab_meters_);
 
 	status_bar_ = new Fl_Box(FL_NO_BOX, 0, h - 22, w, 22,
 	    "No device connected");

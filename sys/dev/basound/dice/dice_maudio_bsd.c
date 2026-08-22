@@ -499,6 +499,11 @@ dice_maudio_set_router(struct dice_bsd_softc *sc, unsigned int rate_mode,
 /*
  * Read the matrix mixer coefficients from the mixer section.
  * Coeff layout is output-major: index = output * inputs + input.
+ *
+ * The section is contiguous, so it is read with a single block
+ * transaction: reading the 288 coefficients one quadlet at a time costs
+ * ~450 ms over FireWire (each transaction is ~1.5 ms), which starves the
+ * GUI event loop when the meter tool polls at 25 Hz.
  */
 int
 dice_maudio_get_mixer(struct dice_bsd_softc *sc, unsigned int inputs,
@@ -513,24 +518,27 @@ dice_maudio_get_mixer(struct dice_bsd_softc *sc, unsigned int inputs,
 		return (err);
 
 	n = inputs * outputs;
-	for (i = 0; i < n; i++) {
-		err = dice_read_quad(sc->fwdev, mixer_addr + 4 + (uint64_t)i * 4,
-				     &coeff[i]);
-		if (err != 0)
-			return (err);
+	err = dice_read_block(sc->fwdev, mixer_addr + 4, coeff,
+			      n * sizeof(*coeff));
+	if (err != 0)
+		return (err);
+
+	for (i = 0; i < n; i++)
 		coeff[i] = be32toh(coeff[i]);
-	}
 	return (0);
 }
 
 /*
  * Write the matrix mixer coefficients.  The mixer is applied live by the
- * device; no Load command is required.
+ * device; no Load command is required.  Like the read path, a single
+ * block write is used (dice_write_block expects the buffer in big-endian
+ * quadlet order, so the coefficients are byte-swapped into a local copy).
  */
 int
 dice_maudio_set_mixer(struct dice_bsd_softc *sc, unsigned int inputs,
 		      unsigned int outputs, const uint32_t *coeff)
 {
+	uint32_t buf[PF2626_MAX_MIXER_IN * PF2626_MAX_MIXER_OUT];
 	uint64_t mixer_addr;
 	unsigned int i, n;
 	int err;
@@ -540,13 +548,11 @@ dice_maudio_set_mixer(struct dice_bsd_softc *sc, unsigned int inputs,
 		return (err);
 
 	n = inputs * outputs;
-	for (i = 0; i < n; i++) {
-		err = dice_write_quad(sc->fwdev,
-		    mixer_addr + 4 + (uint64_t)i * 4, htobe32(coeff[i]));
-		if (err != 0)
-			return (err);
-	}
-	return (0);
+	for (i = 0; i < n; i++)
+		buf[i] = htobe32(coeff[i]);
+	err = dice_write_block(sc->fwdev, mixer_addr + 4, buf,
+			       n * sizeof(*buf));
+	return (err);
 }
 
 /*
