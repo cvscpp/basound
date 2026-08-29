@@ -29,6 +29,7 @@
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/bus.h>
 #include <sys/malloc.h>
 #include <sys/lock.h>
@@ -48,6 +49,14 @@
 
 MALLOC_DECLARE(M_ALSA);
 MALLOC_DEFINE(M_DICE_BSD, "dice_bsd", "DICE BSD softc");
+
+/* Boot-time switch for the whole driver.  Loading the basound_dice.ko
+ * module already limits probing to DICE FireWire devices; this tunable
+ * additionally lets loader.conf disable the driver without unloading
+ * the module:
+ *     hw.basound_dice.enable="0" */
+static int dice_bsd_enabled = 1;
+TUNABLE_INT("hw.basound_dice.enable", &dice_bsd_enabled);
 
 /* External declarations for fwmem transaction helpers (from fwmem.c). */
 extern struct fw_xfer *fwmem_read_quad(struct fw_device *, caddr_t, uint8_t,
@@ -910,29 +919,31 @@ dice_pcm_hw_params(struct snd_pcm_substream *substream, void *hw_params)
 	struct dice_pcm_stream *ps = runtime->private_data;
 	struct dice_bsd_softc *sc = device_get_softc(substream->pcm->card->dev->bsddev);
 	struct basound_chan *ch = substream->private_data;
-	int err;
 
 	if (runtime == NULL || ps == NULL)
 		return (-EINVAL);
 
-	err = snd_pcm_lib_malloc_pages(substream,
-				       runtime->hw.buffer_bytes_max);
-	if (err < 0)
-		return (err);
-	if (runtime->dma_area == NULL)
-		return (-ENOMEM);
-
-	runtime->dma_bytes = runtime->hw.buffer_bytes_max;
-
-	/* Extract rate and channel count from basound channel.  Note that
-	 * basound_chan_setformat() runs ops->hw_params BEFORE the OSS
-	 * SNDCTL_DSP_SPEED ioctl has been applied, so ch->speed is still
-	 * the 48000 Hz default here.  dice_pcm_prepare() re-syncs with
-	 * the real speed at stream start. */
+	/*
+	 * DMA memory is owned by the FreeBSD channel: basound_chan_init()
+	 * allocates the sndbuf via sndbuf_alloc() with the card DMA tag and
+	 * sets runtime->dma_area/dma_addr/dma_bytes to it (dice_fill_tx_chunk()
+	 * re-syncs them every packet).
+	 *
+	 * Do NOT call snd_pcm_lib_malloc_pages() here.  That would allocate a
+	 * redundant 16 MB (runtime->hw.buffer_bytes_max) DMA block on EVERY
+	 * setformat / setchannels / setfragments ioctl — JACK's OSS backend
+	 * issues several of those per channel on open, so a duplex session
+	 * leaks ~100 MB — and it overwrites runtime->private_data (set to the
+	 * dice_pcm_stream by dice_pcm_open()) with the snd_dma_buffer, so the
+	 * next hw_params call would take the dmab for a dice_pcm_stream and
+	 * write stream state into freed/foreign memory.  See line6_pcm_hw_params
+	 * for the identical comment.
+	 */
 	dice_stream_sync_from_channel(sc, ps, ch);
 
 	ps->period_bytes = (ch != NULL) ? ch->blocksize : 512;
-	ps->buffer_bytes = runtime->dma_bytes;
+	ps->buffer_bytes = (ch != NULL && ch->buffer != NULL) ?
+	    ch->buffer->bufsize : runtime->dma_bytes;
 
 	return (0);
 }
@@ -940,7 +951,9 @@ dice_pcm_hw_params(struct snd_pcm_substream *substream, void *hw_params)
 static int
 dice_pcm_hw_free(struct snd_pcm_substream *substream)
 {
-	return (snd_pcm_lib_free_pages(substream));
+	/* No ALSA-owned DMA pages; the buffer is the channel sndbuf. */
+	(void)substream;
+	return (0);
 }
 
 static int
@@ -969,10 +982,25 @@ dice_pcm_prepare(struct snd_pcm_substream *substream)
 		ps->period_bytes = ch->blocksize;
 	}
 
-	ps->hwptr = 0;
-	ps->period_accum = 0;
-	ps->tx_dbc = 0;
-	ps->frame_cycle = 0;
+	/*
+	 * Only rewind the stream on a genuine (re)start.  FreeBSD's OSS
+	 * layer re-issues PCMTRIG_START via chn_start() on every write()
+	 * after the channel was stopped, and JACK re-triggers
+	 * prepare/start frequently under its realtime audio thread (see
+	 * the identical note in digi00x-stream.c).  A spurious re-prepare
+	 * while the stream is already active must not reset hwptr to 0
+	 * (the OHCI IT context keeps transmitting from the old position;
+	 * the next refill would read stale offsets and chn_dmaupdate()
+	 * would see a huge backward jump and dispose the whole sndbuf —
+	 * audible distortion) nor restart the blocking-mode SYT sequence
+	 * (losing the device's media-clock lock mid-stream).
+	 */
+	if (!ps->active) {
+		ps->hwptr = 0;
+		ps->period_accum = 0;
+		ps->tx_dbc = 0;
+		ps->frame_cycle = 0;
+	}
 	return (0);
 }
 
@@ -981,16 +1009,31 @@ dice_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_card *card = substream->pcm->card;
 	struct dice_bsd_softc *sc = device_get_softc(card->dev->bsddev);
+	struct dice_pcm_stream *ps = dice_stream_for_substream(substream);
 	int err = 0;
 
+	/*
+	 * Idempotent trigger.  FreeBSD re-issues PCMTRIG_START whenever a
+	 * stopped channel is written again, and JACK re-triggers
+	 * start/stop frequently.  Re-running the full start sequence while
+	 * the stream is already active would re-program the device,
+	 * restart the blocking-mode SYT sequence and double-bump the ISO
+	 * context refcounts (leaving the contexts running after the final
+	 * stop).  The stop functions below are already guarded on
+	 * ps->active; guard START the same way.
+	 */
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		if (ps != NULL && ps->active)
+			return (0);
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			err = dice_streaming_start_playback(sc);
 		else
 			err = dice_streaming_start_capture(sc);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
+		if (ps != NULL && !ps->active)
+			return (0);
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			dice_streaming_stop_playback(sc);
 		else
@@ -1030,6 +1073,8 @@ static const struct snd_pcm_ops dice_pcm_ops = {
 static void
 dice_identify(driver_t *driver, device_t parent)
 {
+	if (!dice_bsd_enabled)
+		return;
 	if (device_find_child(parent, "basound_dice", DEVICE_UNIT_ANY) == NULL)
 		BUS_ADD_CHILD(parent, 0, "basound_dice", DEVICE_UNIT_ANY);
 }
@@ -1037,6 +1082,9 @@ dice_identify(driver_t *driver, device_t parent)
 static int
 dice_probe(device_t dev)
 {
+	if (!dice_bsd_enabled)
+		return (ENXIO);
+
 	/* Real device matching happens in attach/discover, where the
 	 * firewire bus has been explored. */
 	device_set_desc(dev, "DICE FireWire Audio Device");
@@ -1178,6 +1226,55 @@ dice_discover(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
+/* Diagnostics                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * dev.dice.<unit>.stream — one-shot dump of the live stream state and
+ * the underrun / shortfall counters.  tx_underruns counts TX packets
+ * emitted with no ready data (silence substituted), tx_shortfalls
+ * counts packets that only partially matched the negotiated block
+ * size (zero-filled tail — audible clicks).  Both should stay at zero
+ * in steady state; growth during a JACK session pinpoints whether the
+ * "broken/distorted" playback is a data-starved xrun condition rather
+ * than a sample-path bug.
+ */
+static int
+sysctl_dice_stream(SYSCTL_HANDLER_ARGS)
+{
+	struct dice_bsd_softc *sc = arg1;
+	struct dice_streaming *ds;
+	struct dice_pcm_stream *pb, *cap;
+	char buf[512];
+	int len;
+
+	if (sc == NULL || sc->stream == NULL) {
+		snprintf(buf, sizeof(buf), "streaming not initialized");
+		return (sysctl_handle_string(oidp, buf, strlen(buf) + 1, req));
+	}
+	ds = sc->stream;
+	pb = &ds->playback;
+	cap = &ds->capture;
+
+	len = snprintf(buf, sizeof(buf),
+	    "playback: active=%d rate=%u ch=%u devch=%u dbs=%u fdf=0x%02x "
+	    "hwptr=%lu/%u period=%u tx_underruns=%lu tx_shortfalls=%lu\n"
+	    "capture:  active=%d rate=%u ch=%u devch=%u dbs=%u "
+	    "hwptr=%lu/%u period=%u",
+	    pb->active, pb->rate, pb->pcm_channels, pb->device_channels,
+	    pb->data_block_quadlets, pb->fdf, pb->hwptr, pb->buffer_bytes,
+	    pb->period_bytes, pb->tx_underruns, pb->tx_shortfalls,
+	    cap->active, cap->rate, cap->pcm_channels, cap->device_channels,
+	    cap->data_block_quadlets, cap->hwptr, cap->buffer_bytes,
+	    cap->period_bytes);
+	if (len < 0)
+		len = 0;
+	if (len >= (int)sizeof(buf))
+		len = (int)sizeof(buf) - 1;
+	return (sysctl_handle_string(oidp, buf, len + 1, req));
+}
+
+/* ------------------------------------------------------------------ */
 /* Card setup                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -1282,6 +1379,13 @@ dice_init_card(struct dice_bsd_softc *sc)
 	}
 
 	sc->attached = true;
+
+	/* Diagnostics: dev.dice.<unit>.stream */
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(sc->dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)),
+	    OID_AUTO, "stream", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    sc, 0, sysctl_dice_stream, "A",
+	    "Playback/capture stream state and underrun counters");
 
 	/* The /dev/pf2626N control interface only applies to EAP devices
 	 * (ProFire 2626), which set cfg->setup_router during detection. */

@@ -38,6 +38,14 @@
 
 /* Line6 USB driver - bridges FreeBSD usb_device to ALSA Line6 driver */
 
+/* Boot-time switch for the whole driver.  Loading the basound_line6.ko
+ * module already limits probing to Line6 USB devices; this tunable
+ * additionally lets loader.conf disable the driver without unloading
+ * the module:
+ *     hw.basound_line6.enable="0" */
+static int line6_bsd_enabled = 1;
+TUNABLE_INT("hw.basound_line6.enable", &line6_bsd_enabled);
+
 MALLOC_DECLARE(M_ALSA);
 
 SYSCTL_DECL(_hw_basound);
@@ -1561,6 +1569,9 @@ line6_bsd_probe(device_t dev)
 {
 	struct usb_attach_arg *uaa;
 	const struct line6_device_info *info;
+
+	if (!line6_bsd_enabled)
+		return (ENXIO);
 
 	uaa = device_get_ivars(dev);
 	if (uaa == NULL)

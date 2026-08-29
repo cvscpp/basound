@@ -645,11 +645,11 @@ DEFINE_CLASS(basound_chan, basound_chan_methods, 0);
 /*
  * PCM child device driver.
  *
- * The parent PCI device (e.g. basound_hdsp) creates a "pcm" child device via
- * device_add_child(), stores a struct snd_pcm * in its ivars, and calls
- * device_probe_and_attach().  This driver is registered for the
- * "basound_hdsp" bus, so newbus finds it, allocates PCM_SOFTC_SIZE bytes
- * for the snddev_info softc, and calls basound_pcm_attach().
+ * basound_pcm_register() (below) creates the "pcm" child device under
+ * the parent (e.g. basound_hdsp) and attaches it explicitly via
+ * device_set_driver(), so this probe is only a fallback.  The child
+ * device gets PCM_SOFTC_SIZE bytes for its softc, so pcm_init() writes
+ * into snddev_info, not our own softc.
  */
 static int
 basound_pcm_probe(device_t dev)
@@ -768,12 +768,17 @@ static driver_t basound_pcm_driver = {
 };
 
 /*
- * Register the PCM sub-driver under every basound bus type so that
- * device_probe_and_attach() finds it when the parent creates a "pcm" child.
+ * NOTE: No DRIVER_MODULE(basound_pcm, <bus>, ...) registrations here.
+ *
+ * The basound_pcm driver is attached explicitly via device_set_driver()
+ * in basound_pcm_register(), never through newbus devclass probing (see
+ * the comment in basound_pcm_register below).  A DRIVER_MODULE() line
+ * would additionally emit a MODULE_DEPEND(basound_pcm, basound_<drv>),
+ * and since the drivers themselves depend on this core module, that
+ * would create a circular MODULE_DEPEND chain and make the split
+ * modules (basound.ko core + per-class driver modules) impossible to
+ * load in any order.
  */
-DRIVER_MODULE(basound_pcm, basound_hdsp,    basound_pcm_driver, 0, 0);
-DRIVER_MODULE(basound_pcm, basound_line6,   basound_pcm_driver, 0, 0);
-DRIVER_MODULE(basound_pcm, basound_digi00x, basound_pcm_driver, 0, 0);
 
 /*
  * basound_pcm_register — called from snd_card_register().

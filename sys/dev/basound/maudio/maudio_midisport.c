@@ -33,6 +33,14 @@
 
 MALLOC_DECLARE(M_ALSA);
 
+/* Boot-time switch for the whole driver.  Loading the basound_maudio.ko
+ * module already limits probing to M-Audio MIDISport USB devices; this
+ * tunable additionally lets loader.conf disable the driver without
+ * unloading the module:
+ *     hw.basound_maudio.enable="0" */
+static int maudio_bsd_enabled = 1;
+TUNABLE_INT("hw.basound_maudio.enable", &maudio_bsd_enabled);
+
 /* M-Audio vendor ID and product IDs */
 #define MAUDIO_VENDOR_ID		0x0763
 #define MAUDIO_MIDISPORT8x8		0x1031
@@ -418,6 +426,9 @@ maudio_midisport_probe(device_t dev)
 {
 	struct usb_attach_arg *uaa = device_get_ivars(dev);
 
+	if (!maudio_bsd_enabled)
+		return ENXIO;
+
 	if ((uaa->info.idVendor == MAUDIO_VENDOR_ID) &&
 	    ((uaa->info.idProduct == MAUDIO_MIDISPORT8x8) ||
 	     (uaa->info.idProduct == MAUDIO_MIDISPORT8x8_OLD))) {
@@ -576,6 +587,7 @@ static driver_t maudio_midisport_driver = {
 };
 
 DRIVER_MODULE(basound_maudio, uhub, maudio_midisport_driver, 0, 0);
+MODULE_DEPEND(basound_maudio, basound, 1, 1, 1);
 MODULE_DEPEND(basound_maudio, usb, 1, 1, 1);
 MODULE_DEPEND(basound_maudio, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
 

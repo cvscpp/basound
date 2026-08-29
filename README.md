@@ -13,23 +13,50 @@ A FreeBSD kernel module that provides support for professional audio devices fro
 
 ```bash
 cd /path/to/basound
-make
+make all-modules
 ```
 
-This produces `basound.ko` - a single kernel module supporting DICE, HDSP, and Line6 devices.
+This produces the core module plus one module per supported device
+class:
+
+- `basound.ko` — ALSA shim / glue core (no device drivers)
+- `basound_hdsp.ko` — RME Hammerfall DSP (PCI)
+- `basound_dice.ko` — DICE FireWire interfaces
+- `basound_digi00x.ko` — Digidesign Digi 002/003 (FireWire)
+- `basound_line6.ko` — Line6 USB audio interfaces
+- `basound_maudio.ko` — M-Audio MIDISport 8x8 (USB MIDI)
+
+`make` alone builds only the core; `make all-modules` builds everything.
 
 ### Installation
 
 ```bash
-# Load the module
+# Load only the driver for your hardware.  The core is pulled in
+# automatically via MODULE_DEPEND (kldload resolves dependencies):
+kldload ./sys/dev/basound/hdsp/basound_hdsp.ko
+
+# Or load core and drivers explicitly (boot: put in /boot/loader.conf):
+#   kld_list="basound basound_hdsp"
 kldload ./basound.ko
+kldload ./sys/dev/basound/line6/basound_line6.ko
 
 # Verify device detection
-dmesg | grep -E "DICE|HDSP|Line6"
+dmesg | grep -E "DICE|HDSP|Line6|Digi|MIDISport"
 sndstat
 
 # Access mixer
 mixer
+```
+
+To keep a loaded module from probing at boot, without unloading it, set
+its tunable in `/boot/loader.conf`:
+
+```
+hw.basound_hdsp.enable="0"
+hw.basound_dice.enable="0"
+hw.basound_digi00x.enable="0"
+hw.basound_line6.enable="0"
+hw.basound_maudio.enable="0"
 ```
 
 ### Testing
@@ -186,44 +213,46 @@ amidi -l
 
 ### Module Organization
 
+The project is split into a core module plus one module per supported
+device class.  Each driver module `MODULE_DEPEND`s on the core, so the
+core is loaded automatically when a driver is loaded (and unloads only
+after all drivers are gone).
+
 ```
-basound.ko (~60 KB)
-├── DICE Driver (406 lines)
-│   ├── FireWire device probing
-│   ├── PCM callbacks
-│   ├── MIDI device creation
-│   └── Mixer integration
-├── HDSP Driver (728 lines)
-│   ├── hdsp_bsd.c: PCI device probing, resource allocation
-│   ├── hdsp_main.c: Card creation, PCM device setup
-│   ├── hdsp_midi.c: Dual MIDI port support
-│   ├── hdsp_mixer.c: Mixer control creation
-│   └── hdsp.h: Hardware definitions and register macros
-├── Line6 Driver (493 lines)
-│   ├── USB device probing
-│   ├── Conditional PCM creation
-│   ├── MIDI device creation (if supported)
-│   └── Mixer integration
-└── ALSA Shim (Linux→FreeBSD compatibility)
-    ├── sound/core.h: Card/device abstractions
-    ├── sound/pcm.h: PCM operations
-    ├── sound/pci.h: PCI resource access
-    └── (Device tree: PCI/USB → ALSA Card → PCM/MIDI/Mixer)
-│   └── Mixer integration
-│
-├── Line6 Driver (493 lines)
-│   ├── USB device probing
-│   ├── PCM callbacks
-│   ├── MIDI device creation
-│   └── Mixer integration
-│
-└── ALSA Shim Layer (shared)
-    ├── sound/core.h - Card structures
-    ├── sound/pcm.h - PCM device API
-    ├── sound/pcm_params.h - PCM constraints
-    ├── sound/rawmidi.h - MIDI API
-    └── Linux compatibility headers
+basound.ko (core, ~36 KB) — ALSA shim + FreeBSD sound integration
+├── ALSA shim: snd_card/snd_pcm/snd_rawmidi/snd_kcontrol, DMA, firmware
+├── FreeBSD bridge: basound_pcm driver (pcm_init/pcm_addchan), mixer glue
+└── basound_debug.c: shared debug/tone helpers
+
+basound_hdsp.ko (~420 KB)      RME Hammerfall DSP (PCI)
+├── hdsp_bsd.c   PCI probing, resource allocation, tunable gate
+├── hdsp_main.c  Card creation, PCM device setup
+├── hdsp_midi.c  Dual MIDI port support
+├── hdsp_mixer.c Mixer control creation
+└── hdsp_cdev.c  /dev/hdspN mixer interface
+
+basound_dice.ko (~54 KB)       DICE FireWire interfaces
+├── dice_bsd.c          probing, card setup, tunable gate
+├── dice_streaming.c    FreeBSD-native ISO DMA (AM824/CIP)
+├── dice_alesis_bsd.c   Alesis iO14/iO26, MultiMix 12/16
+├── dice_maudio_bsd.c   M-Audio ProFire 2626
+└── dice_cdev.c         /dev/pf2626N mixer interface
+
+basound_digi00x.ko (~46 KB)    Digidesign Digi 002/003 (FireWire)
+├── digi00x_bsd.c       probing, tunable gate
+└── digi00x-{stream,streaming,pcm,midi,transaction,hwdep,proc}.c
+
+basound_line6.ko (~36 KB)      Line6 USB audio interfaces
+└── line6_bsd.c         USB probing, PCM, MIDI, toneport, tunable gate
+
+basound_maudio.ko (~17 KB)     M-Audio MIDISport 8x8 (USB MIDI)
+└── maudio_midisport.c  USB MIDI, tunable gate
 ```
+
+Each driver honours a `hw.basound_<class>.enable` tunable (default 1)
+checked in its `device_probe`/`device_identify` methods, so a loaded
+module can be prevented from probing via `/boot/loader.conf` without
+unloading it.
 
 ### Device Flow
 
@@ -256,24 +285,29 @@ User Applications (aplay, arecord, mixer, etc.)
 ### Build Commands
 
 ```bash
-# Full rebuild
-make clean && make
+# Full rebuild of core + all driver modules
+make clean && make all-modules
 
-# Incremental build
+# Core module only
 make
 
 # Clean up
 make clean
+make clean-modules   # clean the driver modules
 
 # View build output
-make | head -50  # see first 50 lines
+make all-modules | head -50
 ```
 
 ### Build Output
 
 ```
-Module: basound.ko
-Size: ~60 KB
+Module: basound.ko            (core, ~36 KB)
+Module: basound_hdsp.ko       (~420 KB)
+Module: basound_dice.ko       (~54 KB)
+Module: basound_digi00x.ko    (~46 KB)
+Module: basound_line6.ko      (~36 KB)
+Module: basound_maudio.ko     (~17 KB)
 Format: ELF 64-bit LSB relocatable, x86-64, FreeBSD
 ```
 
@@ -281,16 +315,49 @@ Format: ELF 64-bit LSB relocatable, x86-64, FreeBSD
 
 ### Loading the Module
 
+Load only the driver module matching your hardware; `kldload` resolves
+the dependency on the core automatically:
+
 ```bash
-# Load module
-kldload ./basound.ko
+# RME HDSP (PCI)
+kldload ./sys/dev/basound/hdsp/basound_hdsp.ko
+
+# DICE FireWire
+kldload ./sys/dev/basound/dice/basound_dice.ko
+
+# Digidesign Digi 002/003 (FireWire)
+kldload ./sys/dev/basound/digi00x/basound_digi00x.ko
+
+# Line6 USB
+kldload ./sys/dev/basound/line6/basound_line6.ko
+
+# M-Audio MIDISport (USB MIDI)
+kldload ./sys/dev/basound/maudio/basound_maudio.ko
 
 # Verify loading
 kldstat | grep basound
 
-# Unload module
-kldunload basound
+# Unload (core unloads last, after all drivers are gone)
+kldunload basound_line6
 ```
+
+At boot, list the core plus the driver(s) you need in `/boot/loader.conf`:
+
+```
+kld_list="basound basound_hdsp"
+```
+
+To keep a loaded driver from probing, add its tunable:
+
+```
+hw.basound_hdsp.enable="0"
+```
+
+Note: with several basound drivers loaded simultaneously, only the ones
+whose probe matches actual hardware attach — e.g. a machine with only an
+RME card never attaches the Line6/M-Audio/DICE drivers even when their
+modules are loaded.  Loading only what you need keeps probing to a
+minimum.
 
 ### Checking Device Detection
 
@@ -342,40 +409,50 @@ amidi -p "Line6" -s note_on.mid
 
 ```
 basound/
-├── Makefile                    # Build configuration
+├── Makefile                    # Core module + `all-modules`/`clean-modules` targets
 ├── README.md                   # This file
 ├── basound.plan               # Development plan
 │
 ├── sys/dev/basound/
+│   ├── Makefile                # (builds all driver modules) — see top-level
+│   ├── basound.c              # Core module: modevent, MODULE_DEPEND(sound)
+│   ├── basound_debug.c        # Shared debug/tone helpers
 │   ├── dice/
-│   │   └── dice_bsd.c        # DICE FireWire driver (406 lines)
+│   │   ├── Makefile           # basound_dice.ko
+│   │   └── dice_bsd.c         # DICE FireWire driver
+│   ├── digi00x/
+│   │   ├── Makefile           # basound_digi00x.ko
+│   │   └── digi00x_bsd.c      # Digidesign Digi 002/003 driver
 │   ├── hdsp/
-│   │   ├── hdsp_bsd.c        # HDSP PCI probing & attachment (176 lines)
-│   │   ├── hdsp_main.c       # HDSP card creation & init (300 lines)
-│   │   ├── hdsp_midi.c       # HDSP MIDI support (21 lines)
-│   │   ├── hdsp_mixer.c      # HDSP mixer controls (64 lines)
-│   │   └── hdsp.h            # HDSP hardware definitions (167 lines)
+│   │   ├── Makefile           # basound_hdsp.ko
+│   │   ├── hdsp_bsd.c         # HDSP PCI probing & attachment
+│   │   ├── hdsp_main.c        # HDSP card creation & init
+│   │   ├── hdsp_midi.c        # HDSP MIDI support
+│   │   ├── hdsp_mixer.c       # HDSP mixer controls
+│   │   ├── hdsp_cdev.c        # /dev/hdspN mixer interface
+│   │   └── hdsp.h             # HDSP hardware definitions
 │   ├── line6/
-│   │   └── line6_bsd.c       # Line6 USB driver (493 lines)
-│   └── basound.h             # Module shared definitions
+│   │   ├── Makefile           # basound_line6.ko
+│   │   └── line6_bsd.c        # Line6 USB driver
+│   └── maudio/
+│       ├── Makefile           # basound_maudio.ko
+│       └── maudio_midisport.c # M-Audio MIDISport 8x8 (USB MIDI)
 │
-├── sys/alsa/include/sound/   # ALSA compatibility layer
-│   ├── core.h               # Card/device abstractions
-│   ├── pcm.h                # PCM device/substream structures
-│   ├── pcm_params.h         # PCM format/rate constraints
-│   ├── rawmidi.h            # MIDI device structures
-│   ├── control.h            # Mixer/control structures
-│   ├── pci.h                # PCI device access
-│   └── ...                  # Other ALSA headers
+├── sys/alsa/                  # ALSA shim core (compiled into basound.ko)
+│   ├── alsa_card.c            # snd_card_new/free/register
+│   ├── alsa_pcm.c             # snd_pcm_new/set_ops
+│   ├── alsa_pcm_bsd.c         # FreeBSD PCM bridge (pcm child driver)
+│   ├── alsa_mixer_bsd.c       # FreeBSD mixer glue
+│   ├── alsa_midi.c            # rawmidi shim
+│   ├── alsa_mem.c             # DMA allocation
+│   ├── ...                    # firmware, hwdep, info, work, control, pci
+│   └── include/sound/         # ALSA compatibility headers
 │
-├── linux/                    # Linux kernel compatibility
-│   ├── sound/pci/rme9652/
-│   │   ├── hdsp.c           # Original ALSA HDSP driver code
-│   │   └── hdspm.c          # HDSP variant for reference
-│   └── ...                  # Other Linux driver code
+├── linux/                     # Upstream ALSA/Linux sources (reference)
+│   └── sound/...
 │
 └── sys/dev/usb/
-    └── opt_usb.h            # USB configuration stub
+    └── opt_usb.h              # USB configuration stub
 ```
 
 ## Implementation Details
@@ -675,17 +752,34 @@ For issues and questions:
 
 ## Statistics
 
-- **Total Drivers**: 3 (DICE FireWire + HDSP PCI + Line6 USB)
-- **Supported Devices**: 25 professional audio models (11 DICE + 3 HDSP + 11 Line6)
-- **Source Code**: 1600+ lines of driver code
-- **Module Size**: ~60 KB
-- **ALSA Shim**: 600+ lines shared compatibility layer
-- **Build Time**: ~2 minutes
+- **Total Drivers**: 5 (HDSP PCI + DICE FireWire + Digi 002/003 + Line6 USB + M-Audio USB MIDI)
+- **Supported Devices**: 25+ professional audio models
+- **Modules**: core `basound.ko` + one module per device class
 - **Compilation**: ✅ Clean (no errors, no warnings)
+- **Load test**: ✅ all six modules load/unload cleanly (see Changelog)
 
 ## Changelog
 
-### Current Version (HDSP PCI Driver Added)
+### Current Version (Per-Device-Class Modules + Tunables)
+- ✅ Split the monolithic `basound.ko` into a core shim module plus one
+  module per device class:
+  - `basound.ko` — ALSA shim + FreeBSD sound bridge (no drivers)
+  - `basound_hdsp.ko`, `basound_dice.ko`, `basound_digi00x.ko`,
+    `basound_line6.ko`, `basound_maudio.ko`
+- ✅ Each driver `MODULE_DEPEND`s on the core; `kldload` resolves the
+  dependency automatically (verified: core auto-loads and unloads last)
+- ✅ Loading only the module matching your hardware means only that
+  driver probes the bus — no cross-family detection traffic
+- ✅ Added `hw.basound_<class>.enable` tunables (loader.conf) to gate
+  each driver's probe/identify without unloading the module
+- ✅ Added per-directory `Makefile`s + `make all-modules` / `make clean-modules`
+- ✅ Removed the vestigial `DRIVER_MODULE(basound_pcm, ...)` registrations
+  that would have created a circular `MODULE_DEPEND` in the split
+  (attach goes through `device_set_driver()` directly)
+- ✅ Verified: all six modules build, load, and unload cleanly on
+  FreeBSD 15.1; `kldstat` shows the core referenced by all drivers
+
+### Previous Version (HDSP PCI Driver Added)
 - ✅ Added complete HDSP PCI driver (728 lines across 5 files)
 - ✅ Support for 3 RME HDSP device families (Digiface, Multiface, 9652)
 - ✅ PCI device probing and enumeration

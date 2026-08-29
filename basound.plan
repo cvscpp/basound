@@ -16,20 +16,47 @@ Create a glue layer for FreeBSD that allows using ALSA drivers for professional 
 - **Support:** MIDI.
 - **Exclude:** Standard onboard cards, GPU cards, and `uaudio` compatible devices.
 
+## Module Layout (per device class)
+
+The project is split into a core module plus one loadable module per
+supported device class.  Loading only the driver that matches your
+hardware means only that driver probes the bus:
+
+```
+basound.ko            core ALSA shim + FreeBSD sound bridge (no drivers)
+basound_hdsp.ko       RME Hammerfall DSP PCI            (sys/dev/basound/hdsp)
+basound_dice.ko       DICE FireWire interfaces          (sys/dev/basound/dice)
+basound_digi00x.ko    Digidesign Digi 002/003 FireWire  (sys/dev/basound/digi00x)
+basound_line6.ko      Line6 USB audio interfaces        (sys/dev/basound/line6)
+basound_maudio.ko     M-Audio MIDISport 8x8 USB MIDI    (sys/dev/basound/maudio)
+```
+
+Each driver `MODULE_DEPEND`s on `basound` (core), which `kldload`
+resolves automatically and which unloads last.  Each driver also honors
+a `hw.basound_<class>.enable` tunable (default 1, set in loader.conf)
+checked in its `device_probe`/`device_identify` methods.
+
+Build everything with `make all-modules` from the project root, or each
+module from its own directory.
+
 ## Architecture: Kernel Shim Layer
 The project will consist of a FreeBSD kernel module that provides an emulation environment for the ALSA framework.
 
-### 1. ALSA Core Shim
+### 1. ALSA Core Shim (basound.ko)
 - Implement `alsa-kernel` APIs in FreeBSD KPI.
 - Support for `snd_card`, `snd_pcm`, `snd_pcm_ops`.
 - Memory management mapping (ALSA `dma_alloc` -> FreeBSD `bus_dma`).
 
-### 2. FreeBSD Sound/MIDI Integration
-- Register as a FreeBSD `pcm` device.
+### 2. FreeBSD Sound/MIDI Integration (basound.ko)
+- Register as a FreeBSD `pcm` device (the `basound_pcm` sub-driver is
+  attached via `device_set_driver()` in `basound_pcm_register()`; there
+  are deliberately no `DRIVER_MODULE(basound_pcm, <bus>)` entries, which
+  would create circular module dependencies in the split).
 - Map ALSA PCM callbacks to FreeBSD `snd_channel` operations.
 - Map ALSA MIDI callbacks to FreeBSD `midi` operations.
 
 ### 3. Driver Porting Framework
+- One loadable module per device class (see layout above).
 - Create a build system that allows compiling upstream ALSA drivers against the `basound` shim.
 - Identify initial target hardware (e.g., RME or M-Audio cards).
 
@@ -52,6 +79,9 @@ The project will consist of a FreeBSD kernel module that provides an emulation e
 
 ### Phase 4: Driver Integration (Planned)
 - [ ] Implement PCI helper functions (`snd_pci_*`).
+- [x] Split drivers into per-class loadable modules (basound_hdsp,
+      basound_dice, basound_digi00x, basound_line6, basound_maudio).
+- [x] Add `hw.basound_<class>.enable` tunable gates to every driver.
 - [ ] Choose a specific professional card driver to port as a proof of concept.
 - [ ] Adapt the driver's build system to the FreeBSD kernel module environment.
 
@@ -60,3 +90,5 @@ The project will consist of a FreeBSD kernel module that provides an emulation e
 - **Loading:** Verify the kernel module loads without panics.
 - **Device Recognition:** Verify the driver attaches to the hardware.
 - **Functional Testing:** Use FreeBSD tools like `cat /dev/sndstat`, `mixer`, and MIDI utilities to verify audio playback and recording.
+- **Done:** all six modules build, load, and unload cleanly on FreeBSD
+  15.1; `kldload` auto-loads the core dependency and the core unloads last.

@@ -35,6 +35,14 @@
 
 MALLOC_DECLARE(M_ALSA);
 
+/* Boot-time switch for the whole driver.  Loading the basound_digi00x.ko
+ * module already limits probing to Digidesign Digi 002/003 FireWire
+ * devices; this tunable additionally lets loader.conf disable the
+ * driver without unloading the module:
+ *     hw.basound_digi00x.enable="0" */
+static int dg00x_bsd_enabled = 1;
+TUNABLE_INT("hw.basound_digi00x.enable", &dg00x_bsd_enabled);
+
 #define VENDOR_DIGIDESIGN	0x00a07e
 #define MODEL_CONSOLE		0x000001
 #define MODEL_RACK		0x000002
@@ -146,6 +154,8 @@ get_model_id(struct fw_device *fwdev)
 static void
 dg00x_identify(driver_t *driver, device_t parent)
 {
+	if (!dg00x_bsd_enabled)
+		return;
 	/* Only create one child */
 	if (device_find_child(parent, "basound_digi00x", DEVICE_UNIT_ANY) == NULL)
 		BUS_ADD_CHILD(parent, 0, "basound_digi00x", DEVICE_UNIT_ANY);
@@ -159,6 +169,9 @@ dg00x_identify(driver_t *driver, device_t parent)
 static int
 dg00x_probe(device_t dev)
 {
+	if (!dg00x_bsd_enabled)
+		return (ENXIO);
+
 	device_set_desc(dev, "Digidesign Digi 002/003 FireWire Audio");
 	return (BUS_PROBE_DEFAULT);
 }

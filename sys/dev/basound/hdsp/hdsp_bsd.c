@@ -21,6 +21,14 @@
 #define PCI_DEVICE_ID_RME_MULTIFACE	0x3fc6
 #define PCI_DEVICE_ID_RME_H9652		0x3fc4
 
+/* Boot-time switch for the whole driver.  Loading the basound_hdsp.ko
+ * module already limits probing to RME HDSP PCI devices; this tunable
+ * additionally lets loader.conf disable the driver without unloading
+ * the module:
+ *     hw.basound_hdsp.enable="0" */
+static int hdsp_bsd_enabled = 1;
+TUNABLE_INT("hw.basound_hdsp.enable", &hdsp_bsd_enabled);
+
 struct hdsp_bsd_softc {
 	struct hdsp chip;
 	struct resource *irq_res;
@@ -32,6 +40,9 @@ hdsp_bsd_probe(device_t dev)
 {
 	uint16_t vendor = pci_get_vendor(dev);
 	uint16_t device = pci_get_device(dev);
+
+	if (!hdsp_bsd_enabled)
+		return (ENXIO);
 
 	if (vendor != PCI_VENDOR_ID_RME)
 		return (ENXIO);
