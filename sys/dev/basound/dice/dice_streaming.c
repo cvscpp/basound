@@ -310,7 +310,8 @@ dice_frames_this_packet(struct dice_pcm_stream *ps)
 /* ------------------------------------------------------------------ */
 
 static int
-dice_iso_open(struct firewire_comm *fc, struct dice_iso_channel *ch, int is_tx)
+dice_iso_open(struct firewire_comm *fc, struct dice_iso_channel *ch,
+	      int is_tx, int stream_index)
 {
 	struct fw_xferq *xferq;
 	int i;
@@ -319,6 +320,8 @@ dice_iso_open(struct firewire_comm *fc, struct dice_iso_channel *ch, int is_tx)
 	if (ch->dmach < 0) return (-ENOMEM);
 
 	ch->fc = (void *)fc;
+	ch->stream_index = stream_index;
+	ch->direction = is_tx;
 	xferq = is_tx ? fc->it[ch->dmach] : fc->ir[ch->dmach];
 	ch->xferq = (void *)xferq;
 
@@ -448,18 +451,34 @@ dice_encode_am824(uint32_t *dest, const int32_t *src, unsigned int channels)
 		dest[c] = htobe32(((uint32_t)src[c] >> 8) | AM824_LABEL_PCM);
 }
 
+/*
+ * Encode ONE data block of ONE DICE stream from a full interleaved
+ * frame row (`frame_row` holds nch samples of the frame).  The stream's
+ * channels are frame_row[first_ch .. first_ch + pcm_chs); any of them
+ * beyond the app's negotiated count are zero (AM824 label only, silence).
+ *
+ * The MIDI conformant-data quadlet (if the stream carries MIDI) follows
+ * the PCM quadlets — the same layout ALSA's amdtp-am824.c produces
+ * (pcm_positions[0..pcm_chs), midi_position = pcm_chs).
+ */
 static void
-dice_encode_am824_padded(uint32_t *dest, const int32_t *src,
-			 unsigned int src_channels, unsigned int channels)
+dice_encode_stream_block(uint32_t *blk, const int32_t *frame_row,
+			 unsigned int nch, const struct dice_stream_layout *sl)
 {
 	unsigned int c;
-	for (c = 0; c < channels; c++) {
-		uint32_t s = AM824_LABEL_PCM;
 
-		if (c < src_channels)
-			s |= ((uint32_t)src[c] >> 8);
-		dest[c] = htobe32(s);
+	for (c = 0; c < sl->pcm_chs; c++) {
+		uint32_t s = AM824_LABEL_PCM;
+		unsigned int src = sl->first_ch + c;
+
+		if (src < nch)
+			s |= ((uint32_t)frame_row[src] >> 8);
+		blk[c] = htobe32(s);
 	}
+	if (sl->midi_ports > 0)
+		/* Empty MIDI conformant-data word (0x80 00 00 00 on the
+		 * wire, big-endian). */
+		blk[sl->pcm_chs] = htobe32(0x80000000);
 }
 
 static void
@@ -655,24 +674,71 @@ dice_set_rate(struct dice_bsd_softc *sc, unsigned int rate)
 }
 
 /* ------------------------------------------------------------------ */
-/* TX fill — encode PCM into one ISO chunk (playback direction)         */
+/* TX fill — encode PCM into the ISO chunks (playback direction)        */
 /* ------------------------------------------------------------------ */
 
+/* Shared per-slot framing for one TX packet (see dice_tx_framing_next). */
+struct dice_tx_framing {
+	unsigned int	frames;		/* data blocks in this packet (0 = NODATA) */
+	unsigned int	syt;		/* CIP SYT field */
+	bool		no_data;	/* FDF=0xff empty packet */
+};
+
+/*
+ * Advance the blocking-mode SYT sequence once per refill slot.  Both
+ * isochronous streams of a direction are transmitted on the same bus
+ * cycles with the same media clock, so their packets must carry the
+ * same frame count and presentation time — compute the framing once
+ * here and hand the same values to every stream's packet builder.
+ */
 static void
-dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
-		   struct fw_bulkxfer *bx)
+dice_tx_framing_next(struct dice_pcm_stream *ps, struct dice_tx_framing *tf)
+{
+	unsigned int syt;
+
+	dice_blocking_framing(ps, &tf->frames, &syt, &tf->no_data);
+	tf->syt = syt;
+}
+
+/*
+ * Fetch `frames` frames of `nch`-channel interleaved audio from the OSS
+ * sndbuf at ps->hwptr, converting it to the S32-in-32 scale the AM824
+ * encoder consumes.  S16_LE is shifted left 16 so the sample sits in the
+ * top half of the 32-bit word (bits 31..16) — the AM824 encoder emits
+ * the top 24 bits (>> 8), so a plain sign-extended sample (bits 15..0)
+ * would land in the bits the hardware ignores and reduce 16-bit audio
+ * to ~1/256 amplitude (JACK's default "-w 16" produced silence on the
+ * HDSP until the identical shift-left-16 fix there).  AFMT_FLOAT is
+ * converted with integer math (no kernel FPU in callout context).
+ *
+ * Advances hwptr/period_accum and bumps the underrun/shortfall
+ * counters.  Returns the sample source: either the DMA ring directly
+ * (fast path) or `scratch` (wrap / shortfall / underrun / conversion).
+ * A NODATA packet (frames == 0) fetches nothing and leaves hwptr alone.
+ */
+static const int32_t *
+dice_tx_fetch(struct dice_bsd_softc *sc, unsigned int frames,
+	      unsigned int nch, unsigned int sample_bytes, bool is_float,
+	      int32_t *scratch)
 {
 	struct dice_pcm_stream *ps = &DSTREAM(sc)->playback;
-	unsigned int dbs = ps->data_block_quadlets;
-	unsigned int nch, frames, dbc, bytes, pkt_len;
-	struct fw_pkt *fp;
-	uint32_t *payload;
-	unsigned int i;
 	struct basound_chan *txch = ps->substream ?
 	    ps->substream->private_data : NULL;
-	unsigned int sample_bytes;
-	bool is_float;
+	struct snd_dbuf *sb;
+	unsigned int bytes, source_off;
+	unsigned int ready_bytes = 0, pending_bytes = 0, read_bytes = 0;
+	bool underrun = false;
+	const int32_t *sp;
+	uint8_t *dma;
 
+	if (frames == 0)
+		return (scratch);
+
+	/*
+	 * Re-sync the playback source with the OSS channel's live buffer
+	 * and format on every slot.  chn_resizebuf() can remap/remalloc
+	 * the sndbuf mid-stream; the runtime DMA view must track it.
+	 */
 	if (txch != NULL && txch->channel != NULL && txch->buffer != NULL) {
 		if (txch->channel->format != 0)
 			txch->format = txch->channel->format;
@@ -683,185 +749,239 @@ dice_fill_tx_chunk(struct dice_bsd_softc *sc, struct fw_xferq *xferq,
 		}
 		ps->buffer_bytes = txch->buffer->bufsize;
 		ps->period_bytes = txch->blocksize;
-		if (ps->buffer_bytes > 0) ps->hwptr %= ps->buffer_bytes;
+		if (ps->buffer_bytes > 0)
+			ps->hwptr %= ps->buffer_bytes;
 	}
 
-	nch = ps->pcm_channels;
-	if (txch != NULL) {
-		unsigned int fmt_ch = AFMT_CHANNEL(txch->format);
-		if (fmt_ch != 0 && fmt_ch <= ps->device_channels) {
-			nch = fmt_ch; ps->pcm_channels = nch;
-		}
-	}
-	if (nch > ps->device_channels) nch = ps->device_channels;
+	sb = txch ? txch->buffer : NULL;
+	bytes = frames * nch * sample_bytes;
+	source_off = ps->hwptr;
 
-	/*
-	 * Blocking-mode framing: either syt_interval data blocks with a
-	 * computed SYT presentation time, or an empty NODATA packet
-	 * (FDF=0xff, SYT=0xffff).  DICE devices recover their media
-	 * clock from this sequence; ALSA's dice driver is the only
-	 * firewire driver that is both blocking and SYT-aware.
-	 */
-	{
-		unsigned int syt;
-		bool no_data;
+	if (sb != NULL) {
+		unsigned int rp = sndbuf_getreadyptr(sb);
 
-		dice_blocking_framing(ps, &frames, &syt, &no_data);
-		dbc = ps->tx_dbc;
-		ps->tx_dbc = (dbc + frames) & 0xff;
+		ready_bytes = sndbuf_getready(sb);
+		if (source_off >= rp)
+			pending_bytes = source_off - rp;
+		else
+			pending_bytes = ps->buffer_bytes - rp + source_off;
 
-		sample_bytes = (txch != NULL) ? AFMT_BPS(txch->format) : 4;
-		if (sample_bytes != 2 && sample_bytes != 4) sample_bytes = 4;
-		is_float = (txch != NULL) &&
-		    (AFMT_ENCODING(txch->format) == AFMT_FLOAT);
-
-		bytes = frames * nch * sample_bytes;
-		/* Empty packets still carry the 8-byte CIP header. */
-		pkt_len = 8 + frames * dbs * 4;
-
-		fp = (struct fw_pkt *)fwdma_v_addr(xferq->buf, bx->poffset);
-		if (fp == NULL) return;
-
-		fp->mode.stream.len = pkt_len;
-		payload = (uint32_t *)fp->mode.stream.payload;
-
-		dice_build_cip_header(&payload[0], sc->fwdev->fc->nodeid,
-		    dbs, dbc, CIP_FMT_AM,
-		    no_data ? DICE_FDF_NO_DATA : ps->fdf, syt);
-	}
-
-	/* Fill data blocks.
-	 *
-	 * IMPORTANT: the conversion and the block-fill loops MUST use
-	 * separate loop variables.  The old code reused the frame index
-	 * inside the sample conversion loops, so after the first block
-	 * `i` had advanced to frames*nch: only one data block was ever
-	 * filled per packet, blocks 1..frames-1 carried stale/uninitialized
-	 * DMA memory (audible garbage), and the AM824 encode read past the
-	 * end of the stack tmpbuf (out-of-bounds stack read). */
-	{
-		struct snd_dbuf *sb = txch ? txch->buffer : NULL;
-		int32_t tmpbuf[MAX_DICE_PCM_CH * 12];
-		const int32_t *sp;
-		unsigned int source_off = ps->hwptr;
-		unsigned int ready_bytes = 0, pending_bytes = 0, read_bytes = 0;
-		bool underrun = false;
-
-		if (sb != NULL) {
-			unsigned int rp = sndbuf_getreadyptr(sb);
-			ready_bytes = sndbuf_getready(sb);
-			if (source_off >= rp)
-				pending_bytes = source_off - rp;
-			else
-				pending_bytes = ps->buffer_bytes - rp + source_off;
-
-			if (pending_bytes > ready_bytes) {
-				underrun = true; read_bytes = 0; ps->tx_underruns++;
-			} else {
-				read_bytes = ready_bytes - pending_bytes;
-				if (read_bytes > bytes) read_bytes = bytes;
-				if (read_bytes < bytes) ps->tx_shortfalls++;
-			}
+		if (pending_bytes > ready_bytes) {
+			underrun = true; read_bytes = 0; ps->tx_underruns++;
 		} else {
-			underrun = true; ps->tx_underruns++;
+			read_bytes = ready_bytes - pending_bytes;
+			if (read_bytes > bytes) read_bytes = bytes;
+			if (read_bytes < bytes) ps->tx_shortfalls++;
 		}
-		if (sample_bytes > 1) read_bytes -= read_bytes % sample_bytes;
+	} else {
+		underrun = true; ps->tx_underruns++;
+	}
+	if (sample_bytes > 1)
+		read_bytes -= read_bytes % sample_bytes;
 
-		if (underrun) {
-			memset(tmpbuf, 0, frames * nch * sizeof(int32_t));
-			sp = tmpbuf;
-		} else if (read_bytes >= bytes && sample_bytes == 4 &&
-		    !is_float && source_off + bytes <= ps->buffer_bytes) {
-			/* Fast path: full packet of S32_LE, no wrap. */
-			sp = (const int32_t *)((const uint8_t *)
-			    ps->substream->runtime->dma_area + source_off);
-		} else {
-			unsigned int fi;
-			unsigned int samples = frames * nch;
+	dma = (uint8_t *)ps->substream->runtime->dma_area;
 
-			for (fi = 0; fi < samples; fi++) tmpbuf[fi] = 0;
-			if (read_bytes > 0 && sample_bytes == 4) {
-				unsigned int ns = read_bytes / 4;
+	if (underrun) {
+		memset(scratch, 0, frames * nch * sizeof(int32_t));
+		sp = scratch;
+	} else if (read_bytes >= bytes && sample_bytes == 4 && !is_float &&
+	    source_off + bytes <= ps->buffer_bytes) {
+		/* Fast path: full packet of S32_LE, no wrap. */
+		sp = (const int32_t *)(dma + source_off);
+	} else {
+		unsigned int fi;
+		unsigned int samples = frames * nch;
 
-				if (source_off + read_bytes <= ps->buffer_bytes)
-					memcpy(tmpbuf,
-					    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
-					    read_bytes);
-				else {
-					unsigned int first = ps->buffer_bytes - source_off;
-					memcpy(tmpbuf,
-					    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
-					    first);
-					memcpy((uint8_t *)tmpbuf + first,
-					    ps->substream->runtime->dma_area,
-					    read_bytes - first);
-				}
-				if (is_float) {
-					uint32_t *u = (uint32_t *)tmpbuf;
+		for (fi = 0; fi < samples; fi++) scratch[fi] = 0;
+		if (read_bytes > 0 && sample_bytes == 4) {
+			unsigned int ns = read_bytes / 4;
 
-					for (fi = 0; fi < ns; fi++)
-						tmpbuf[fi] = dice_f32_to_s32(u[fi]);
-				}
-			} else if (read_bytes > 0 && sample_bytes == 2) {
-				unsigned int rd = read_bytes / 2;
-				const int16_t *s16;
-				uint8_t sbuf[18*12*2];
-				if (source_off + read_bytes <= ps->buffer_bytes)
-					s16 = (const int16_t *)((const uint8_t *)
-					    ps->substream->runtime->dma_area + source_off);
-				else {
-					unsigned int first = ps->buffer_bytes - source_off;
-					memcpy(sbuf,
-					    (const uint8_t *)ps->substream->runtime->dma_area + source_off,
-					    first);
-					memcpy(sbuf + first,
-					    ps->substream->runtime->dma_area,
-					    read_bytes - first);
-					s16 = (const int16_t *)sbuf;
-				}
-				for (fi = 0; fi < rd; fi++)
-					tmpbuf[fi] = ((int32_t)s16[fi]) << 16;
+			if (source_off + read_bytes <= ps->buffer_bytes)
+				memcpy(scratch, dma + source_off, read_bytes);
+			else {
+				unsigned int first = ps->buffer_bytes - source_off;
+				memcpy(scratch, dma + source_off, first);
+				memcpy((uint8_t *)scratch + first, dma,
+				    read_bytes - first);
 			}
-			sp = tmpbuf;
-		}
+			if (is_float) {
+				uint32_t *u = (uint32_t *)scratch;
 
-		for (i = 0; i < frames; i++) {
-			uint32_t *blk = &payload[CIP_HEADER_QUADLETS + i * dbs];
+				for (fi = 0; fi < ns; fi++)
+					scratch[fi] = dice_f32_to_s32(u[fi]);
+			}
+		} else if (read_bytes > 0 && sample_bytes == 2) {
+			unsigned int rd = read_bytes / 2;
+			const int16_t *s16;
+			/* Wrap-around scratch, sized for the worst case
+			 * (32 frames × 32 ch × 2 bytes at 192 kHz). */
+			uint8_t sbuf[MAX_DICE_PCM_CH * 12 * 2];
 
-			/*
-			 * DICE data-block layout: the PCM quadlets come first,
-			 * followed by the MIDI conformant-data quadlet (see
-			 * dice-interface.h RX_NUMBER_MIDI and Linux
-			 * amdtp-am824.c, which sets pcm_positions[i] = i and
-			 * midi_position = pcm_channels).  Placing MIDI first
-			 * shifted every PCM channel by one quadlet, so the
-			 * device saw stream channel 1 as "left" and channel 2
-			 * as "right" — the reported "rear 2+3" routing offset.
-			 */
-			dice_encode_am824_padded(blk,
-			    &sp[i * nch], nch, ps->device_channels);
-			if (ps->midi_ports > 0)
-				blk[ps->device_channels] = 0x00000080; /* no MIDI */
+			if (source_off + read_bytes <= ps->buffer_bytes)
+				s16 = (const int16_t *)(dma + source_off);
+			else {
+				unsigned int first = ps->buffer_bytes - source_off;
+				memcpy(sbuf, dma + source_off, first);
+				memcpy(sbuf + first, dma, read_bytes - first);
+				s16 = (const int16_t *)sbuf;
+			}
+			for (fi = 0; fi < rd; fi++)
+				scratch[fi] = ((int32_t)s16[fi]) << 16;
 		}
+		sp = scratch;
 	}
 
 	ps->hwptr += bytes;
 	if (ps->hwptr >= ps->buffer_bytes) ps->hwptr = 0;
 	ps->period_accum += bytes;
+	return (sp);
+}
+
+/*
+ * Build one ISO TX packet for DICE stream `idx` into chunk `bx`.
+ *
+ * dbs comes from the stream's own layout (16 quadlets for ProFire
+ * stream 0, 10+MIDI for stream 1 — never the summed total: the DICE
+ * firmware parses each stream with its own declared block size).  The
+ * frame count and SYT are shared across the direction's streams
+ * (dice_tx_framing_next); the DBC counter is per-stream.
+ */
+static void
+dice_fill_tx_chunk(struct dice_bsd_softc *sc, unsigned int idx,
+		   struct fw_xferq *xferq, struct fw_bulkxfer *bx,
+		   const struct dice_tx_framing *tf, const int32_t *sp,
+		   unsigned int nch)
+{
+	struct dice_pcm_stream *ps = &DSTREAM(sc)->playback;
+	struct dice_stream_layout *sl = &ps->streams[idx];
+	unsigned int dbs = sl->data_block_quadlets;
+	unsigned int dbc, pkt_len, i;
+	struct fw_pkt *fp;
+	uint32_t *payload;
+
+	dbc = sl->dbc;
+	sl->dbc = (dbc + tf->frames) & 0xff;
+
+	/* Empty packets still carry the 8-byte CIP header. */
+	pkt_len = 8 + tf->frames * dbs * 4;
+
+	fp = (struct fw_pkt *)fwdma_v_addr(xferq->buf, bx->poffset);
+	if (fp == NULL)
+		return;
+
+	fp->mode.stream.len = pkt_len;
+	payload = (uint32_t *)fp->mode.stream.payload;
+
+	dice_build_cip_header(&payload[0], sc->fwdev->fc->nodeid,
+	    dbs, dbc, CIP_FMT_AM,
+	    tf->no_data ? DICE_FDF_NO_DATA : ps->fdf, tf->syt);
+
+	/*
+	 * Fill data blocks.  Each block takes this stream's channel
+	 * slice (first_ch .. first_ch + pcm_chs) out of the full
+	 * interleaved frame row; channels beyond the app's negotiated
+	 * count are silence (AM824 label only).
+	 *
+	 * IMPORTANT: the block loop must use its own loop variable —
+	 * the old code reused the frame index inside the sample
+	 * conversion loops, filling only block 0 and reading past the
+	 * end of the stack tmpbuf (audible garbage).
+	 */
+	for (i = 0; i < tf->frames; i++)
+		dice_encode_stream_block(&payload[CIP_HEADER_QUADLETS + i * dbs],
+		    &sp[i * nch], nch, sl);
 }
 
 /* ------------------------------------------------------------------ */
 /* RX handler — decode ISO packets into PCM DMA buffer                  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Write one DICE stream's decoded channel slice into the capture ring.
+ *
+ * `pos` is the byte offset (within buffer_bytes) of frame 0 of the
+ * packet; each frame's slice is contiguous in the ring (channel
+ * first_ch..first_ch+pcm_chs of the interleaved frame) unless it wraps
+ * the end.  S32 passes through raw; S16 keeps the top half (the wire
+ * carries 24 bits MSB-aligned, so the 16-bit audio sits in bits 31..16);
+ * FLOAT is converted with integer math (no kernel FPU here).
+ */
+static void
+dice_rx_write_slice(struct dice_pcm_stream *ps, uint8_t *dma,
+		    const int32_t *tmp, unsigned int frames,
+		    const struct dice_stream_layout *sl, unsigned int nch,
+		    unsigned int sample_bytes, bool is_float,
+		    unsigned long pos)
+{
+	unsigned int frame_bytes = nch * sample_bytes;
+	unsigned int slice_bytes = sl->pcm_chs * sample_bytes;
+	unsigned int fi;
+
+	if (sample_bytes == 4 && !is_float) {
+		for (fi = 0; fi < frames; fi++) {
+			unsigned long base = pos + (unsigned long)fi *
+			    frame_bytes + sl->first_ch * sample_bytes;
+			const uint8_t *src = (const uint8_t *)
+			    &tmp[fi * sl->pcm_chs];
+
+			base %= ps->buffer_bytes;
+			if (base + slice_bytes <= ps->buffer_bytes)
+				memcpy(dma + base, src, slice_bytes);
+			else {
+				unsigned int first = ps->buffer_bytes - base;
+
+				memcpy(dma + base, src, first);
+				memcpy(dma, src + first, slice_bytes - first);
+			}
+		}
+	} else {
+		unsigned int c;
+
+		for (fi = 0; fi < frames; fi++) {
+			for (c = 0; c < sl->pcm_chs; c++) {
+				unsigned long off = pos +
+				    (unsigned long)fi * frame_bytes +
+				    (sl->first_ch + c) * sample_bytes;
+				uint8_t *dst = dma + (off % ps->buffer_bytes);
+				int32_t v = tmp[fi * sl->pcm_chs + c];
+
+				if (is_float) {
+					uint32_t f = dice_s32_to_f32(v);
+					memcpy(dst, &f, sizeof(f));
+				} else if (sample_bytes == 2) {
+					int16_t s16 = (int16_t)(v >> 16);
+					memcpy(dst, &s16, sizeof(s16));
+				} else {
+					memcpy(dst, &v, sizeof(v));
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Per-channel RX completion handler.  Each DICE stream is received on
+ * its own IR context; the handler decodes that stream's channel slice
+ * out of every completed data block.
+ *
+ * Ring position: every stream of a direction carries the same frame
+ * count per packet (blocking-mode SYT sequence), so each stream tracks
+ * its own cumulative byte count (`sl->rx_pos_bytes`) and both counters
+ * progress identically — every stream therefore writes its slice for
+ * packet N at the same ring offset, producing a correctly interleaved
+ * capture even though the two handlers run independently (serialised by
+ * FW_GLOCK inside fwohci_task_dma).  The OSS-visible hwptr and period
+ * accounting follow stream 0's counter.
+ */
 static void
 dice_rx_handler(struct fw_xferq *xferq)
 {
 	struct dice_iso_channel *ch;
 	struct dice_bsd_softc *sc;
 	struct dice_pcm_stream *ps;
+	struct dice_stream_layout *sl;
 	struct fw_bulkxfer *bx;
-	unsigned int frames, dbs, bytes;
+	unsigned int idx, frames;
 	int recycled = 0;
 
 	if (xferq == NULL || xferq->sc == NULL) return;
@@ -869,6 +989,8 @@ dice_rx_handler(struct fw_xferq *xferq)
 	if (ch->ctx == NULL) return;
 	sc = DICE_SC(ch);
 	ps = &DSTREAM(sc)->capture;
+	idx = ch->stream_index;
+	sl = &ps->streams[idx];
 
 	while ((bx = STAILQ_FIRST(&xferq->stvalid)) != NULL) {
 		STAILQ_REMOVE_HEAD(&xferq->stvalid, link);
@@ -876,22 +998,20 @@ dice_rx_handler(struct fw_xferq *xferq)
 		if (ps->active && ps->substream != NULL &&
 		    ps->substream->runtime != NULL &&
 		    ps->substream->runtime->dma_area != NULL &&
-		    xferq->buf != NULL) {
+		    xferq->buf != NULL && sl->pcm_chs > 0) {
 			struct basound_chan *rxch = ps->substream->private_data;
-			unsigned int sample_bytes;
+			unsigned int sample_bytes, nch, dbs, fi;
 			bool is_float;
 			uint32_t *payload;
-			unsigned int nch;
+			int32_t tmpbuf[MAX_DICE_PCM_CH * 12];
 
 			/*
 			 * Re-sync the capture DMA target with the OSS
 			 * channel's live buffer on every completed packet.
 			 * chn_resizebuf() can remap/remalloc the hardware
-			 * sndbuf after the ALSA runtime was set up, and
-			 * dice_pcm_hw_params()/snd_pcm_lib_malloc_pages()
-			 * may have pointed runtime->dma_area at a different
-			 * allocation.  The OSS read path consumes ch->buffer,
-			 * so write decoded samples there.
+			 * sndbuf after the ALSA runtime was set up; the
+			 * OSS read path consumes ch->buffer, so write
+			 * decoded samples there.
 			 */
 			if (rxch != NULL && rxch->buffer != NULL &&
 			    rxch->channel != NULL) {
@@ -907,8 +1027,10 @@ dice_rx_handler(struct fw_xferq *xferq)
 				}
 				ps->buffer_bytes = rxch->buffer->bufsize;
 				ps->period_bytes = rxch->blocksize;
-				if (ps->buffer_bytes > 0)
+				if (ps->buffer_bytes > 0) {
 					ps->hwptr %= ps->buffer_bytes;
+					sl->rx_pos_bytes %= ps->buffer_bytes;
+				}
 			}
 
 			sample_bytes = (rxch != NULL) ?
@@ -918,7 +1040,8 @@ dice_rx_handler(struct fw_xferq *xferq)
 			is_float = (rxch != NULL) &&
 			    (AFMT_ENCODING(rxch->format) == AFMT_FLOAT);
 
-			payload = (uint32_t *)fwdma_v_addr(xferq->buf, bx->poffset);
+			payload = (uint32_t *)fwdma_v_addr(xferq->buf,
+			    bx->poffset);
 			/*
 			 * Blocking-mode capture: the device transmits either
 			 * syt_interval data blocks (valid SYT) or empty
@@ -927,70 +1050,47 @@ dice_rx_handler(struct fw_xferq *xferq)
 			 * which; data-block count is otherwise fixed.
 			 */
 			if (payload != NULL &&
-			    ((be32toh(payload[1]) >> 16) & 0xff) == DICE_FDF_NO_DATA)
+			    ((be32toh(payload[1]) >> 16) & 0xff) ==
+			    DICE_FDF_NO_DATA)
 				frames = 0;
 			else
 				frames = ps->syt_interval;
-			dbs = ps->data_block_quadlets;
+			dbs = sl->data_block_quadlets;
 			nch = ps->pcm_channels;
-			if (nch > ps->device_channels) nch = ps->device_channels;
-			bytes = frames * nch * sample_bytes;
+			if (nch > ps->device_channels)
+				nch = ps->device_channels;
 
-			{
-				int32_t tmpbuf[MAX_DICE_PCM_CH * 12];
-				unsigned int fi;
+			if (frames > 0) {
+				unsigned long pos = sl->rx_pos_bytes %
+				    ps->buffer_bytes;
+				unsigned int bytes = frames * nch *
+				    sample_bytes;
 
 				for (fi = 0; fi < frames; fi++) {
-					const uint32_t *blk = &payload[CIP_HEADER_QUADLETS + fi * dbs];
+					const uint32_t *blk = &payload[
+					    CIP_HEADER_QUADLETS + fi * dbs];
 
-					/* PCM quadlets are first; MIDI (if any)
-					 * follows after the audio quadlets. */
-					dice_decode_am824(&tmpbuf[fi * nch], blk, nch);
+					/* PCM quadlets are first; MIDI (if
+					 * any) follows after the audio. */
+					dice_decode_am824(&tmpbuf[fi * sl->pcm_chs],
+					    blk, sl->pcm_chs);
 				}
+				dice_rx_write_slice(ps,
+				    (uint8_t *)ps->substream->runtime->dma_area,
+				    tmpbuf, frames, sl, nch, sample_bytes,
+				    is_float, pos);
 
-				if (is_float) {
-					unsigned int s;
-
-					for (s = 0; s < frames * nch; s++)
-						tmpbuf[s] = (int32_t)
-						    dice_s32_to_f32(tmpbuf[s]);
-				}
-
-				if (sample_bytes == 4 &&
-				    ps->hwptr + bytes <= ps->buffer_bytes) {
-					memcpy((uint8_t *)ps->substream->runtime->dma_area + ps->hwptr,
-					    tmpbuf, bytes);
-				} else if (sample_bytes == 4) {
-					unsigned int first = ps->buffer_bytes - ps->hwptr;
-					uint8_t *dst = (uint8_t *)ps->substream->runtime->dma_area + ps->hwptr;
-					if (first >= bytes)
-						memcpy(dst, tmpbuf, bytes);
-					else {
-						memcpy(dst, tmpbuf, first);
-						memcpy(ps->substream->runtime->dma_area,
-						    (uint8_t *)tmpbuf + first, bytes - first);
-					}
-				} else {
-					int16_t tmp16[MAX_DICE_PCM_CH * 12];
-					unsigned int s;
-					for (s = 0; s < frames * nch; s++)
-						tmp16[s] = (int16_t)(tmpbuf[s] >> 16);
-					{
-						unsigned int first = ps->buffer_bytes - ps->hwptr;
-						uint8_t *dst = (uint8_t *)ps->substream->runtime->dma_area + ps->hwptr;
-						if (first >= bytes)
-							memcpy(dst, tmp16, bytes);
-						else {
-							memcpy(dst, tmp16, first);
-							memcpy(ps->substream->runtime->dma_area,
-							    (uint8_t *)tmp16 + first, bytes - first);
-						}
-					}
+				sl->rx_pos_bytes += bytes;
+				sl->rx_pos_bytes %= ps->buffer_bytes;
+				if (idx == 0) {
+					/* hwptr is the OSS-visible capture
+					 * position; both streams' counters
+					 * advance in lockstep, so stream
+					 * 0's alone drives it. */
+					ps->hwptr = sl->rx_pos_bytes;
+					ps->period_accum += bytes;
 				}
 			}
-			ps->hwptr += bytes;
-			if (ps->hwptr >= ps->buffer_bytes) ps->hwptr = 0;
-			ps->period_accum += bytes;
 		}
 		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
 		recycled++;
@@ -1015,23 +1115,31 @@ dice_pcm_stream_cb(void *arg)
 	/* DEBUG (remove after diagnosis): periodic stream state. */
 	{
 		static unsigned int cb_ticks;
-		struct fw_xferq *tx = ISO_XFERQ(&DSTREAM(sc)->iso_tx);
-		struct fw_xferq *rx = ISO_XFERQ(&DSTREAM(sc)->iso_rx);
+		struct fw_xferq *tx0 = ISO_XFERQ(&DSTREAM(sc)->iso_tx[0]);
+		struct fw_xferq *tx1 = pb->stream_count > 1 ?
+		    ISO_XFERQ(&DSTREAM(sc)->iso_tx[1]) : NULL;
+		struct fw_xferq *rx0 = ISO_XFERQ(&DSTREAM(sc)->iso_rx[0]);
 
 		if (++cb_ticks <= 2000 && (cb_ticks % 100 == 1)) {
 			device_printf(sc->dev,
 			    "dice: cb tick=%u pb=%d/%p cap=%d/%p "
-			    "refilled-now hwptr=%lu stall=%u "
-			    "tx(f=%u,d=%u,v=%u,r=%d) rx(f=%u,d=%u,v=%u,r=%d)\n",
+			    "hwptr=%lu stall=%u "
+			    "tx0(f=%u,d=%u,v=%u,r=%d) "
+			    "tx1(f=%u,d=%u,v=%u,r=%d) "
+			    "rx0(f=%u,d=%u,v=%u,r=%d)\n",
 			    cb_ticks, pb->active, (void *)pb->substream,
 			    cap->active, (void *)cap->substream,
 			    pb->hwptr, DSTREAM(sc)->tx_stall_ticks,
-			    dice_qcount(tx, 0), dice_qcount(tx, 1),
-			    dice_qcount(tx, 2),
-			    (tx->flag & FWXFERQ_RUNNING) != 0,
-			    dice_qcount(rx, 0), dice_qcount(rx, 1),
-			    dice_qcount(rx, 2),
-			    (rx->flag & FWXFERQ_RUNNING) != 0);
+			    dice_qcount(tx0, 0), dice_qcount(tx0, 1),
+			    dice_qcount(tx0, 2),
+			    (tx0->flag & FWXFERQ_RUNNING) != 0,
+			    tx1 ? dice_qcount(tx1, 0) : 0,
+			    tx1 ? dice_qcount(tx1, 1) : 0,
+			    tx1 ? dice_qcount(tx1, 2) : 0,
+			    tx1 ? (tx1->flag & FWXFERQ_RUNNING) != 0 : 0,
+			    dice_qcount(rx0, 0), dice_qcount(rx0, 1),
+			    dice_qcount(rx0, 2),
+			    (rx0->flag & FWXFERQ_RUNNING) != 0);
 		}
 	}
 
@@ -1052,7 +1160,7 @@ int
 dice_streaming_init(struct dice_bsd_softc *sc)
 {
 	struct firewire_comm *fc;
-	int err;
+	int err, i;
 
 	if (sc->fwdev == NULL || sc->fwdev->fc == NULL) return (-ENODEV);
 	if (sc->stream != NULL) return (0);
@@ -1061,66 +1169,75 @@ dice_streaming_init(struct dice_bsd_softc *sc)
 	    M_WAITOK | M_ZERO);
 	if (sc->stream == NULL) return (-ENOMEM);
 
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		DSTREAM(sc)->iso_tx[i].dmach = -1;
+		DSTREAM(sc)->iso_rx[i].dmach = -1;
+	}
+
 	fc = sc->fwdev->fc;
 
-	err = dice_iso_open(fc, &DSTREAM(sc)->iso_tx, 1);
-	if (err < 0) { free(sc->stream, M_DICE_ISO); sc->stream = NULL; return (err); }
-	DSTREAM(sc)->iso_tx.ctx = sc;
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		err = dice_iso_open(fc, &DSTREAM(sc)->iso_tx[i], 1, i);
+		if (err < 0)
+			goto fail;
+		DSTREAM(sc)->iso_tx[i].ctx = sc;
 
-	err = dice_iso_open(fc, &DSTREAM(sc)->iso_rx, 0);
-	if (err < 0) {
-		dice_iso_close(&DSTREAM(sc)->iso_tx);
-		free(sc->stream, M_DICE_ISO); sc->stream = NULL;
-		return (err);
+		err = dice_iso_open(fc, &DSTREAM(sc)->iso_rx[i], 0, i);
+		if (err < 0)
+			goto fail;
+		DSTREAM(sc)->iso_rx[i].ctx = sc;
+		ISO_XFERQ(&DSTREAM(sc)->iso_rx[i])->hand = dice_rx_handler;
 	}
-	DSTREAM(sc)->iso_rx.ctx = sc;
-	ISO_XFERQ(&DSTREAM(sc)->iso_rx)->hand = dice_rx_handler;
-
-	/* DEBUG (remove after diagnosis). */
-	device_printf(sc->dev,
-	    "dice: iso init tx dmach=%d free=%u dma=%u val=%u run=%d | "
-	    "rx dmach=%d free=%u dma=%u val=%u run=%d\n",
-	    DSTREAM(sc)->iso_tx.dmach,
-	    dice_qcount(ISO_XFERQ(&DSTREAM(sc)->iso_tx), 0),
-	    dice_qcount(ISO_XFERQ(&DSTREAM(sc)->iso_tx), 1),
-	    dice_qcount(ISO_XFERQ(&DSTREAM(sc)->iso_tx), 2),
-	    (ISO_XFERQ(&DSTREAM(sc)->iso_tx)->flag & FWXFERQ_RUNNING) != 0,
-	    DSTREAM(sc)->iso_rx.dmach,
-	    dice_qcount(ISO_XFERQ(&DSTREAM(sc)->iso_rx), 0),
-	    dice_qcount(ISO_XFERQ(&DSTREAM(sc)->iso_rx), 1),
-	    dice_qcount(ISO_XFERQ(&DSTREAM(sc)->iso_rx), 2),
-	    (ISO_XFERQ(&DSTREAM(sc)->iso_rx)->flag & FWXFERQ_RUNNING) != 0);
 
 	callout_init(&DSTREAM(sc)->callout, 1);
 	mtx_init(&DSTREAM(sc)->playback_lock, "dice_playback", NULL, MTX_DEF);
 	mtx_init(&DSTREAM(sc)->capture_lock, "dice_capture", NULL, MTX_DEF);
 	/*
 	 * The FreeBSD firewire stack exposes no isochronous channel
-	 * allocator, so (like digi00x) use fixed channel numbers.  DICE
-	 * uses one channel per direction: RX is host->device (playback),
+	 * allocator, so (like digi00x) use fixed channel numbers — one
+	 * pair per DICE stream index.  RX is host->device (playback),
 	 * TX is device->host (capture).
 	 */
-	DSTREAM(sc)->rx_channel = 2;
-	DSTREAM(sc)->tx_channel = 3;
+	DSTREAM(sc)->rx_channel[0] = 2;	/* playback stream 0 */
+	DSTREAM(sc)->rx_channel[1] = 4;	/* playback stream 1 */
+	DSTREAM(sc)->tx_channel[0] = 3;	/* capture stream 0 */
+	DSTREAM(sc)->tx_channel[1] = 5;	/* capture stream 1 */
 	return (0);
+
+fail:
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		if (DSTREAM(sc)->iso_tx[i].dmach >= 0)
+			dice_iso_close(&DSTREAM(sc)->iso_tx[i]);
+		if (DSTREAM(sc)->iso_rx[i].dmach >= 0)
+			dice_iso_close(&DSTREAM(sc)->iso_rx[i]);
+	}
+	free(sc->stream, M_DICE_ISO);
+	sc->stream = NULL;
+	return (err);
 }
 
 void
 dice_streaming_fini(struct dice_bsd_softc *sc)
 {
+	int i;
+
 	if (sc->stream == NULL) return;
 
 	callout_drain(&DSTREAM(sc)->callout);
 
-	if (DSTREAM(sc)->iso_tx.dmach >= 0) {
-		ISO_FC(&DSTREAM(sc)->iso_tx)->itx_disable(
-		    ISO_FC(&DSTREAM(sc)->iso_tx), DSTREAM(sc)->iso_tx.dmach);
-		dice_iso_close(&DSTREAM(sc)->iso_tx);
-	}
-	if (DSTREAM(sc)->iso_rx.dmach >= 0) {
-		ISO_FC(&DSTREAM(sc)->iso_rx)->irx_disable(
-		    ISO_FC(&DSTREAM(sc)->iso_rx), DSTREAM(sc)->iso_rx.dmach);
-		dice_iso_close(&DSTREAM(sc)->iso_rx);
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		if (DSTREAM(sc)->iso_tx[i].dmach >= 0) {
+			ISO_FC(&DSTREAM(sc)->iso_tx[i])->itx_disable(
+			    ISO_FC(&DSTREAM(sc)->iso_tx[i]),
+			    DSTREAM(sc)->iso_tx[i].dmach);
+			dice_iso_close(&DSTREAM(sc)->iso_tx[i]);
+		}
+		if (DSTREAM(sc)->iso_rx[i].dmach >= 0) {
+			ISO_FC(&DSTREAM(sc)->iso_rx[i])->irx_disable(
+			    ISO_FC(&DSTREAM(sc)->iso_rx[i]),
+			    DSTREAM(sc)->iso_rx[i].dmach);
+			dice_iso_close(&DSTREAM(sc)->iso_rx[i]);
+		}
 	}
 
 	mtx_destroy(&DSTREAM(sc)->playback_lock);
@@ -1132,7 +1249,7 @@ dice_streaming_fini(struct dice_bsd_softc *sc)
 static void
 dice_stream_configure(struct dice_pcm_stream *ps, int dir, unsigned int rate)
 {
-	unsigned int eff_rate;
+	unsigned int eff_rate, i;
 
 	ps->direction = dir;
 	ps->sfc = dice_rate_to_sfc(rate);
@@ -1148,16 +1265,95 @@ dice_stream_configure(struct dice_pcm_stream *ps, int dir, unsigned int rate)
 	 * stayed dark, and its own capture transmitter never started.
 	 */
 	ps->fdf = ps->sfc;
-	ps->tx_dbc = 0;
 	ps->frame_cycle = 0;
 	ps->frames_per_packet = rate / 8000;
 	ps->frame_remainder = rate % 8000;
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		ps->streams[i].dbc = 0;
+		ps->streams[i].rx_pos_bytes = 0;
+	}
 
 	/* Blocking-mode SYT sequence (DICE media clock recovery). */
 	eff_rate = rate;
 	if (ps->double_pcm_frames && rate > 96000)
 		eff_rate /= 2;	/* dual-wire: 2 PCM frames per data block */
 	dice_blocking_init(ps, eff_rate);
+}
+
+/*
+ * Build the per-stream AM824 data-block layouts for one direction from
+ * the detected device config at the given sample rate.
+ *
+ * The device's channel complement is split over up to two isochronous
+ * streams (the DICE II/Jr/Mini ASICs cap a single stream at 16 data
+ * channels):
+ *   ProFire 2626 @ <=48 kHz: stream 0 = 16 ch, stream 1 = 10 ch (+MIDI)
+ *   iO26 RX @ <=48 kHz:      stream 0 = 8 ch,  stream 1 = 0 (unused)
+ * Each stream's CIP DBS field and data blocks use ITS OWN channel count.
+ * Packing the summed total (e.g. 27 quadlets for the ProFire) into one
+ * stream makes the firmware walk off its expected 16-quadlet block
+ * boundaries — the ProFire 2626 playback was garbled until this split.
+ */
+void
+dice_stream_build_layout(struct dice_bsd_softc *sc,
+			 struct dice_pcm_stream *ps, bool is_capture,
+			 unsigned int rate)
+{
+	unsigned int mode_idx, first = 0, i;
+
+	if (rate <= 48000)
+		mode_idx = SND_DICE_RATE_MODE_LOW;
+	else if (rate <= 96000)
+		mode_idx = SND_DICE_RATE_MODE_MIDDLE;
+	else
+		mode_idx = SND_DICE_RATE_MODE_HIGH;
+
+	ps->double_pcm_frames = !sc->cfg.disable_double_pcm_frames;
+	ps->device_channels = 0;
+	ps->midi_ports = 0;
+	ps->stream_count = 0;
+
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		struct dice_stream_layout *sl = &ps->streams[i];
+		unsigned int chs, midi;
+
+		if (is_capture) {
+			chs = sc->cfg.tx_pcm_chs[i][mode_idx];
+			midi = sc->cfg.tx_midi_ports[i];
+		} else {
+			chs = sc->cfg.rx_pcm_chs[i][mode_idx];
+			midi = sc->cfg.rx_midi_ports[i];
+		}
+		if (chs == 0 && midi == 0)
+			continue;
+
+		sl->pcm_chs = chs;
+		sl->midi_ports = midi;
+		sl->first_ch = first;
+		sl->data_block_quadlets = chs + (midi > 0 ? 1 : 0);
+		if (ps->double_pcm_frames && rate > 96000)
+			sl->data_block_quadlets *= 2;	/* dual-wire */
+		sl->dbc = 0;
+		sl->rx_pos_bytes = 0;
+
+		first += chs;
+		ps->device_channels += chs;
+		ps->midi_ports += midi;
+		ps->stream_count++;
+	}
+
+	if (ps->stream_count == 0) {
+		/* Detection returned nothing; fall back to a single
+		 * stereo stream so the wire format stays valid. */
+		ps->streams[0].pcm_chs = 2;
+		ps->streams[0].midi_ports = 0;
+		ps->streams[0].first_ch = 0;
+		ps->streams[0].data_block_quadlets = 2;
+		ps->streams[0].dbc = 0;
+		ps->streams[0].rx_pos_bytes = 0;
+		ps->device_channels = 2;
+		ps->stream_count = 1;
+	}
 }
 
 /*
@@ -1171,56 +1367,30 @@ dice_stream_configure(struct dice_pcm_stream *ps, int dir, unsigned int rate)
  *
  * The two directions share the device clock (same rate/FDF), but each has
  * its own data-block layout: the device's RX (host->device) blocks carry
- * the RX channel complement and its TX (device->host) blocks the TX one —
- * on the iO26 those are 8 and 26 PCM channels.  The other stream's layout
- * is therefore re-derived from the direction's own channel map at the
- * shared rate instead of copying the starting stream's geometry.
+ * the RX channel complement and its TX (device->host) blocks the TX one.
+ * The other stream's layout is therefore re-derived from the direction's
+ * own channel map at the shared rate instead of copying the starting
+ * stream's geometry.
  */
 static void
 dice_clone_geometry(struct dice_bsd_softc *sc, struct dice_pcm_stream *from)
 {
 	struct dice_pcm_stream *to = (from == &DSTREAM(sc)->playback) ?
 	    &DSTREAM(sc)->capture : &DSTREAM(sc)->playback;
-	unsigned int mode_idx, device_ch = 0, midi = 0, i;
 	int to_capture = (to == &DSTREAM(sc)->capture);
 
 	to->rate = from->rate;
 	to->sfc = from->sfc;
 	to->fdf = from->fdf;
-
-	if (from->rate <= 48000)
-		mode_idx = SND_DICE_RATE_MODE_LOW;
-	else if (from->rate <= 96000)
-		mode_idx = SND_DICE_RATE_MODE_MIDDLE;
-	else
-		mode_idx = SND_DICE_RATE_MODE_HIGH;
-
-	for (i = 0; i < MAX_DICE_STREAMS; i++) {
-		if (to_capture) {
-			device_ch += sc->cfg.tx_pcm_chs[i][mode_idx];
-			midi += sc->cfg.tx_midi_ports[i];
-		} else {
-			device_ch += sc->cfg.rx_pcm_chs[i][mode_idx];
-			midi += sc->cfg.rx_midi_ports[i];
-		}
-	}
-
 	to->pcm_channels = from->pcm_channels;
-	if (device_ch == 0)
-		device_ch = to->pcm_channels;
-	if (to->pcm_channels > device_ch)
-		to->pcm_channels = device_ch;
-	to->device_channels = device_ch;
-	to->midi_ports = midi;
-	to->double_pcm_frames = !sc->cfg.disable_double_pcm_frames;
-	to->data_block_quadlets = device_ch + (midi > 0 ? 1 : 0);
-	if (to->double_pcm_frames && from->rate > 96000)
-		to->data_block_quadlets *= 2;
+
+	dice_stream_build_layout(sc, to, to_capture, from->rate);
+	if (to->pcm_channels > to->device_channels)
+		to->pcm_channels = to->device_channels;
 
 	to->frames_per_packet = from->frames_per_packet;
 	to->frame_remainder = from->frame_remainder;
 	to->frame_cycle = 0;
-	to->tx_dbc = 0;
 
 	/* Blocking-mode SYT sequence for the complementary stream. */
 	{
@@ -1234,35 +1404,41 @@ dice_clone_geometry(struct dice_bsd_softc *sc, struct dice_pcm_stream *from)
 
 /*
  * Program the device side of the streaming session: RX/TX isochronous
- * channels, TX speed, then GLOBAL_ENABLE=1.  The DICE firmware latches
- * the stream configuration when streaming is (re)started, so this must
- * run before the host DMA contexts are enabled.  Only needed when the
- * session transitions from idle.
+ * channels and TX speed for every stream index, then GLOBAL_ENABLE=1.
+ * The DICE firmware latches the stream configuration when streaming is
+ * (re)started, so this must run before the host DMA contexts are
+ * enabled.  Only needed when the session transitions from idle.
  */
 static int
 dice_program_device(struct dice_bsd_softc *sc)
 {
+	unsigned int i;
 	int err;
 
-	err = dice_program_iso(sc, 0, 0, DSTREAM(sc)->rx_channel);
-	if (err != 0) {
-		device_printf(sc->dev, "dice: RX_ISOCHRONOUS write failed (%d)\n",
-		    err);
-		return (err);
-	}
-	err = dice_program_iso(sc, 1, 0, DSTREAM(sc)->tx_channel);
-	if (err != 0) {
-		device_printf(sc->dev, "dice: TX_ISOCHRONOUS write failed (%d)\n",
-		    err);
-		return (err);
-	}
-	err = dice_write_quad(sc->fwdev,
-	    DICE_PRIVATE_SPACE + sc->tx_offset + 0x014, /* TX_SPEED */
-	    htobe32(sc->fwdev->fc->speed));
-	if (err != 0) {
-		device_printf(sc->dev, "dice: TX_SPEED write failed (%d)\n",
-		    err);
-		return (err);
+	for (i = 0; i < MAX_DICE_STREAMS; i++) {
+		err = dice_program_iso(sc, 0, i, DSTREAM(sc)->rx_channel[i]);
+		if (err != 0) {
+			device_printf(sc->dev,
+			    "dice: RX_ISOCHRONOUS[%u] write failed (%d)\n",
+			    i, err);
+			return (err);
+		}
+		err = dice_program_iso(sc, 1, i, DSTREAM(sc)->tx_channel[i]);
+		if (err != 0) {
+			device_printf(sc->dev,
+			    "dice: TX_ISOCHRONOUS[%u] write failed (%d)\n",
+			    i, err);
+			return (err);
+		}
+		/* TX_SPEED is per stream index (ALSA start_streams). */
+		err = dice_write_quad(sc->fwdev,
+		    DICE_PRIVATE_SPACE + sc->tx_offset + i * 0x20 + 0x014,
+		    htobe32(sc->fwdev->fc->speed));
+		if (err != 0) {
+			device_printf(sc->dev,
+			    "dice: TX_SPEED[%u] write failed (%d)\n", i, err);
+			return (err);
+		}
 	}
 	err = dice_enable(sc, true);
 	if (err != 0)
@@ -1272,26 +1448,98 @@ dice_program_device(struct dice_bsd_softc *sc)
 }
 
 /*
- * Ensure the host isochronous transmit context (playback direction) is
+ * Fill one TX slot: one packet per active playback stream, all carrying
+ * the same blocking-mode framing (dice_tx_framing_next).  The caller
+ * must hold FW_GLOCK.  Returns 1 when a slot was filled, 0 when any
+ * active stream's stfree queue is empty.
+ */
+static int
+dice_refill_tx_slot(struct dice_bsd_softc *sc)
+{
+	struct dice_pcm_stream *ps = &DSTREAM(sc)->playback;
+	struct dice_tx_framing tf;
+	struct fw_xferq *xq[MAX_DICE_STREAMS];
+	struct fw_bulkxfer *bx[MAX_DICE_STREAMS];
+	int32_t scratch[MAX_DICE_PCM_CH * 12];
+	const int32_t *sp;
+	struct basound_chan *txch;
+	unsigned int nch, sample_bytes, scount, i;
+	bool is_float;
+
+	scount = ps->stream_count;
+	if (scount == 0 || scount > MAX_DICE_STREAMS)
+		return (0);
+
+	for (i = 0; i < scount; i++) {
+		struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx[i];
+
+		if (ch->dmach < 0)
+			return (0);
+		xq[i] = ISO_XFERQ(ch);
+		bx[i] = STAILQ_FIRST(&xq[i]->stfree);
+		if (bx[i] == NULL)
+			return (0);
+	}
+
+	txch = ps->substream ? ps->substream->private_data : NULL;
+	nch = ps->pcm_channels;
+	if (txch != NULL) {
+		unsigned int fmt_ch = AFMT_CHANNEL(txch->format);
+
+		if (fmt_ch != 0 && fmt_ch <= ps->device_channels)
+			nch = fmt_ch;
+		ps->pcm_channels = nch;
+	}
+	if (nch > ps->device_channels)
+		nch = ps->device_channels;
+	sample_bytes = (txch != NULL) ? AFMT_BPS(txch->format) : 4;
+	if (sample_bytes != 2 && sample_bytes != 4)
+		sample_bytes = 4;
+	is_float = (txch != NULL) &&
+	    (AFMT_ENCODING(txch->format) == AFMT_FLOAT);
+
+	dice_tx_framing_next(ps, &tf);
+	sp = dice_tx_fetch(sc, tf.frames, nch, sample_bytes, is_float,
+	    scratch);
+
+	for (i = 0; i < scount; i++) {
+		STAILQ_REMOVE_HEAD(&xq[i]->stfree, link);
+		dice_fill_tx_chunk(sc, i, xq[i], bx[i], &tf, sp, nch);
+		STAILQ_INSERT_TAIL(&xq[i]->stvalid, bx[i], link);
+	}
+	return (1);
+}
+
+/*
+ * Ensure the host isochronous transmit contexts (playback direction) are
  * running.  Reference counted (rx_use_count): the first caller drains
  * and refills all chunks (silent when no playback app is open) and
- * enables the IT context; later callers just bump the count.
+ * enables the IT contexts; later callers just bump the count.
  */
 static int
 dice_ensure_host_tx(struct dice_bsd_softc *sc)
 {
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
-	struct fw_xferq *xferq;
+	struct dice_pcm_stream *pb = &DSTREAM(sc)->playback;
+	struct fw_xferq *xferq[MAX_DICE_STREAMS];
 	struct firewire_comm *fc;
-	struct fw_bulkxfer *bx;
 	uint32_t fv;
-	int err, i;
+	unsigned int scount, i;
+	int err;
 
-	if (sc->stream == NULL || ch->dmach < 0)
+	if (sc->stream == NULL)
 		return (0);
-	xferq = ISO_XFERQ(ch);
-	fc = ISO_FC(ch);
-	if (fc == NULL || xferq == NULL)
+	scount = pb->stream_count;
+	if (scount == 0 || scount > MAX_DICE_STREAMS)
+		return (0);
+	for (i = 0; i < scount; i++) {
+		struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx[i];
+
+		if (ch->dmach < 0)
+			return (0);
+		xferq[i] = ISO_XFERQ(ch);
+	}
+	fc = ISO_FC(&DSTREAM(sc)->iso_tx[0]);
+	if (fc == NULL || xferq[0] == NULL)
 		return (-ENODEV);
 
 	mtx_lock(&DSTREAM(sc)->playback_lock);
@@ -1302,70 +1550,44 @@ dice_ensure_host_tx(struct dice_bsd_softc *sc)
 	mtx_unlock(&DSTREAM(sc)->playback_lock);
 
 	/*
-	 * The IT context is (re)armed at a fresh cycle match, so restart
+	 * The IT contexts are (re)armed at a fresh cycle match, so restart
 	 * the blocking-mode SYT sequence and re-sync the transmission
 	 * cycle counter with the bus.
 	 */
-	{
-		struct dice_pcm_stream *pb = &DSTREAM(sc)->playback;
-
-		dice_stream_configure(pb, SNDRV_PCM_STREAM_PLAYBACK,
-				      pb->rate);
-		pb->tx_cycle = dice_first_tx_cycle(sc);
-	}
+	dice_stream_configure(pb, SNDRV_PCM_STREAM_PLAYBACK, pb->rate);
+	pb->tx_cycle = dice_first_tx_cycle(sc);
 
 	/* DEBUG (remove after diagnosis). */
-	device_printf(sc->dev,
-	    "dice: ensure_tx dmach=%d pre free=%u dma=%u val=%u run=%d "
-	    "first_cycle=%u\n",
-	    ch->dmach,
-	    dice_qcount(xferq, 0), dice_qcount(xferq, 1),
-	    dice_qcount(xferq, 2),
-	    (xferq->flag & FWXFERQ_RUNNING) != 0,
-	    DSTREAM(sc)->playback.tx_cycle);
+	device_printf(sc->dev, "dice: ensure_tx streams=%u first_cycle=%u\n",
+	    scount, pb->tx_cycle);
 
 	FW_GLOCK(fc);
-	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
-	STAILQ_CONCAT(&xferq->stfree, &xferq->stvalid);
+	for (i = 0; i < scount; i++) {
+		STAILQ_CONCAT(&xferq[i]->stfree, &xferq[i]->stdma);
+		STAILQ_CONCAT(&xferq[i]->stfree, &xferq[i]->stvalid);
+	}
 	for (i = 0; i < DICE_ISO_NCHUNKS; i++) {
-		bx = STAILQ_FIRST(&xferq->stfree);
-		if (bx == NULL)
+		if (dice_refill_tx_slot(sc) == 0)
 			break;
-		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
-		dice_fill_tx_chunk(sc, xferq, bx);
-		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
 	}
 	FW_GUNLOCK(fc);
 
-	fv = DICE_ISO_TAG_CIP |
-	    (DSTREAM(sc)->rx_channel >= 0 ?
-	     (DSTREAM(sc)->rx_channel & 0x3f) : 0);
-	xferq->flag = (xferq->flag & ~FWXFERQ_CHTAGMASK) | fv;
-	err = fc->itx_enable(fc, ch->dmach);
-	/* DEBUG (remove after diagnosis): dump first packet as built. */
-	{
-		struct fw_pkt *fp0 = (struct fw_pkt *)
-		    fwdma_v_addr(xferq->buf, 0);
-		uint32_t *pl0 = fp0 ? (uint32_t *)fp0->mode.stream.payload : NULL;
+	for (i = 0; i < scount; i++) {
+		struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx[i];
 
-		device_printf(sc->dev,
-		    "dice: itx_enable ret=%d run=%d free=%u dma=%u val=%u "
-		    "len=%u q0=0x%08x q1=0x%08x midi=0x%08x pcm0=0x%08x\n",
-		    err, (xferq->flag & FWXFERQ_RUNNING) != 0,
-		    dice_qcount(xferq, 0), dice_qcount(xferq, 1),
-		    dice_qcount(xferq, 2),
-		    fp0 ? fp0->mode.stream.len : 0,
-		    pl0 ? be32toh(pl0[0]) : 0,
-		    pl0 ? be32toh(pl0[1]) : 0,
-		    pl0 ? be32toh(pl0[2]) : 0,
-		    pl0 ? be32toh(pl0[3]) : 0);
-	}
-	if (err != 0) {
-		device_printf(sc->dev, "dice: itx_enable failed (%d)\n", err);
-		mtx_lock(&DSTREAM(sc)->playback_lock);
-		DSTREAM(sc)->rx_use_count = 0;
-		mtx_unlock(&DSTREAM(sc)->playback_lock);
-		return (-err);
+		fv = DICE_ISO_TAG_CIP |
+		    (DSTREAM(sc)->rx_channel[i] >= 0 ?
+		     (DSTREAM(sc)->rx_channel[i] & 0x3f) : 0);
+		xferq[i]->flag = (xferq[i]->flag & ~FWXFERQ_CHTAGMASK) | fv;
+		err = fc->itx_enable(fc, ch->dmach);
+		if (err != 0) {
+			device_printf(sc->dev,
+			    "dice: itx_enable[%u] failed (%d)\n", i, err);
+			mtx_lock(&DSTREAM(sc)->playback_lock);
+			DSTREAM(sc)->rx_use_count = 0;
+			mtx_unlock(&DSTREAM(sc)->playback_lock);
+			return (-err);
+		}
 	}
 	DSTREAM(sc)->tx_stall_ticks = 0;
 	DSTREAM(sc)->tx_restart = false;
@@ -1373,27 +1595,37 @@ dice_ensure_host_tx(struct dice_bsd_softc *sc)
 }
 
 /*
- * Ensure the host isochronous receive context (capture direction) is
+ * Ensure the host isochronous receive contexts (capture direction) are
  * running.  Reference counted (tx_use_count).  The device only starts
  * transmitting its capture stream once it receives the host's playback
- * stream, so this context is enabled for playback sessions too; the RX
- * handler is a no-op while no capture app is active.
+ * stream, so these contexts are enabled for playback sessions too; the
+ * RX handlers are no-ops while no capture app is active.
  */
 static int
 dice_ensure_host_rx(struct dice_bsd_softc *sc)
 {
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx;
-	struct fw_xferq *xferq;
+	struct dice_pcm_stream *cap = &DSTREAM(sc)->capture;
 	struct firewire_comm *fc;
+	struct fw_xferq *xferq[MAX_DICE_STREAMS];
 	struct fw_bulkxfer *bx;
 	uint32_t fv;
-	int err;
+	unsigned int scount, i;
+	int err = 0;
 
-	if (sc->stream == NULL || ch->dmach < 0)
+	if (sc->stream == NULL)
 		return (0);
-	xferq = ISO_XFERQ(ch);
-	fc = ISO_FC(ch);
-	if (fc == NULL || xferq == NULL)
+	scount = cap->stream_count;
+	if (scount == 0 || scount > MAX_DICE_STREAMS)
+		return (0);
+	for (i = 0; i < scount; i++) {
+		struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx[i];
+
+		if (ch->dmach < 0)
+			return (0);
+		xferq[i] = ISO_XFERQ(ch);
+	}
+	fc = ISO_FC(&DSTREAM(sc)->iso_rx[0]);
+	if (fc == NULL || xferq[0] == NULL)
 		return (-ENODEV);
 
 	mtx_lock(&DSTREAM(sc)->capture_lock);
@@ -1403,46 +1635,40 @@ dice_ensure_host_rx(struct dice_bsd_softc *sc)
 	}
 	mtx_unlock(&DSTREAM(sc)->capture_lock);
 
-	/* DEBUG (remove after diagnosis). */
-	device_printf(sc->dev,
-	    "dice: ensure_rx dmach=%d pre free=%u dma=%u val=%u run=%d\n",
-	    ch->dmach,
-	    dice_qcount(xferq, 0), dice_qcount(xferq, 1),
-	    dice_qcount(xferq, 2),
-	    (xferq->flag & FWXFERQ_RUNNING) != 0);
-
-	fv = DICE_ISO_TAG_CIP |
-	    (DSTREAM(sc)->tx_channel >= 0 ?
-	     (DSTREAM(sc)->tx_channel & 0x3f) : 0);
-	xferq->flag = (xferq->flag & ~FWXFERQ_CHTAGMASK) | fv;
-
 	/*
 	 * Drain leftover chunks back to stfree before arming the IR
-	 * context.  fwohci never drains the queues itself: on stop the
+	 * contexts.  fwohci never drains the queues itself: on stop the
 	 * chunks stay in stdma/stvalid, so a subsequent irx_enable()
 	 * finds stfree empty and prints "IR DMA no free chunk" and
 	 * never arms the context (capture dead — jackd's
 	 * "Discard error bytes read = -1").  Mirror digi00x_start_rx().
 	 */
 	FW_GLOCK(fc);
-	while ((bx = STAILQ_FIRST(&xferq->stdma)) != NULL) {
-		STAILQ_REMOVE_HEAD(&xferq->stdma, link);
-		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
+	for (i = 0; i < scount; i++) {
+		while ((bx = STAILQ_FIRST(&xferq[i]->stdma)) != NULL) {
+			STAILQ_REMOVE_HEAD(&xferq[i]->stdma, link);
+			STAILQ_INSERT_TAIL(&xferq[i]->stfree, bx, link);
+		}
+		while ((bx = STAILQ_FIRST(&xferq[i]->stvalid)) != NULL) {
+			STAILQ_REMOVE_HEAD(&xferq[i]->stvalid, link);
+			STAILQ_INSERT_TAIL(&xferq[i]->stfree, bx, link);
+		}
 	}
-	while ((bx = STAILQ_FIRST(&xferq->stvalid)) != NULL) {
-		STAILQ_REMOVE_HEAD(&xferq->stvalid, link);
-		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
+	for (i = 0; i < scount; i++) {
+		struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx[i];
+
+		fv = DICE_ISO_TAG_CIP |
+		    (DSTREAM(sc)->tx_channel[i] >= 0 ?
+		     (DSTREAM(sc)->tx_channel[i] & 0x3f) : 0);
+		xferq[i]->flag = (xferq[i]->flag & ~FWXFERQ_CHTAGMASK) | fv;
+		err = fc->irx_enable(fc, ch->dmach);
+		if (err != 0)
+			break;
 	}
-	err = fc->irx_enable(fc, ch->dmach);
 	FW_GUNLOCK(fc);
-	/* DEBUG (remove after diagnosis). */
-	device_printf(sc->dev,
-	    "dice: ensure_rx post free=%u dma=%u val=%u run=%d ret=%d\n",
-	    dice_qcount(xferq, 0), dice_qcount(xferq, 1),
-	    dice_qcount(xferq, 2),
-	    (xferq->flag & FWXFERQ_RUNNING) != 0, err);
 	if (err != 0) {
-		device_printf(sc->dev, "dice: irx_enable failed (%d)\n", err);
+		device_printf(sc->dev, "dice: irx_enable[%u] failed (%d)\n",
+		    i, err);
 		mtx_lock(&DSTREAM(sc)->capture_lock);
 		DSTREAM(sc)->tx_use_count = 0;
 		mtx_unlock(&DSTREAM(sc)->capture_lock);
@@ -1454,12 +1680,15 @@ dice_ensure_host_rx(struct dice_bsd_softc *sc)
 static void
 dice_release_host_tx(struct dice_bsd_softc *sc)
 {
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
 	struct firewire_comm *fc;
+	unsigned int i, scount;
 
-	if (sc->stream == NULL || ch->dmach < 0)
+	if (sc->stream == NULL)
 		return;
-	fc = ISO_FC(ch);
+	scount = DSTREAM(sc)->playback.stream_count;
+	if (scount == 0 || scount > MAX_DICE_STREAMS)
+		return;
+	fc = ISO_FC(&DSTREAM(sc)->iso_tx[0]);
 
 	mtx_lock(&DSTREAM(sc)->playback_lock);
 	if (DSTREAM(sc)->rx_use_count == 0) {
@@ -1474,18 +1703,22 @@ dice_release_host_tx(struct dice_bsd_softc *sc)
 	DSTREAM(sc)->tx_restart = false;
 	mtx_unlock(&DSTREAM(sc)->playback_lock);
 
-	fc->itx_disable(fc, ch->dmach);
+	for (i = 0; i < scount; i++)
+		fc->itx_disable(fc, DSTREAM(sc)->iso_tx[i].dmach);
 }
 
 static void
 dice_release_host_rx(struct dice_bsd_softc *sc)
 {
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_rx;
 	struct firewire_comm *fc;
+	unsigned int i, scount;
 
-	if (sc->stream == NULL || ch->dmach < 0)
+	if (sc->stream == NULL)
 		return;
-	fc = ISO_FC(ch);
+	scount = DSTREAM(sc)->capture.stream_count;
+	if (scount == 0 || scount > MAX_DICE_STREAMS)
+		return;
+	fc = ISO_FC(&DSTREAM(sc)->iso_rx[0]);
 
 	mtx_lock(&DSTREAM(sc)->capture_lock);
 	if (DSTREAM(sc)->tx_use_count == 0) {
@@ -1498,7 +1731,8 @@ dice_release_host_rx(struct dice_bsd_softc *sc)
 	}
 	mtx_unlock(&DSTREAM(sc)->capture_lock);
 
-	fc->irx_disable(fc, ch->dmach);
+	for (i = 0; i < scount; i++)
+		fc->irx_disable(fc, DSTREAM(sc)->iso_rx[i].dmach);
 }
 
 int
@@ -1552,8 +1786,8 @@ dice_streaming_start_playback(struct dice_bsd_softc *sc)
 		callout_reset(&DSTREAM(sc)->callout, 1, dice_pcm_stream_cb, sc);
 	DSTREAM(sc)->active_streams++;
 	device_printf(sc->dev, "dice: playback start rate=%u pcm_ch=%u "
-	    "dev_ch=%u dbs=%u fdf=0x%02x\n", ps->rate, ps->pcm_channels,
-	    ps->device_channels, ps->data_block_quadlets, ps->fdf);
+	    "dev_ch=%u streams=%u fdf=0x%02x\n", ps->rate, ps->pcm_channels,
+	    ps->device_channels, ps->stream_count, ps->fdf);
 	return (0);
 }
 
@@ -1606,8 +1840,8 @@ dice_streaming_start_capture(struct dice_bsd_softc *sc)
 		callout_reset(&DSTREAM(sc)->callout, 1, dice_pcm_stream_cb, sc);
 	DSTREAM(sc)->active_streams++;
 	device_printf(sc->dev, "dice: capture start rate=%u pcm_ch=%u "
-	    "dev_ch=%u dbs=%u fdf=0x%02x\n", ps->rate, ps->pcm_channels,
-	    ps->device_channels, ps->data_block_quadlets, ps->fdf);
+	    "dev_ch=%u streams=%u fdf=0x%02x\n", ps->rate, ps->pcm_channels,
+	    ps->device_channels, ps->stream_count, ps->fdf);
 	return (0);
 }
 
@@ -1658,7 +1892,7 @@ dice_streaming_stop_capture(struct dice_bsd_softc *sc)
 /*
  * Restart a stalled TX stream.
  *
- * Called from the refill watchdog when the OHCI IT context has stopped
+ * Called from the refill watchdog when the OHCI IT contexts have stopped
  * completing packets (e.g. a FireWire bus reset — fwohci halts all ISO
  * contexts on reset and never restarts them, and the DICE firmware
  * clears GLOBAL_ENABLE).  Nothing would ever be recycled into stfree
@@ -1667,7 +1901,7 @@ dice_streaming_stop_capture(struct dice_bsd_softc *sc)
  * Sequence, mirroring start_playback:
  *   1. re-program the device (rate + RX/TX channels + enable) — fwmem
  *      transactions may tsleep up to 5s each, so no locks are held;
- *   2. itx_disable() the dead context — its internal pause() sleeps
+ *   2. itx_disable() the dead contexts — their internal pause() sleeps
  *      1s, again with no locks held;
  *   3. under playback_lock + FW_GLOCK, drain every chunk back to stfree,
  *      refill, and itx_enable() to rebuild the DMA descriptors.
@@ -1679,23 +1913,32 @@ dice_streaming_stop_capture(struct dice_bsd_softc *sc)
 static void
 dice_streaming_restart_tx(struct dice_bsd_softc *sc)
 {
-	struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx;
 	struct dice_pcm_stream *ps = &DSTREAM(sc)->playback;
 	struct firewire_comm *fc;
-	struct fw_xferq *xferq;
-	struct fw_bulkxfer *bx;
-	int refilled = 0, i;
+	struct fw_xferq *xferq[MAX_DICE_STREAMS];
+	unsigned int scount, i;
+	int refilled = 0;
 
-	if (sc->stream == NULL || ch->dmach < 0 || !ps->active) {
+	if (sc->stream == NULL || !ps->active) {
 		if (sc->stream != NULL) {
 			DSTREAM(sc)->tx_restart = false;
 			DSTREAM(sc)->tx_stall_ticks = 0;
 		}
 		return;
 	}
-	fc = ISO_FC(ch);
-	xferq = ISO_XFERQ(ch);
-	if (fc == NULL || xferq == NULL) return;
+	scount = ps->stream_count;
+	if (scount == 0 || scount > MAX_DICE_STREAMS)
+		return;
+	for (i = 0; i < scount; i++) {
+		struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx[i];
+
+		if (ch->dmach < 0)
+			return;
+		xferq[i] = ISO_XFERQ(ch);
+	}
+	fc = ISO_FC(&DSTREAM(sc)->iso_tx[0]);
+	if (fc == NULL)
+		return;
 
 	device_printf(sc->dev, "dice: TX DMA stalled, restarting stream\n");
 
@@ -1703,30 +1946,27 @@ dice_streaming_restart_tx(struct dice_bsd_softc *sc)
 	(void)dice_set_rate(sc, ps->rate);
 	(void)dice_program_device(sc);
 
-	/* Host side: tear down the dead context (pause 1s inside). */
-	fc->itx_disable(fc, ch->dmach);
+	/* Host side: tear down the dead contexts (pause 1s inside). */
+	for (i = 0; i < scount; i++)
+		fc->itx_disable(fc, DSTREAM(sc)->iso_tx[i].dmach);
 
 	mtx_lock(&DSTREAM(sc)->playback_lock);
 	FW_GLOCK(fc);
-	STAILQ_CONCAT(&xferq->stfree, &xferq->stdma);
-	STAILQ_CONCAT(&xferq->stfree, &xferq->stvalid);
+	for (i = 0; i < scount; i++) {
+		STAILQ_CONCAT(&xferq[i]->stfree, &xferq[i]->stdma);
+		STAILQ_CONCAT(&xferq[i]->stfree, &xferq[i]->stvalid);
+	}
 
-	/* Fresh blocking-mode sequence; the rearmed IT context starts at
+	/* Fresh blocking-mode sequence; the rearmed IT contexts start at
 	 * a new cycle match, so re-sync the transmission cycle too. */
 	dice_stream_configure(ps, SNDRV_PCM_STREAM_PLAYBACK, ps->rate);
 	ps->tx_cycle = dice_first_tx_cycle(sc);
 
-	for (i = 0; i < DICE_ISO_NCHUNKS; i++) {
-		bx = STAILQ_FIRST(&xferq->stfree);
-		if (bx == NULL) break;
-		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
-		dice_fill_tx_chunk(sc, xferq, bx);
-		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
-		refilled++;
-	}
+	while (dice_refill_tx_slot(sc) > 0 && refilled++ < DICE_ISO_NCHUNKS)
+		;
 	FW_GUNLOCK(fc);
-	if (refilled > 0)
-		fc->itx_enable(fc, ch->dmach);
+	for (i = 0; i < scount; i++)
+		fc->itx_enable(fc, DSTREAM(sc)->iso_tx[i].dmach);
 	DSTREAM(sc)->tx_stall_ticks = 0;
 	DSTREAM(sc)->tx_restart = false;
 	mtx_unlock(&DSTREAM(sc)->playback_lock);
@@ -1735,53 +1975,78 @@ dice_streaming_restart_tx(struct dice_bsd_softc *sc)
 void
 dice_streaming_refill_tx(struct dice_bsd_softc *sc)
 {
-	struct dice_iso_channel *ch;
-	struct fw_xferq *xferq;
+	struct dice_pcm_stream *ps;
+	struct fw_xferq *xferq[MAX_DICE_STREAMS];
 	struct firewire_comm *fc;
-	struct fw_bulkxfer *bx;
+	unsigned int scount, i;
+	bool all_empty;
 	int refilled = 0;
 
 	if (sc->stream == NULL)
 		return;
-	ch = &DSTREAM(sc)->iso_tx;
+	ps = &DSTREAM(sc)->playback;
+	scount = ps->stream_count;
+	if (scount == 0 || scount > MAX_DICE_STREAMS ||
+	    DSTREAM(sc)->rx_use_count == 0)
+		return;
+	for (i = 0; i < scount; i++) {
+		struct dice_iso_channel *ch = &DSTREAM(sc)->iso_tx[i];
+
+		if (ch->dmach < 0)
+			return;
+		xferq[i] = ISO_XFERQ(ch);
+	}
+	fc = ISO_FC(&DSTREAM(sc)->iso_tx[0]);
+	if (fc == NULL)
+		return;
 
 	/*
-	 * Keep refilling whenever the IT context is running, even if no
-	 * playback app is open (capture-only session): dice_fill_tx_chunk
+	 * Keep refilling whenever the IT contexts are running, even if no
+	 * playback app is open (capture-only session): dice_tx_fetch
 	 * produces silent, correctly framed packets for that case.  The
 	 * old gate on ps->substream/runtime/dma_area stopped the refill
 	 * dead whenever playback wasn't open, so a capture-only session
 	 * never fed the device and the device never transmitted.
 	 */
-	if (ch->dmach < 0 || DSTREAM(sc)->rx_use_count == 0)
-		return;
-
-	xferq = ISO_XFERQ(ch);
-	fc = ISO_FC(ch);
-
 	mtx_lock(&DSTREAM(sc)->playback_lock);
 	FW_GLOCK(fc);
-	while ((bx = STAILQ_FIRST(&xferq->stfree)) != NULL) {
-		STAILQ_REMOVE_HEAD(&xferq->stfree, link);
-		dice_fill_tx_chunk(sc, xferq, bx);
-		STAILQ_INSERT_TAIL(&xferq->stvalid, bx, link);
-		refilled++;
-	}
+	while (dice_refill_tx_slot(sc) > 0 &&
+	    refilled++ < DICE_ISO_NCHUNKS)
+		;
 	FW_GUNLOCK(fc);
 	if (refilled > 0) {
 		DSTREAM(sc)->tx_stall_ticks = 0;
-		fc->itx_enable(fc, ch->dmach);
-	} else if (++DSTREAM(sc)->tx_stall_ticks >= DICE_TX_STALL_LIMIT) {
+		for (i = 0; i < scount; i++)
+			fc->itx_enable(fc, DSTREAM(sc)->iso_tx[i].dmach);
+	} else {
 		/*
-		 * No chunk has been recycled for the whole limit window.
-		 * A healthy context completes ~8 packets/ms, so this means
-		 * the OHCI IT context is dead (bus reset / DMA error).
-		 * Defer the restart until after playback_lock is dropped:
-		 * it sleeps (itx_disable pause, fwmem timeouts) and must
-		 * not run with the mutex held.
+		 * No slot was filled this tick.  Distinguish a genuine
+		 * stall (ALL active streams' queues empty — the OHCI IT
+		 * contexts stopped completing packets, e.g. after a bus
+		 * reset) from a transient imbalance where one stream's
+		 * queue has chunks but another's is momentarily empty
+		 * (the paired fill stops at the first empty queue).
 		 */
-		DSTREAM(sc)->tx_stall_ticks = 0;
-		DSTREAM(sc)->tx_restart = true;
+		all_empty = true;
+		for (i = 0; i < scount; i++) {
+			if (STAILQ_FIRST(&xferq[i]->stfree) != NULL) {
+				all_empty = false;
+				break;
+			}
+		}
+		if (all_empty &&
+		    ++DSTREAM(sc)->tx_stall_ticks >= DICE_TX_STALL_LIMIT) {
+			/*
+			 * A healthy context completes ~8 packets/ms, so a
+			 * whole limit window with no recycled chunk means
+			 * the contexts are dead.  Defer the restart until
+			 * after playback_lock is dropped: it sleeps
+			 * (itx_disable pause, fwmem timeouts) and must not
+			 * run with the mutex held.
+			 */
+			DSTREAM(sc)->tx_stall_ticks = 0;
+			DSTREAM(sc)->tx_restart = true;
+		}
 	}
 	mtx_unlock(&DSTREAM(sc)->playback_lock);
 

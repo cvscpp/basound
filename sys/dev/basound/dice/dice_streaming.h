@@ -49,6 +49,13 @@ struct dice_bsd_softc;
 #define CIP_FMT_AM		0x10
 #define DICE_ISO_TAG_CIP	(1 << 6)
 
+/* Number of DICE isochronous streams per direction (DICE II/Jr/Mini:
+ * max 2 pairs).  Defined here (not via dice_bsd.h) because this header
+ * deliberately avoids including firewire headers. */
+#ifndef MAX_DICE_STREAMS
+#define MAX_DICE_STREAMS	2
+#endif
+
 struct dice_iso_channel {
 	int		dmach;		/* -1 = not allocated */
 	void		*xferq;		/* struct fw_xferq * */
@@ -57,6 +64,23 @@ struct dice_iso_channel {
 	void		**mbufs;	/* struct mbuf ** array */
 	void		*ctx;		/* backpointer to dice_bsd_softc */
 	int		direction;	/* 0=playback(RX), 1=capture(TX) */
+	int		stream_index;	/* DICE stream index carried by this
+					 * channel (0 or 1).  DICE devices
+					 * with more than 16 PCM channels
+					 * (e.g. the M-Audio ProFire 2626:
+					 * RX/TX 26 = 16 + 10) spread their
+					 * channels over two isochronous
+					 * streams, each with its own
+					 * data-block layout, DBC sequence
+					 * and isochronous channel.  The
+					 * DICE Jr./Mini ASICs cap a single
+					 * stream at 16 data channels, so
+					 * packing e.g. 27 quadlets (26 PCM +
+					 * MIDI) into one block makes the
+					 * firmware walk off its expected
+					 * 16-quadlet block boundaries —
+					 * garbled/no audio on every output.
+					 */
 };
 
 /* ------------------------------------------------------------------ */
@@ -70,6 +94,25 @@ struct dice_iso_channel {
 enum { DICE_SFC_32000=0, DICE_SFC_44100=1, DICE_SFC_48000=2,
        DICE_SFC_88200=3, DICE_SFC_96000=4, DICE_SFC_176400=5,
        DICE_SFC_192000=6 };
+
+/*
+ * Layout of ONE DICE isochronous stream (stream index 0 or 1) for one
+ * direction.  The device's channel complement is split across streams:
+ * the ProFire 2626 uses 16 channels on stream 0 and 10 on stream 1 at
+ * <=48 kHz (plus MIDI on one of them).  `first_ch` is the index of this
+ * stream's first channel within the app's interleaved frame (0 for
+ * stream 0, stream0.pcm_chs for stream 1, ...).
+ */
+struct dice_stream_layout {
+	unsigned int	pcm_chs;	/* PCM channels of this DICE stream */
+	unsigned int	midi_ports;	/* MIDI ports of this DICE stream */
+	unsigned int	data_block_quadlets; /* quadlets per block (pcm + midi) */
+	unsigned int	first_ch;	/* first channel index in the interleaved frame */
+	unsigned int	dbc;		/* per-stream CIP data block counter */
+	unsigned long	rx_pos_bytes;	/* cumulative bytes decoded into the
+					 * capture ring (per-stream; all
+					 * streams advance in lockstep) */
+};
 
 struct dice_pcm_stream {
 	unsigned long   hwptr;		/* current ring buffer position (bytes) */
@@ -87,15 +130,13 @@ struct dice_pcm_stream {
 	int		direction;	/* SNDRV_PCM_STREAM_PLAYBACK or CAPTURE */
 	bool		double_pcm_frames; /* dual-wire at >96 kHz */
 
-	/* AM824 data block layout */
-	unsigned int	data_block_quadlets; /* total quadlets per block (pcm + midi) */
+	/* Per-DICE-stream AM824 data-block layouts (0..stream_count-1) */
+	struct dice_stream_layout streams[MAX_DICE_STREAMS];
+	unsigned int	stream_count;	/* number of active DICE streams for this
+					 * direction at the current rate mode */
 
 	/* CIP header state */
-	unsigned int	tx_dbc;		/* TX data block counter */
 	unsigned int	fdf;		/* CIP FDF field */
-
-	/* DICE register stream index (0 or 1) */
-	unsigned int	stream_index;
 
 	/* AMDTP fractional framing (non-blocking fallback) */
 	unsigned int	frames_per_packet;
@@ -136,14 +177,19 @@ struct dice_pcm_stream {
 /* ------------------------------------------------------------------ */
 
 struct dice_streaming {
-	struct dice_iso_channel   iso_tx;	/* capture direction */
-	struct dice_iso_channel   iso_rx;	/* playback direction */
+	/* One ISO DMA context per DICE stream index (0..MAX_DICE_STREAMS-1).
+	 * Devices whose direction uses a single stream (e.g. the Alesis
+	 * iO26 RX: 8 channels) only ever enable iso_rx[0]/iso_tx[0]; the
+	 * second context stays idle.  Dual-stream devices (M-Audio ProFire
+	 * 2626: 16+10 channels) use both. */
+	struct dice_iso_channel   iso_tx[MAX_DICE_STREAMS]; /* capture */
+	struct dice_iso_channel   iso_rx[MAX_DICE_STREAMS]; /* playback */
 	struct dice_pcm_stream    playback;
 	struct dice_pcm_stream    capture;
 
-	/* ISO resource allocation */
-	int	tx_channel;	/* allocated isochronous channel, -1 = none */
-	int	rx_channel;
+	/* ISO resource allocation (fixed channels, one per stream index) */
+	int	tx_channel[MAX_DICE_STREAMS];
+	int	rx_channel[MAX_DICE_STREAMS];
 
 	struct callout	callout;	/* shared TX refill + period signalling */
 	unsigned int	active_streams;
@@ -185,5 +231,16 @@ void dice_build_cip_header(uint32_t *hdr, unsigned int node_id,
 			   unsigned int fmt, unsigned int fdf,
 			   unsigned int syt);
 unsigned int dice_frames_this_packet(struct dice_pcm_stream *ps);
+
+/*
+ * Build the per-stream AM824 data-block layouts for one direction from
+ * the detected device config at the given sample rate.  Fills
+ * ps->streams[], ps->stream_count, ps->device_channels and
+ * ps->midi_ports.  Called by dice_stream_sync_from_channel() (dice_bsd.c)
+ * and dice_clone_geometry() before stream start.
+ */
+void dice_stream_build_layout(struct dice_bsd_softc *sc,
+			      struct dice_pcm_stream *ps, bool is_capture,
+			      unsigned int rate);
 
 #endif /* _BASOUND_DICE_STREAMING_H_ */

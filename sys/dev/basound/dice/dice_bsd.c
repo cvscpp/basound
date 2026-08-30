@@ -863,7 +863,7 @@ dice_stream_sync_from_channel(struct dice_bsd_softc *sc,
 			      struct dice_pcm_stream *ps,
 			      struct basound_chan *ch)
 {
-	unsigned int mode_idx, device_ch = 0, midi = 0, rate, pcm_ch, i;
+	unsigned int rate, pcm_ch;
 	int capture = (ps == &sc->stream->capture);
 
 	if (ch == NULL)
@@ -875,41 +875,20 @@ dice_stream_sync_from_channel(struct dice_bsd_softc *sc,
 	if (pcm_ch == 0)
 		pcm_ch = 2;
 
-	/* Determine rate mode and get channel+MIDI counts from config. */
-	if (rate <= 48000)
-		mode_idx = SND_DICE_RATE_MODE_LOW;
-	else if (rate <= 96000)
-		mode_idx = SND_DICE_RATE_MODE_MIDDLE;
-	else
-		mode_idx = SND_DICE_RATE_MODE_HIGH;
-
-	for (i = 0; i < MAX_DICE_STREAMS; i++) {
-		if (capture) {
-			device_ch += sc->cfg.tx_pcm_chs[i][mode_idx];
-			midi += sc->cfg.tx_midi_ports[i];
-		} else {
-			device_ch += sc->cfg.rx_pcm_chs[i][mode_idx];
-			midi += sc->cfg.rx_midi_ports[i];
-		}
-	}
-
-	if (device_ch == 0)
-		device_ch = pcm_ch;
-	if (pcm_ch > device_ch)
-		pcm_ch = device_ch;
-
+	/*
+	 * Build the per-DICE-stream data-block layouts from the detected
+	 * config at the negotiated rate (ProFire 2626: stream 0 = 16 ch,
+	 * stream 1 = 10 ch; iO26 RX: stream 0 only).  This replaces the
+	 * old single summed data block, which exceeded the DICE Jr./Mini
+	 * 16-data-channel per-stream limit and made the firmware walk off
+	 * its expected block boundaries (garbled playback).
+	 */
+	dice_stream_build_layout(sc, ps, capture, rate);
 	ps->rate = rate;
 	ps->pcm_channels = pcm_ch;
-	ps->device_channels = device_ch;
-	ps->midi_ports = midi;
-	ps->double_pcm_frames = !sc->cfg.disable_double_pcm_frames;
-
-	/* AM824 data block quadlets: one per PCM channel + one for MIDI. */
-	ps->data_block_quadlets = device_ch + (midi > 0 ? 1 : 0);
-
-	/* Dual-wire at >96 kHz doubles the data block. */
-	if (ps->double_pcm_frames && rate > 96000)
-		ps->data_block_quadlets *= 2;
+	if (pcm_ch > ps->device_channels)
+		pcm_ch = ps->device_channels;
+	ps->pcm_channels = pcm_ch;
 }
 
 static int
@@ -998,7 +977,6 @@ dice_pcm_prepare(struct snd_pcm_substream *substream)
 	if (!ps->active) {
 		ps->hwptr = 0;
 		ps->period_accum = 0;
-		ps->tx_dbc = 0;
 		ps->frame_cycle = 0;
 	}
 	return (0);
@@ -1257,16 +1235,23 @@ sysctl_dice_stream(SYSCTL_HANDLER_ARGS)
 	cap = &ds->capture;
 
 	len = snprintf(buf, sizeof(buf),
-	    "playback: active=%d rate=%u ch=%u devch=%u dbs=%u fdf=0x%02x "
+	    "playback: active=%d rate=%u ch=%u devch=%u streams=%u "
+	    "s0=%u/%u s1=%u/%u fdf=0x%02x "
 	    "hwptr=%lu/%u period=%u tx_underruns=%lu tx_shortfalls=%lu\n"
-	    "capture:  active=%d rate=%u ch=%u devch=%u dbs=%u "
+	    "capture:  active=%d rate=%u ch=%u devch=%u streams=%u "
+	    "s0=%u/%u s1=%u/%u "
 	    "hwptr=%lu/%u period=%u",
 	    pb->active, pb->rate, pb->pcm_channels, pb->device_channels,
-	    pb->data_block_quadlets, pb->fdf, pb->hwptr, pb->buffer_bytes,
+	    pb->stream_count,
+	    pb->streams[0].pcm_chs, pb->streams[0].data_block_quadlets,
+	    pb->streams[1].pcm_chs, pb->streams[1].data_block_quadlets,
+	    pb->fdf, pb->hwptr, pb->buffer_bytes,
 	    pb->period_bytes, pb->tx_underruns, pb->tx_shortfalls,
 	    cap->active, cap->rate, cap->pcm_channels, cap->device_channels,
-	    cap->data_block_quadlets, cap->hwptr, cap->buffer_bytes,
-	    cap->period_bytes);
+	    cap->stream_count,
+	    cap->streams[0].pcm_chs, cap->streams[0].data_block_quadlets,
+	    cap->streams[1].pcm_chs, cap->streams[1].data_block_quadlets,
+	    cap->hwptr, cap->buffer_bytes, cap->period_bytes);
 	if (len < 0)
 		len = 0;
 	if (len >= (int)sizeof(buf))

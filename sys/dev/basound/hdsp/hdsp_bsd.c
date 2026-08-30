@@ -170,6 +170,10 @@ hdsp_bsd_detach(device_t dev)
 {
 	struct hdsp_bsd_softc *sc = device_get_softc(dev);
 
+	/* Make sure the 1 ms feeder callout is fully quiesced before
+	 * tearing down the card (it must not touch a freed softc). */
+	callout_drain(&sc->chip.pcm_callout);
+
 	hdsp_cdev_destroy(&sc->chip);
 
 	/* Free planar DMA buffers before tearing down the card and PCI resources. */

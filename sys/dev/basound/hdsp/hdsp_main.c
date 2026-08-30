@@ -120,6 +120,9 @@ snd_hdsp_create(struct snd_card *card, struct hdsp *hdsp)
 	 * don't clear critical configuration bits. */
 	hdsp->control_register = HDSP_ClockModeMaster;
 
+	/* 1 ms staging-buffer feeder (see hdsp_pcm_callout). */
+	callout_init(&hdsp->pcm_callout, 1);
+
 	/* Initialize audio_stream structures */
 	mtx_init(&hdsp->capture_stream.lock, "hdsp_capture_stream", NULL, MTX_DEF);
 	hdsp->capture_stream.state = AUDIO_STREAM_IDLE;
@@ -245,29 +248,73 @@ snd_hdsp_interrupt(void *arg)
 
 	if (audio) {
 		/*
-		 * Capture: interleave the just-finished period from the planar
-		 * hardware buffer into sndbuf BEFORE snd_pcm_period_elapsed so
-		 * the PCM layer reads the correct captured data.
+		 * Only touch a substream if its direction is actually
+		 * RUNNING.  A direction whose channel was opened and then
+		 * closed (or never started) has a freed basound_chan in
+		 * substream->private_data; calling into the PCM layer for it
+		 * would use-after-free.  audio_stream state is the reliable
+		 * proxy: trigger START sets RUNNING, trigger STOP / channel
+		 * close sets STOPPED, never-opened stays IDLE.
 		 */
-		if (hdsp->capture_substream)
+		if (hdsp->capture_stream.state == AUDIO_STREAM_RUNNING)
 			hdsp_interleave_from_planar(hdsp, finished_period);
 
-		if (hdsp->capture_substream)
+		if (hdsp->capture_stream.state == AUDIO_STREAM_RUNNING)
 			snd_pcm_period_elapsed(hdsp->capture_substream);
-		if (hdsp->playback_substream)
+		if (hdsp->playback_stream.state == AUDIO_STREAM_RUNNING)
 			snd_pcm_period_elapsed(hdsp->playback_substream);
 
-		/*
-		 * Playback: deinterleave the just-refilled sndbuf period into
-		 * the planar DMA buffer AFTER snd_pcm_period_elapsed has had the
-		 * PCM layer write fresh audio into sndbuf[finished_period].
-		 */
-		if (hdsp->playback_substream)
+		if (hdsp->playback_stream.state == AUDIO_STREAM_RUNNING)
 			hdsp_deinterleave_to_planar(hdsp, finished_period);
 	}
 
 	if (midi0 || midi1)
 		schedule_work(&hdsp->midi_work);
+}
+
+/*
+ * Fine-grained staging-buffer feeder (1 ms).
+ *
+ * The FreeBSD OSS layer only transfers data between the application
+ * (bufsoft) and hardware (bufhard) sndbufs inside chn_intr().  With the
+ * interrupt-driven design, chn_intr() fired only at the HDSP hardware
+ * period cadence (e.g. every 512 frames ≈ 10.7 ms at 48 kHz) and the
+ * coarse hw pointer drained bufhard in whole-period chunks, so bufsoft
+ * accumulated up to a full JACK period between refills.  JACK's OSS
+ * backend samples that fill (SNDCTL_DSP_CURRENT_OPTR.fifo_samples =
+ * bufsoft ready) every process cycle and runs a skip/insert
+ * "buffer balancing" heuristic whenever the fill deviates from its
+ * elapsed-time model; the ± one-period phase jitter tripped it
+ * constantly, dropping 2000-7000 frames every few cycles
+ * ("underrun, late by ..., skip ..." + xruns) — audible distortion.
+ *
+ * This callout drives chn_intr() every 1 ms.  Together with the precise
+ * hw pointer (snd_hdsp_pointer), the OSS layer drains bufsoft→bufhard
+ * in ~48-frame increments, so fifo_samples stays low and stable and
+ * JACK's balancing logic never trips.  chn_intr() is cheap (pure buffer
+ * accounting, takes CHN_LOCK) and safe from callout context; the
+ * hardware ISR still performs the planar interleave/deinterleave at
+ * true period boundaries.  This mirrors the digi00x driver, which fixed
+ * the identical JACK failure by feeding chn_intr() every 1 ms.
+ */
+static void
+hdsp_pcm_callout(void *arg)
+{
+	struct hdsp *hdsp = arg;
+
+	if (!hdsp->running)
+		return;
+
+	/*
+	 * Only feed directions that are RUNNING (same rationale as the ISR:
+	 * a closed/never-opened channel's private_data is invalid).
+	 */
+	if (hdsp->playback_stream.state == AUDIO_STREAM_RUNNING)
+		snd_pcm_period_elapsed(hdsp->playback_substream);
+	if (hdsp->capture_stream.state == AUDIO_STREAM_RUNNING)
+		snd_pcm_period_elapsed(hdsp->capture_substream);
+
+	callout_reset(&hdsp->pcm_callout, 1, hdsp_pcm_callout, hdsp);
 }
 
 int
@@ -624,12 +671,26 @@ hdsp_deinterleave_to_planar(struct hdsp *hdsp, int period_idx)
 	src_off = period_idx * period_frames * nch * bps;
 	dst_off = period_idx * period_frames;
 
+	/*
+	 * Sample alignment: the HDSP DSP/mixer and the converters operate
+	 * on 24-bit audio MSB-aligned inside the 32-bit DMA word, i.e. the
+	 * significant bits sit at 31..8 (this is exactly how Linux ALSA
+	 * feeds S32_LE to the hdsp driver — raw copy, apps left-justify).
+	 *
+	 * S32_LE data is passed through unchanged (already left-justified).
+	 * S16_LE data must therefore be shifted LEFT by 16 before the copy;
+	 * a plain sign-extension (sample in bits 15..0) puts the signal in
+	 * the bits the hardware ignores, reducing full-scale 16-bit audio
+	 * to ~1/256 amplitude — JACK (the main S16_LE client, its default
+	 * "-w 16") produced silence while audacious (S32_LE) played fine.
+	 */
 	for (fr = 0; fr < period_frames; fr++)
 		for (c = 0; c < nch; c++)
 			dst[c * ch_buf_words + dst_off + fr] =
 			    (bps == 4) ?
 			    ((const uint32_t *)src)[(src_off / 4) + fr * nch + c] :
-			    ((const uint16_t *)src)[(src_off / 2) + fr * nch + c];
+			    ((uint32_t)((const int16_t *)src)[(src_off / 2) +
+			    fr * nch + c]) << 16;
 }
 
 /*
@@ -681,13 +742,22 @@ hdsp_interleave_from_planar(struct hdsp *hdsp, int period_idx)
 	src_off = period_idx * period_frames;
 	dst_off = period_idx * period_frames * nch * bps;
 
+	/*
+	 * Sample alignment (mirror of hdsp_deinterleave_to_planar): the
+	 * hardware leaves 24-bit data MSB-aligned in the 32-bit DMA word
+	 * (bits 31..8).  S32_LE consumers get the word raw; S16_LE
+	 * consumers must receive bits 31..16 (the top half), NOT bits
+	 * 15..0 — the low half is the 24-bit tail (dither/noise floor)
+	 * and yields near-silent, noisy 16-bit capture.
+	 */
 	for (fr = 0; fr < period_frames; fr++)
 		for (c = 0; c < nch; c++) {
 			uint32_t s = src[c * ch_buf_words + src_off + fr];
 			if (bps == 4)
 				((uint32_t *)dst)[(dst_off / 4) + fr * nch + c] = s;
 			else
-				((uint16_t *)dst)[(dst_off / 2) + fr * nch + c] = (uint16_t)s;
+				((uint16_t *)dst)[(dst_off / 2) + fr * nch + c] =
+				    (uint16_t)(s >> 16);
 		}
 }
 
@@ -998,6 +1068,12 @@ snd_hdsp_trigger(struct snd_pcm_substream *substream, int cmd)
 			
 			/* Set stream as running */
 			hdsp->running = 1;
+
+			/*
+			 * Arm the 1 ms staging-buffer feeder so the OSS layer
+			 * drains bufsoft→bufhard smoothly (see hdsp_pcm_callout).
+			 */
+			callout_reset(&hdsp->pcm_callout, 1, hdsp_pcm_callout, hdsp);
 		} else if (stream_dir == SNDRV_PCM_STREAM_PLAYBACK) {
 			/*
 			 * Hardware already running (capture-first full-duplex):
@@ -1030,6 +1106,13 @@ snd_hdsp_trigger(struct snd_pcm_substream *substream, int cmd)
 			
 			/* Clear running flag */
 			hdsp->running = 0;
+
+			/*
+			 * Stop the 1 ms feeder.  callout_stop() only cancels a
+			 * pending callout; a handler already running sees
+			 * running==0 and bails out without re-arming.
+			 */
+			callout_stop(&hdsp->pcm_callout);
 		}
 		mtx_unlock(&hdsp->lock);
 		return 0;
@@ -1056,20 +1139,46 @@ snd_hdsp_trigger(struct snd_pcm_substream *substream, int cmd)
  * the trigger path holds CHN_LOCK when it acquires hdsp->lock; inverting
  * that order causes an SMP deadlock.
  *
- * Use the coarse HDSP_BufferID bit (bit 26 of the status register) to
- * determine which half of the double buffer the hardware is currently in.
- * Returns 0 (first half) or period_bytes (second half) as a byte offset,
- * matching the non-precise-ptr mode of the upstream Linux driver.
+ * Precise h/w pointer (matching the upstream Linux driver's precise_ptr
+ * mode): the HDSP status register carries a fine-grained buffer position
+ * in bits 6-15 (HDSP_BufferPositionMask).  Divide by 4 to convert the
+ * per-channel byte count to frames, then wrap at the 2-period double
+ * buffer size and scale by the interleaved frame size to produce a byte
+ * offset into the sndbuf.
+ *
+ * Unlike the coarse BufferID pointer (0 / period_bytes), this advances
+ * smoothly, so chn_dmaupdate() frees bufhard space continuously and the
+ * 1 ms feeder callout (hdsp_pcm_callout) can drain bufsoft→bufhard in
+ * small increments — keeping the app-visible staging fill (fifo_samples)
+ * low and stable for JACK.
  */
 unsigned long
 snd_hdsp_pointer(struct snd_pcm_substream *substream)
 {
 	struct hdsp *hdsp = (struct hdsp *)substream->pcm->private_data;
-	uint32_t status;
+	struct basound_chan *ch;
+	uint32_t status, pos_frames, period_frames, frame_bytes;
+	uint32_t nch, bps;
 
 	if (hdsp == NULL || !hdsp->running || substream->runtime == NULL)
 		return 0;
 
+	ch = substream->private_data;
+	if (ch == NULL || ch->buffer == NULL)
+		return 0;
+
+	nch = AFMT_CHANNEL(ch->format);
+	if (nch == 0)
+		nch = 2;
+	bps = (ch->format & AFMT_S32_LE) ? 4 : 2;
+	frame_bytes = nch * bps;
+	period_frames = substream->runtime->period_bytes / frame_bytes;
+	if (period_frames == 0)
+		return 0;
+
 	status = hdsp_read(hdsp, HDSP_statusRegister);
-	return (status & HDSP_BufferID) ? substream->runtime->period_bytes : 0;
+	pos_frames = (status & HDSP_BufferPositionMask) / 4;
+	pos_frames &= (period_frames * 2) - 1;
+
+	return pos_frames * frame_bytes;
 }

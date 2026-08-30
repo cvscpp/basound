@@ -5,6 +5,7 @@
 #include <sys/param.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/callout.h>
 #include <sys/conf.h>
 #include <linux/workqueue.h>
 #include <sound/core.h>
@@ -109,6 +110,15 @@ struct hdsp {
 	int                   running;
 	int                   system_sample_rate;
 	uint32_t              dds_value;
+
+	/*
+	 * 1 ms staging-buffer feeder callout.  Drives chn_intr() at a fine
+	 * cadence while streaming so the OSS layer drains bufsoft→bufhard
+	 * in small increments instead of whole-period chunks; keeps the
+	 * app-visible fifo_samples (SNDCTL_DSP_CURRENT_OPTR) low and
+	 * stable so JACK's buffer-balancing heuristic never trips.
+	 */
+	struct callout        pcm_callout;
 	
 	int                   irq;
 	void                 *iobase;
