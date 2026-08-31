@@ -199,6 +199,21 @@ struct dice_bsd_softc {
 	uint64_t rx_offset;
 	uint64_t sync_offset;
 
+	/*
+	 * Per-stream register block size (bytes) inside the TX/RX section,
+	 * from TX_SIZE/RX_SIZE (offset 0x004, read-only, in quadlets).
+	 * NOT a constant: DICE II devices (e.g. the ProFire 2626) use a
+	 * 0x120-byte block (256-byte channel names + AC3 registers), while
+	 * older DICE I devices use 0x60.  The streaming layer must address
+	 * stream index i at tx_offset + i * tx_reg_size (likewise RX), or
+	 * the stream-1 registers land inside stream 0's name area and the
+	 * device is never told its isochronous channel (its TX stream 1
+	 * then never starts).  ALSA reads this size the same way
+	 * (get_register_params).  Fallback 0x20 if unreadable.
+	 */
+	unsigned int tx_reg_size;
+	unsigned int rx_reg_size;
+
 	/* Audio streaming framework (PCM plumbing). */
 	struct dice_streaming *stream;
 

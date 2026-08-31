@@ -27,6 +27,7 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/callout.h>
+#include <sys/taskqueue.h>
 
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -43,11 +44,29 @@ struct dice_bsd_softc;
 /* ISO DMA channel state                                                */
 /* ------------------------------------------------------------------ */
 
-#define DICE_ISO_NCHUNKS	32
+#define DICE_ISO_NCHUNKS	128
 #define DICE_ISO_PACKET_SIZE	2048
 #define CIP_HEADER_QUADLETS	2
 #define CIP_FMT_AM		0x10
 #define DICE_ISO_TAG_CIP	(1 << 6)
+
+/*
+ * fwohci RX buffer quirk: with ISOHDR set in IRCTL (which fwohci always
+ * does), the OHCI controller writes an 8-byte isochronous header per
+ * received packet ([cycle timestamp][iso packet header] — see Linux
+ * fw-ohci copy_iso_headers()).  FreeBSD's fwohci_add_rx_buf() only
+ * provides a 4-byte dummy descriptor to absorb it, so the dummy eats
+ * the timestamp and the ISO packet header overflows into the EXTBUF
+ * segment at payload[0].  The CIP header therefore starts at payload[1]
+ * and the data blocks at payload[CIP_HEADER_QUADLETS + 1].  Decoding
+ * from payload[CIP_HEADER_QUADLETS] (as if the segment started at CIP)
+ * reads CIP quadlet 1 as the first data block and — worse — checks the
+ * NODATA FDF against the DBS field of CIP quadlet 0, so blocking-mode
+ * NODATA packets are never recognised and every packet is decoded as
+ * syt_interval frames (a 44.1 kHz capture then writes 64,000 frames/s
+ * while the app consumes 44,100 — ring overflow, "not smooth").
+ */
+#define DICE_ISO_HDR_QUADLETS	1
 
 /* Number of DICE isochronous streams per direction (DICE II/Jr/Mini:
  * max 2 pairs).  Defined here (not via dice_bsd.h) because this header
@@ -194,6 +213,26 @@ struct dice_streaming {
 	struct callout	callout;	/* shared TX refill + period signalling */
 	unsigned int	active_streams;
 
+	/*
+	 * Device-cadence chn_intr feeding.  The 1 ms callout below moves
+	 * OSS staging data in 1 ms quantum steps, which JACK's OSS driver
+	 * (a) probes as its "hardware block size" (48 frames at 48 kHz ->
+	 * a 48-frame balancing threshold) and (b) sees as up to +/-1 ms of
+	 * cycle-start jitter -> periodic buffer balancing (skip/insert)
+	 * and graph XRuns -> clicks on mid-frequency tones.  To smooth
+	 * this out, dice_rx_handler enqueues feed_task (every 2nd packet
+	 * of stream 0, ~4 kHz at 48 kHz) and the task drives chn_intr at
+	 * the device cadence.  A taskqueue (not a direct call) is used
+	 * because dice_rx_handler runs with FW_GLOCK held and chn_intr
+	 * takes CHN_LOCK, while the PCM trigger path takes CHN_LOCK then
+	 * FW_GLOCK (itx/irx_enable) - the direct call would deadlock.
+	 * The callout keeps its period_elapsed calls as the fallback for
+	 * playback-only sessions (no RX packets -> no task enqueues).
+	 */
+	struct taskqueue	*feed_tq;
+	struct task		feed_task;
+	unsigned int		feed_div;	/* throttle: enqueue every 2nd rx0 packet */
+
 	unsigned int	tx_use_count;
 	unsigned int	rx_use_count;
 
@@ -205,6 +244,18 @@ struct dice_streaming {
 	 * reaches the limit the whole stream is restarted. */
 	unsigned int	tx_stall_ticks;
 	bool		tx_restart;
+
+	/* RX classification counters (per DICE stream), accumulated by
+	 * dice_rx_handler and read-and-cleared by sysctl dev.dice.0.stream,
+	 * so each read reports the window since the previous read:
+	 *   val = packets with a valid SYT (data blocks decoded),
+	 *   nod = empty blocking-mode NODATA packets,
+	 *   fr  = data blocks decoded (val * syt_interval),
+	 *   dbs = CIP DBS of the last received packet. */
+	unsigned int	dbg_rx_valid[MAX_DICE_STREAMS];
+	unsigned int	dbg_rx_nodata[MAX_DICE_STREAMS];
+	unsigned int	dbg_rx_frames[MAX_DICE_STREAMS];
+	unsigned int	dbg_rx_dbs[MAX_DICE_STREAMS];
 
 	struct mtx	playback_lock;	/* serialises TX (playback) start/stop/refill */
 	struct mtx	capture_lock;	/* serialises RX (capture) start/stop */

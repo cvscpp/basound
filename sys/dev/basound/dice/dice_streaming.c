@@ -17,6 +17,7 @@
 #include <sys/malloc.h>
 #include <sys/bus.h>
 #include <sys/mbuf.h>
+#include <sys/priority.h>
 #include <machine/bus.h>
 
 #include <sys/lock.h>
@@ -49,31 +50,6 @@ MALLOC_DEFINE(M_DICE_ISO, "dice_iso", "DICE ISO DMA buffers");
 #define DICE_CLOCK_RATE_SHIFT		8
 
 #define DSTREAM(sc)	((sc)->stream)
-
-/* DEBUG (remove after diagnosis): count chunks in a queue. */
-static unsigned int
-dice_qcount(struct fw_xferq *x, int which)
-{
-	struct fw_bulkxfer *bx;
-	struct fw_xferq *q = NULL;
-	unsigned int n = 0;
-
-	if (x == NULL)
-		return (0);
-	switch (which) {
-	case 0: q = (struct fw_xferq *)&x->stfree; break;
-	case 1: q = (struct fw_xferq *)&x->stdma; break;
-	case 2: q = (struct fw_xferq *)&x->stvalid; break;
-	}
-	if (q == NULL)
-		return (0);
-	switch (which) {
-	case 0: STAILQ_FOREACH(bx, &x->stfree, link) n++; break;
-	case 1: STAILQ_FOREACH(bx, &x->stdma, link) n++; break;
-	case 2: STAILQ_FOREACH(bx, &x->stvalid, link) n++; break;
-	}
-	return (n);
-}
 
 /*
  * TX stall watchdog limit (in 1 ms callout ticks).  While the stream is
@@ -594,11 +570,25 @@ dice_program_iso(struct dice_bsd_softc *sc, int is_tx, unsigned int idx, int ch)
 {
 	uint64_t addr = DICE_PRIVATE_SPACE;
 	uint32_t val = htobe32(ch >= 0 ? (uint32_t)ch : 0xffffffff);
+	unsigned int stride;
 
+	/*
+	 * Stream index i lives at section_offset + i * reg_block_size
+	 * (bytes), where the block size comes from the device's TX_SIZE /
+	 * RX_SIZE registers — NOT a constant.  Hardcoding 0x20 here put
+	 * stream 1's TX_ISOCHRONOUS at tx_offset + 0x28, i.e. inside
+	 * stream 0's 256-byte name area on DICE II devices (block size
+	 * 0x120), so the device was never told stream 1's isochronous
+	 * channel and never transmitted its second stream (capture
+	 * channels 16-25 absent on the ProFire 2626).
+	 */
+	stride = is_tx ? sc->tx_reg_size : sc->rx_reg_size;
+	if (stride == 0)
+		stride = 0x20;
 	if (is_tx)
-		addr += sc->tx_offset + idx * 0x20 + 0x008; /* TX_ISOCHRONOUS */
+		addr += sc->tx_offset + idx * stride + 0x008; /* TX_ISOCHRONOUS */
 	else
-		addr += sc->rx_offset + idx * 0x20 + 0x008; /* RX_ISOCHRONOUS */
+		addr += sc->rx_offset + idx * stride + 0x008; /* RX_ISOCHRONOUS */
 
 	return (dice_write_quad(sc->fwdev, addr, val));
 }
@@ -994,6 +984,7 @@ dice_rx_handler(struct fw_xferq *xferq)
 
 	while ((bx = STAILQ_FIRST(&xferq->stvalid)) != NULL) {
 		STAILQ_REMOVE_HEAD(&xferq->stvalid, link);
+		frames = 0;	/* recomputed per packet below */
 
 		if (ps->active && ps->substream != NULL &&
 		    ps->substream->runtime != NULL &&
@@ -1042,19 +1033,50 @@ dice_rx_handler(struct fw_xferq *xferq)
 
 			payload = (uint32_t *)fwdma_v_addr(xferq->buf,
 			    bx->poffset);
+
 			/*
 			 * Blocking-mode capture: the device transmits either
 			 * syt_interval data blocks (valid SYT) or empty
-			 * NODATA packets (FDF=0xff) on the cycles between.
-			 * The FDF field of the received CIP header tells
-			 * which; data-block count is otherwise fixed.
+			 * NODATA packets on the cycles between.  NODATA is
+			 * signalled by FDF=0xff in CIP q1 and/or SYT=0xffff.
+			 *
+			 * The CIP header sits at payload[1..2], NOT
+			 * payload[0..1]: the fwohci IR descriptor chain
+			 * provides only a 4-byte dummy for the isochronous
+			 * header, but the OHCI controller writes an 8-byte
+			 * header per received packet ([timestamp][iso packet
+			 * header] — see DICE_ISO_HDR_QUADLETS), so the ISO
+			 * packet header overflows into the segment at
+			 * payload[0] and the CIP header follows at
+			 * payload[1..2], with data blocks at payload[3].
+			 * Checking the old offset (payload[1] bits 23-16)
+			 * read the DBS field — never 0xff — so every NODATA
+			 * packet was misclassified as valid and decoded as
+			 * syt_interval frames (64,000 frames/s at 44.1 kHz
+			 * vs. the app's 44,100: ring overflow, "not
+			 * smooth").
 			 */
-			if (payload != NULL &&
-			    ((be32toh(payload[1]) >> 16) & 0xff) ==
-			    DICE_FDF_NO_DATA)
-				frames = 0;
-			else
-				frames = ps->syt_interval;
+			frames = 0;
+			if (payload != NULL) {
+				uint32_t q1 = be32toh(payload[2]);
+
+				if (idx < MAX_DICE_STREAMS)
+					DSTREAM(sc)->dbg_rx_dbs[idx] =
+					    (be32toh(payload[1]) >> 16) & 0xff;
+				if (((q1 >> 16) & 0xff) == DICE_FDF_NO_DATA ||
+				    (q1 & 0xffff) == DICE_SYT_NO_INFO ||
+				    ((q1 >> 8) & 0xff) == DICE_FDF_NO_DATA) {
+					if (idx < MAX_DICE_STREAMS)
+						DSTREAM(sc)->dbg_rx_nodata[idx]++;
+				} else {
+					frames = ps->syt_interval;
+					if (idx < MAX_DICE_STREAMS) {
+						DSTREAM(sc)->dbg_rx_valid[idx]++;
+						DSTREAM(sc)->dbg_rx_frames[idx] +=
+						    frames;
+					}
+				}
+			}
 			dbs = sl->data_block_quadlets;
 			nch = ps->pcm_channels;
 			if (nch > ps->device_channels)
@@ -1068,7 +1090,8 @@ dice_rx_handler(struct fw_xferq *xferq)
 
 				for (fi = 0; fi < frames; fi++) {
 					const uint32_t *blk = &payload[
-					    CIP_HEADER_QUADLETS + fi * dbs];
+					    CIP_HEADER_QUADLETS +
+					    DICE_ISO_HDR_QUADLETS + fi * dbs];
 
 					/* PCM quadlets are first; MIDI (if
 					 * any) follows after the audio. */
@@ -1092,6 +1115,17 @@ dice_rx_handler(struct fw_xferq *xferq)
 				}
 			}
 		}
+		/*
+		 * Device-cadence OSS staging feed: enqueue the feed task on
+		 * every 2nd packet of stream 0 (~4 kHz at 48 kHz).  Counted
+		 * per packet (not per handler invocation) so it stays at the
+		 * right rate even when fwohci batches completions.  The task
+		 * itself calls snd_pcm_period_elapsed (see dice_feed_cb).
+		 */
+		if (idx == 0 && DSTREAM(sc)->feed_tq != NULL &&
+		    (DSTREAM(sc)->feed_div++ & 1) == 0)
+			taskqueue_enqueue(DSTREAM(sc)->feed_tq,
+			    &DSTREAM(sc)->feed_task);
 		STAILQ_INSERT_TAIL(&xferq->stfree, bx, link);
 		recycled++;
 	}
@@ -1103,6 +1137,29 @@ dice_rx_handler(struct fw_xferq *xferq)
 /* TX refill + period signalling callout                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Device-cadence OSS staging feed.  Enqueued from dice_rx_handler at
+ * ~4 kHz (every 2nd packet of stream 0); calls snd_pcm_period_elapsed
+ * (== chn_intr) for both active directions so the OSS staging buffers
+ * (bufsoft) fill in small, device-synchronised increments instead of
+ * 1 ms callout quanta.  Runs in a taskqueue thread WITHOUT FW_GLOCK,
+ * so the CHN_LOCK it acquires inside chn_intr cannot deadlock against
+ * the PCM trigger path's CHN_LOCK -> FW_GLOCK ordering (see the
+ * comment on feed_task in dice_streaming.h).
+ */
+static void
+dice_feed_cb(void *arg, int pending)
+{
+	struct dice_bsd_softc *sc = arg;
+	struct dice_pcm_stream *pb = &DSTREAM(sc)->playback;
+	struct dice_pcm_stream *cap = &DSTREAM(sc)->capture;
+
+	if (pb->active && pb->substream != NULL)
+		snd_pcm_period_elapsed(pb->substream);
+	if (cap->active && cap->substream != NULL)
+		snd_pcm_period_elapsed(cap->substream);
+}
+
 static void
 dice_pcm_stream_cb(void *arg)
 {
@@ -1111,37 +1168,6 @@ dice_pcm_stream_cb(void *arg)
 	struct dice_pcm_stream *cap = &DSTREAM(sc)->capture;
 
 	dice_streaming_refill_tx(sc);
-
-	/* DEBUG (remove after diagnosis): periodic stream state. */
-	{
-		static unsigned int cb_ticks;
-		struct fw_xferq *tx0 = ISO_XFERQ(&DSTREAM(sc)->iso_tx[0]);
-		struct fw_xferq *tx1 = pb->stream_count > 1 ?
-		    ISO_XFERQ(&DSTREAM(sc)->iso_tx[1]) : NULL;
-		struct fw_xferq *rx0 = ISO_XFERQ(&DSTREAM(sc)->iso_rx[0]);
-
-		if (++cb_ticks <= 2000 && (cb_ticks % 100 == 1)) {
-			device_printf(sc->dev,
-			    "dice: cb tick=%u pb=%d/%p cap=%d/%p "
-			    "hwptr=%lu stall=%u "
-			    "tx0(f=%u,d=%u,v=%u,r=%d) "
-			    "tx1(f=%u,d=%u,v=%u,r=%d) "
-			    "rx0(f=%u,d=%u,v=%u,r=%d)\n",
-			    cb_ticks, pb->active, (void *)pb->substream,
-			    cap->active, (void *)cap->substream,
-			    pb->hwptr, DSTREAM(sc)->tx_stall_ticks,
-			    dice_qcount(tx0, 0), dice_qcount(tx0, 1),
-			    dice_qcount(tx0, 2),
-			    (tx0->flag & FWXFERQ_RUNNING) != 0,
-			    tx1 ? dice_qcount(tx1, 0) : 0,
-			    tx1 ? dice_qcount(tx1, 1) : 0,
-			    tx1 ? dice_qcount(tx1, 2) : 0,
-			    tx1 ? (tx1->flag & FWXFERQ_RUNNING) != 0 : 0,
-			    dice_qcount(rx0, 0), dice_qcount(rx0, 1),
-			    dice_qcount(rx0, 2),
-			    (rx0->flag & FWXFERQ_RUNNING) != 0);
-		}
-	}
 
 	if (pb->active && pb->substream != NULL)
 		snd_pcm_period_elapsed(pb->substream);
@@ -1192,6 +1218,20 @@ dice_streaming_init(struct dice_bsd_softc *sc)
 	callout_init(&DSTREAM(sc)->callout, 1);
 	mtx_init(&DSTREAM(sc)->playback_lock, "dice_playback", NULL, MTX_DEF);
 	mtx_init(&DSTREAM(sc)->capture_lock, "dice_capture", NULL, MTX_DEF);
+
+	/* Device-cadence chn_intr feeding taskqueue (see feed_task above).
+	 * Failure is non-fatal: feeding falls back to the 1 ms callout. */
+	DSTREAM(sc)->feed_tq = taskqueue_create("dice_feed", M_WAITOK,
+	    taskqueue_thread_enqueue, &DSTREAM(sc)->feed_tq);
+	if (DSTREAM(sc)->feed_tq == NULL) {
+		device_printf(sc->dev, "dice: feed taskqueue creation failed "
+		    "(falling back to 1 ms callout feeding)\n");
+	} else {
+		TASK_INIT(&DSTREAM(sc)->feed_task, 0, dice_feed_cb, sc);
+		taskqueue_start_threads(&DSTREAM(sc)->feed_tq, 1, PI_DULL,
+		    "dice_feed");
+	}
+
 	/*
 	 * The FreeBSD firewire stack exposes no isochronous channel
 	 * allocator, so (like digi00x) use fixed channel numbers — one
@@ -1224,6 +1264,13 @@ dice_streaming_fini(struct dice_bsd_softc *sc)
 	if (sc->stream == NULL) return;
 
 	callout_drain(&DSTREAM(sc)->callout);
+
+	/* Stop the device-cadence feed task and tear down its thread. */
+	if (DSTREAM(sc)->feed_tq != NULL) {
+		taskqueue_drain(DSTREAM(sc)->feed_tq, &DSTREAM(sc)->feed_task);
+		taskqueue_free(DSTREAM(sc)->feed_tq);
+		DSTREAM(sc)->feed_tq = NULL;
+	}
 
 	for (i = 0; i < MAX_DICE_STREAMS; i++) {
 		if (DSTREAM(sc)->iso_tx[i].dmach >= 0) {
@@ -1430,10 +1477,19 @@ dice_program_device(struct dice_bsd_softc *sc)
 			    i, err);
 			return (err);
 		}
-		/* TX_SPEED is per stream index (ALSA start_streams). */
-		err = dice_write_quad(sc->fwdev,
-		    DICE_PRIVATE_SPACE + sc->tx_offset + i * 0x20 + 0x014,
-		    htobe32(sc->fwdev->fc->speed));
+		/* TX_SPEED is per stream index (ALSA start_streams); the
+		 * per-stream block size comes from TX_SIZE (see
+		 * dice_program_iso). */
+		{
+			unsigned int stride = sc->tx_reg_size;
+
+			if (stride == 0)
+				stride = 0x20;
+			err = dice_write_quad(sc->fwdev,
+			    DICE_PRIVATE_SPACE + sc->tx_offset +
+			    i * stride + 0x014,
+			    htobe32(sc->fwdev->fc->speed));
+		}
 		if (err != 0) {
 			device_printf(sc->dev,
 			    "dice: TX_SPEED[%u] write failed (%d)\n", i, err);
@@ -1556,10 +1612,6 @@ dice_ensure_host_tx(struct dice_bsd_softc *sc)
 	 */
 	dice_stream_configure(pb, SNDRV_PCM_STREAM_PLAYBACK, pb->rate);
 	pb->tx_cycle = dice_first_tx_cycle(sc);
-
-	/* DEBUG (remove after diagnosis). */
-	device_printf(sc->dev, "dice: ensure_tx streams=%u first_cycle=%u\n",
-	    scount, pb->tx_cycle);
 
 	FW_GLOCK(fc);
 	for (i = 0; i < scount; i++) {

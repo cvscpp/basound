@@ -1223,8 +1223,9 @@ sysctl_dice_stream(SYSCTL_HANDLER_ARGS)
 	struct dice_bsd_softc *sc = arg1;
 	struct dice_streaming *ds;
 	struct dice_pcm_stream *pb, *cap;
-	char buf[512];
-	int len;
+	uint32_t clock_sel = 0, status = 0;
+	char buf[768];
+	int len, len2;
 
 	if (sc == NULL || sc->stream == NULL) {
 		snprintf(buf, sizeof(buf), "streaming not initialized");
@@ -1234,13 +1235,36 @@ sysctl_dice_stream(SYSCTL_HANDLER_ARGS)
 	pb = &ds->playback;
 	cap = &ds->capture;
 
+	/*
+	 * DEBUG (remove after diagnosis): live device clock state from
+	 * GLOBAL_CLOCK_SELECT / GLOBAL_STATUS (read in sysctl process
+	 * context — these are FireWire transactions and may sleep).
+	 *   select: bits 7-0  = clock source (0x0c = internal),
+	 *           bits 15-8 = nominal rate code (2 = 48 kHz)
+	 *   status: bit 0     = SOURCE_LOCKED,
+	 *           bits 15-8 = actual (locked) rate code.
+	 * A locked status rate of 2 means the device PLL is really at
+	 * 48 kHz; anything else while the FDF on the wire says 2 means
+	 * the device is transmitting at the wrong rate.
+	 */
+	if (dice_read_global(sc, 0x04c, &clock_sel, 4) == 0)
+		clock_sel = be32toh(clock_sel);
+	else
+		clock_sel = 0xffffffff;
+	if (dice_read_global(sc, 0x054, &status, 4) == 0)
+		status = be32toh(status);
+	else
+		status = 0xffffffff;
+
 	len = snprintf(buf, sizeof(buf),
 	    "playback: active=%d rate=%u ch=%u devch=%u streams=%u "
 	    "s0=%u/%u s1=%u/%u fdf=0x%02x "
 	    "hwptr=%lu/%u period=%u tx_underruns=%lu tx_shortfalls=%lu\n"
 	    "capture:  active=%d rate=%u ch=%u devch=%u streams=%u "
 	    "s0=%u/%u s1=%u/%u "
-	    "hwptr=%lu/%u period=%u",
+	    "hwptr=%lu/%u period=%u\n"
+	    "clock:    select=0x%08x (src=%u rate=%u) "
+	    "status=0x%08x (locked=%u rate=%u)",
 	    pb->active, pb->rate, pb->pcm_channels, pb->device_channels,
 	    pb->stream_count,
 	    pb->streams[0].pcm_chs, pb->streams[0].data_block_quadlets,
@@ -1251,11 +1275,40 @@ sysctl_dice_stream(SYSCTL_HANDLER_ARGS)
 	    cap->stream_count,
 	    cap->streams[0].pcm_chs, cap->streams[0].data_block_quadlets,
 	    cap->streams[1].pcm_chs, cap->streams[1].data_block_quadlets,
-	    cap->hwptr, cap->buffer_bytes, cap->period_bytes);
+	    cap->hwptr, cap->buffer_bytes, cap->period_bytes,
+	    clock_sel, clock_sel & 0xff, (clock_sel >> 8) & 0xff,
+	    status, status & 0x1, (status >> 8) & 0xff);
 	if (len < 0)
 		len = 0;
 	if (len >= (int)sizeof(buf))
 		len = (int)sizeof(buf) - 1;
+
+	/*
+	 * RX blocking-mode classification since the previous read
+	 * (read-and-clear): val = valid packets (data blocks decoded),
+	 * nod = empty NODATA packets, fr = data blocks decoded, dbs =
+	 * received CIP DBS of the last packet.  At 48 kHz a healthy
+	 * 100 ms window shows ~600/200; val+nod << 800 means the device
+	 * (or IR context) dropped packets — a capture gap = click.
+	 */
+	len2 = snprintf(buf + len, sizeof(buf) - len,
+	    "\nrx:    s0 val=%u nod=%u fr=%u dbs=%u  s1 val=%u nod=%u fr=%u dbs=%u",
+	    ds->dbg_rx_valid[0], ds->dbg_rx_nodata[0], ds->dbg_rx_frames[0],
+	    ds->dbg_rx_dbs[0],
+	    ds->dbg_rx_valid[1], ds->dbg_rx_nodata[1], ds->dbg_rx_frames[1],
+	    ds->dbg_rx_dbs[1]);
+	if (len2 > 0) {
+		if (len2 >= (int)(sizeof(buf) - len))
+			len2 = (int)(sizeof(buf) - len) - 1;
+		len += len2;
+	}
+	ds->dbg_rx_valid[0] = 0;
+	ds->dbg_rx_valid[1] = 0;
+	ds->dbg_rx_nodata[0] = 0;
+	ds->dbg_rx_nodata[1] = 0;
+	ds->dbg_rx_frames[0] = 0;
+	ds->dbg_rx_frames[1] = 0;
+
 	return (sysctl_handle_string(oidp, buf, len + 1, req));
 }
 
@@ -1282,6 +1335,26 @@ dice_init_card(struct dice_bsd_softc *sc)
 		device_printf(sc->dev, "DICE subaddresses invalid (%d)\n", err);
 		return (err);
 	}
+
+	/*
+	 * Per-stream register block size (bytes) inside the TX/RX sections,
+	 * from the read-only TX_SIZE/RX_SIZE registers (in quadlets).
+	 * NOT a constant: DICE II (e.g. ProFire 2626) uses 0x120 bytes
+	 * (256-byte channel names + AC3 registers), DICE I uses 0x60.
+	 * Programming stream index i at tx_offset + i * 0x20 would land
+	 * the stream-1 registers inside stream 0's name area, so the
+	 * device is never told stream 1's isochronous channel and never
+	 * transmits its second stream (capture ch 16-25 dead).  Fall back
+	 * to 0x20 if the registers are unreadable.
+	 */
+	sc->tx_reg_size = 0x20;
+	sc->rx_reg_size = 0x20;
+	if (dice_read_tx(sc, TX_SIZE, &reg, 4) == 0)
+		sc->tx_reg_size = be32toh(reg) * 4;
+	if (dice_read_rx(sc, RX_SIZE, &reg, 4) == 0)
+		sc->rx_reg_size = be32toh(reg) * 4;
+	device_printf(sc->dev, "DICE TX/RX per-stream register size %u/%u\n",
+	    sc->tx_reg_size, sc->rx_reg_size);
 
 	/* Clock capabilities; very old firmware does not implement this
 	 * register, in which case we keep the 44.1/48 kHz fallback. */
