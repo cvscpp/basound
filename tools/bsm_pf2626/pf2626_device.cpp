@@ -19,7 +19,7 @@ Pf2626Device::~Pf2626Device() {
 
 bool Pf2626Device::open(const char *path) {
 	close();
-	fd_ = ::open(path, O_RDONLY);
+	fd_ = ::open(path, O_RDWR);
 	if (fd_ < 0)
 		return false;
 	path_ = path;
