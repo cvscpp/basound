@@ -1,0 +1,16 @@
+BASound provides a glue layer between the Linux ALSA driver code and the
+FreeBSD sound(4) subsystem.  It allows ALSA-based drivers for professional
+and pro-consumer audio hardware to be used on FreeBSD without modifying
+the FreeBSD kernel sources or the upstream ALSA drivers.
+
+Supported device families:
+
+  - DICE FireWire audio interfaces (Weiss, Focusrite, TC Electronic,
+    Alesis, M-Audio, PreSonus, and others)
+  - RME Hammerfall DSP PCI interfaces (Digiface, Multiface, 9652)
+  - Digidesign Digi 002/003 FireWire interfaces
+  - Line6 USB audio interfaces (POD, TonePort, Variax)
+  - M-Audio MIDISport 8x8 USB MIDI interface
+
+The port installs a core module (basound.ko) and one module per device
+class.  Only load the module matching your hardware.

@@ -1,0 +1,6 @@
+/%%KMODDIR%%/basound.ko
+/%%KMODDIR%%/basound_dice.ko
+/%%KMODDIR%%/basound_digi00x.ko
+/%%KMODDIR%%/basound_hdsp.ko
+/%%KMODDIR%%/basound_line6.ko
+/%%KMODDIR%%/basound_maudio.ko

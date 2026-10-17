@@ -36,7 +36,8 @@ SRCS=	sys/dev/basound/basound.c \
 	sys/alsa/alsa_pcm.c \
 	sys/alsa/alsa_pcm_bsd.c \
 	sys/alsa/alsa_work.c \
-	device_if.h bus_if.h feeder_if.h mixer_if.h channel_if.h vnode_if.h
+	device_if.h bus_if.h feeder_if.h mixer_if.h channel_if.h pci_if.h \
+	vnode_if.h
 
 CFLAGS+= -I${.CURDIR}/sys/alsa/include \
 	-I${.CURDIR}/sys/alsa \

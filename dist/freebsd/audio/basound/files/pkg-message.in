@@ -1,0 +1,33 @@
+[
+{ type: install
+  message: <<EOM
+BASound installs its kernel modules in %%KMODDIR%%.
+
+Load the module matching your hardware at boot by adding it to kld_list
+in /etc/rc.conf.  The core basound module is pulled in automatically as
+a dependency, so listing the driver module is sufficient:
+
+    kld_list="basound_hdsp"
+
+Available driver modules:
+
+    basound_hdsp      RME Hammerfall DSP (PCI)
+    basound_dice      DICE FireWire interfaces
+    basound_digi00x   Digidesign Digi 002/003 (FireWire)
+    basound_line6     Line6 USB audio interfaces
+    basound_maudio    M-Audio MIDISport 8x8 (USB MIDI)
+
+A loaded driver can be prevented from probing without unloading it by
+setting a tunable in /boot/loader.conf:
+
+    hw.basound_hdsp.enable="0"
+
+The modules were built against the kernel sources in %%SRC_BASE%% for
+%%OPSYS%% %%OSREL%%.  Rebuild this port after upgrading the kernel or
+the modules may fail to load or panic the system.
+
+WARNING: this software is experimental.  Loading the modules may panic
+the kernel.  Use at your own risk.
+EOM
+}
+]

@@ -1,0 +1,12 @@
+FLTK mixer and control utilities for audio devices supported by the
+BASound kernel drivers.
+
+The tools talk to the device through the character devices exported by
+the basound kernel modules, so the matching module must be loaded.
+
+  bsm_hdsp      RME Hammerfall DSP matrix mixer, levels, and clock control
+  bsm_digi00x   Digidesign Digi 002/003 mixer and monitoring control
+  bsm_line6     Line6 POD/TonePort controls and level meters
+  bsm_pf2626    M-Audio ProFire 2626 mixer, routing, and level meters
+
+The tools are GUI applications built with FLTK.

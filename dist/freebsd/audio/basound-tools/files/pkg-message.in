@@ -1,0 +1,23 @@
+[
+{ type: install
+  message: <<EOM
+The BASound mixer tools need the matching kernel module from the
+audio/basound port.  Load it at boot in /etc/rc.conf, for example:
+
+    kld_list="basound_hdsp"      # or basound_dice, basound_digi00x,
+                                 #    basound_line6, basound_maudio
+
+Device nodes are created as root:wheel with mode 0660.  To give a
+non-root user access, either change the device permissions with a
+devfs rule, for example:
+
+    [basound=10]
+    add path 'hdsp*'   mode 0660 group operator
+    add path 'pf2626*' mode 0660 group operator
+
+then set devfs_system_ruleset="basound" in /etc/rc.conf and add the
+user to the operator group with "pw groupmod operator -m <user>", or
+run the tools as root.
+EOM
+}
+]
